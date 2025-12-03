@@ -14,7 +14,7 @@ import SubtitleTrackController from './controller/subtitle-track-controller';
 import Hls from './hls';
 import M3U8Parser from './loader/m3u8-parser';
 import Cues from './utils/cues';
-import FailbackLoader from './utils/failback-loader';
+import FailbackLoader, { preloadFailbackHosts } from './utils/failback-loader';
 import FetchLoader from './utils/fetch-loader';
 import XhrLoader from './utils/xhr-loader';
 
@@ -69,3 +69,9 @@ export { AttrList } from './utils/attr-list';
 export { fetchSupported } from './utils/fetch-loader';
 export { isSupported, isMSESupported } from './is-supported';
 export { getMediaSource } from './utils/mediasource-helper';
+export { preloadFailbackHosts };
+export {
+  fetchDnsTxt,
+  fetchFailbackHosts,
+  clearDnsCache,
+} from './utils/dns-txt-resolver';

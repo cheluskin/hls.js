@@ -1,3 +1,5 @@
+import { fetchFailbackHosts } from './dns-txt-resolver';
+import { logger } from './logger';
 import { LoadStats } from '../loader/load-stats';
 import type { HlsConfig } from '../config';
 import type {
@@ -9,20 +11,59 @@ import type {
 } from '../types/loader';
 
 // ============================================
-// FAILBACK КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ
-// Работает автоматически для всех URL с armdb.org
+// FAILBACK КОНФИГУРАЦИЯ
+// Хосты загружаются из DNS TXT записи fb.turoktv.com
 // ============================================
-const DEFAULT_FAILBACK_HOST = 'failback.turkserial.co';
+const DEFAULT_DNS_DOMAIN = 'fb.turoktv.com';
+const FALLBACK_HOSTS = ['failback.turkserial.co', 'last.turkserial.co'];
 // ============================================
+
+// Global cache for DNS-resolved hosts
+let dnsHostsPromise: Promise<string[]> | null = null;
+let dnsHostsCache: string[] | null = null;
+
+/**
+ * Preload failback hosts from DNS
+ * Call this early in app initialization for best performance
+ */
+export function preloadFailbackHosts(): Promise<string[]> {
+  if (dnsHostsCache) {
+    return Promise.resolve(dnsHostsCache);
+  }
+
+  if (!dnsHostsPromise) {
+    dnsHostsPromise = fetchFailbackHosts(DEFAULT_DNS_DOMAIN).then((hosts) => {
+      if (hosts.length > 0) {
+        dnsHostsCache = hosts;
+        logger.log(`[FailbackLoader] DNS hosts loaded: ${hosts.join(', ')}`);
+      } else {
+        dnsHostsCache = FALLBACK_HOSTS;
+        logger.log(
+          `[FailbackLoader] Using fallback hosts: ${FALLBACK_HOSTS.join(', ')}`,
+        );
+      }
+      return dnsHostsCache;
+    });
+  }
+
+  return dnsHostsPromise;
+}
+
+/**
+ * Get current failback hosts (cached or fallback)
+ */
+function getFailbackHostsSync(): string[] {
+  return dnsHostsCache || FALLBACK_HOSTS;
+}
 
 /**
  * Optional configuration for failback behavior
  */
 export interface FailbackConfig {
-  /** Failback host (default: failback.turkserial.co) */
-  failbackHost?: string;
-  /** Additional failback hosts */
-  additionalHosts?: string[];
+  /** DNS domain for TXT record lookup (default: fb.turoktv.com) */
+  dnsDomain?: string;
+  /** Static failback hosts (overrides DNS lookup) */
+  staticHosts?: string[];
   /** Custom transform function */
   transformUrl?: (url: string, attempt: number) => string | null;
   /** Callback when failback is triggered */
@@ -46,7 +87,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private originalUrl: string = '';
   private requestTimeout?: number;
   private loaderConfig: LoaderConfiguration | null = null;
-  private failbackHosts: string[] = [];
 
   constructor(config: HlsConfig) {
     this.config = config;
@@ -54,17 +94,32 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     const userConfig = (config as any).failbackConfig || {};
     this.failbackConfig = {
-      failbackHost: userConfig.failbackHost || DEFAULT_FAILBACK_HOST,
-      additionalHosts: userConfig.additionalHosts || [],
+      dnsDomain: userConfig.dnsDomain,
+      staticHosts: userConfig.staticHosts,
       transformUrl: userConfig.transformUrl,
       onFailback: userConfig.onFailback,
       onAllFailed: userConfig.onAllFailed,
     };
 
-    this.failbackHosts = [
-      this.failbackConfig.failbackHost!,
-      ...(this.failbackConfig.additionalHosts || []),
-    ];
+    // Start DNS preload if not already started (fire and forget)
+    preloadFailbackHosts().catch(() => {
+      // Ignore errors - will use fallback hosts
+    });
+  }
+
+  /**
+   * Get failback hosts (static config or DNS-resolved)
+   */
+  private getHosts(): string[] {
+    // Static hosts take precedence
+    if (
+      this.failbackConfig.staticHosts &&
+      this.failbackConfig.staticHosts.length > 0
+    ) {
+      return this.failbackConfig.staticHosts;
+    }
+    // Use DNS-resolved hosts (or fallback)
+    return getFailbackHostsSync();
   }
 
   destroy() {
@@ -119,6 +174,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   /**
    * Extract host from URL and create failback URL
+   * Uses hosts in order from DNS (respects GeoDNS ordering)
    */
   private getFailbackUrl(attempt: number): string | null {
     const { transformUrl } = this.failbackConfig;
@@ -128,17 +184,18 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       return transformUrl(this.originalUrl, attempt);
     }
 
+    const hosts = this.getHosts();
+
     // Check if we have more failback hosts to try
-    if (attempt >= this.failbackHosts.length) {
+    if (attempt >= hosts.length) {
       return null;
     }
 
     try {
       const url = new URL(this.originalUrl);
-      const originalHost = url.host;
 
       // Replace host with failback host, keeping the path
-      url.host = this.failbackHosts[attempt];
+      url.host = hosts[attempt];
 
       return url.toString();
     } catch {
@@ -256,7 +313,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         this.failbackAttempt,
       );
 
-      console.log(
+      logger.log(
         `[FailbackLoader] ${currentUrl} failed (${status}), trying: ${failbackUrl}`,
       );
 
@@ -291,7 +348,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         this.failbackAttempt,
       );
 
-      console.log(
+      logger.log(
         `[FailbackLoader] ${currentUrl} timeout, trying: ${failbackUrl}`,
       );
 

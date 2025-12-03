@@ -52,4 +52,6 @@ import './unit/utils/safe-json-stringify';
 import './unit/utils/texttrack-utils';
 import './unit/utils/vttparser';
 import './unit/utils/utf8';
+import './unit/utils/dns-txt-resolver';
+import './unit/utils/failback-loader';
 import './unit/demuxer/transmuxer';
