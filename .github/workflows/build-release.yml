@@ -2,50 +2,12 @@ name: Build, Release & Publish to NPM
 
 on:
   push:
-    branches: [master]
     tags: ['v*']
-  pull_request:
-    branches: [master]
   workflow_dispatch:
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type check
-        run: npm run type-check
-
-      - name: Lint
-        run: npm run lint:quiet
-
-      - name: Build
-        run: npm run build
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: hls-js-dist
-          path: dist/
-          retention-days: 30
-
-  # Публикация на npm при создании тега
-  publish-npm:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - name: Checkout
@@ -70,23 +32,7 @@ jobs:
       - name: Publish to npm
         run: npm publish --access public
 
-  # Создание GitHub Release
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: hls-js-dist
-          path: dist/
-
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
@@ -97,21 +43,11 @@ jobs:
           body: |
             ## CDN Links
 
-            **jsdelivr:**
             ```html
             <script src="https://cdn.jsdelivr.net/npm/@armdborg/hls.js@${{ github.ref_name }}/dist/hls.min.js"></script>
             ```
 
-            **unpkg:**
-            ```html
-            <script src="https://unpkg.com/@armdborg/hls.js@${{ github.ref_name }}/dist/hls.min.js"></script>
-            ```
-
             ## Usage
-            ```javascript
-            const hls = new Hls({
-              fLoader: Hls.FailbackLoader
-            });
-            ```
+            Just replace original hls.js - failback works automatically!
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
