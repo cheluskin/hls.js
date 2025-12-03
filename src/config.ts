@@ -13,6 +13,7 @@ import { SubtitleStreamController } from './controller/subtitle-stream-controlle
 import SubtitleTrackController from './controller/subtitle-track-controller';
 import { TimelineController } from './controller/timeline-controller';
 import Cues from './utils/cues';
+import FailbackLoader from './utils/failback-loader';
 import FetchLoader, { fetchSupported } from './utils/fetch-loader';
 import { requestMediaKeySystemAccess } from './utils/mediakeys-helper';
 import { stringify } from './utils/safe-json-stringify';
@@ -410,7 +411,7 @@ export const hlsDefaultConfig: HlsConfig = {
   ignorePlaylistParsingErrors: false,
   loader: XhrLoader,
   // loader: FetchLoader,
-  fLoader: undefined, // used by fragment-loader
+  fLoader: FailbackLoader, // used by fragment-loader - FAILBACK ENABLED BY DEFAULT
   pLoader: undefined, // used by playlist-loader
   xhrSetup: undefined, // used by xhr-loader
   licenseXhrSetup: undefined, // used by eme-controller

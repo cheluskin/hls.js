@@ -1,70 +1,59 @@
 import { LoadStats } from '../loader/load-stats';
 import type { HlsConfig } from '../config';
 import type {
+  FragmentLoaderContext,
   Loader,
   LoaderCallbacks,
   LoaderConfiguration,
-  LoaderContext,
   LoaderStats,
 } from '../types/loader';
 
 // ============================================
-// КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ - РЕДАКТИРОВАТЬ ЗДЕСЬ
+// FAILBACK КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ
+// Работает автоматически для всех URL с armdb.org
 // ============================================
-const DEFAULT_PRIMARY_HOST = 'hls.armdb.org';
 const DEFAULT_FAILBACK_HOST = 'failback.turkserial.co';
 // ============================================
 
 /**
- * Configuration for failback URL transformation
+ * Optional configuration for failback behavior
  */
 export interface FailbackConfig {
-  /** Primary host to match (default: hls.armdb.org) */
-  primaryHost?: string;
-
-  /** Failback host to use (default: failback.turkserial.co) */
+  /** Failback host (default: failback.turkserial.co) */
   failbackHost?: string;
-
-  /** Additional failback hosts for multiple attempts */
+  /** Additional failback hosts */
   additionalHosts?: string[];
-
-  /** Custom transform function (overrides host settings) */
+  /** Custom transform function */
   transformUrl?: (url: string, attempt: number) => string | null;
-
   /** Callback when failback is triggered */
   onFailback?: (
     originalUrl: string,
     failbackUrl: string,
     attempt: number,
   ) => void;
-
   /** Callback when all attempts failed */
   onAllFailed?: (originalUrl: string, attempts: number) => void;
 }
 
-class FailbackLoader implements Loader<LoaderContext> {
+class FailbackLoader implements Loader<FragmentLoaderContext> {
   private config: HlsConfig;
   private failbackConfig: FailbackConfig;
   private loader: XMLHttpRequest | null = null;
-  private callbacks: LoaderCallbacks<LoaderContext> | null = null;
-  public context: LoaderContext | null = null;
+  private callbacks: LoaderCallbacks<FragmentLoaderContext> | null = null;
+  public context: FragmentLoaderContext | null = null;
   public stats: LoaderStats;
   private failbackAttempt: number = 0;
   private originalUrl: string = '';
   private requestTimeout?: number;
   private loaderConfig: LoaderConfiguration | null = null;
-
-  // Список всех failback хостов
   private failbackHosts: string[] = [];
 
   constructor(config: HlsConfig) {
     this.config = config;
     this.stats = new LoadStats();
 
-    // Merge user config with defaults
     const userConfig = (config as any).failbackConfig || {};
     this.failbackConfig = {
-      primaryHost: userConfig.primaryHost || DEFAULT_PRIMARY_HOST,
       failbackHost: userConfig.failbackHost || DEFAULT_FAILBACK_HOST,
       additionalHosts: userConfig.additionalHosts || [],
       transformUrl: userConfig.transformUrl,
@@ -72,7 +61,6 @@ class FailbackLoader implements Loader<LoaderContext> {
       onAllFailed: userConfig.onAllFailed,
     };
 
-    // Build failback hosts list
     this.failbackHosts = [
       this.failbackConfig.failbackHost!,
       ...(this.failbackConfig.additionalHosts || []),
@@ -105,16 +93,16 @@ class FailbackLoader implements Loader<LoaderContext> {
     if (this.callbacks?.onAbort) {
       this.callbacks.onAbort(
         this.stats,
-        this.context as LoaderContext,
+        this.context as FragmentLoaderContext,
         this.loader,
       );
     }
   }
 
   load(
-    context: LoaderContext,
+    context: FragmentLoaderContext,
     config: LoaderConfiguration,
-    callbacks: LoaderCallbacks<LoaderContext>,
+    callbacks: LoaderCallbacks<FragmentLoaderContext>,
   ) {
     if (this.stats.loading.start) {
       throw new Error('Loader can only be used once.');
@@ -130,28 +118,32 @@ class FailbackLoader implements Loader<LoaderContext> {
   }
 
   /**
-   * Get failback URL for the given attempt number
+   * Extract host from URL and create failback URL
    */
   private getFailbackUrl(attempt: number): string | null {
-    const { primaryHost, transformUrl } = this.failbackConfig;
+    const { transformUrl } = this.failbackConfig;
 
     // Custom transform takes precedence
     if (transformUrl) {
       return transformUrl(this.originalUrl, attempt);
     }
 
-    // Check if URL contains primary host
-    if (!this.originalUrl.includes(primaryHost!)) {
-      return null;
-    }
-
-    // Get failback host for this attempt
+    // Check if we have more failback hosts to try
     if (attempt >= this.failbackHosts.length) {
       return null;
     }
 
-    const failbackHost = this.failbackHosts[attempt];
-    return this.originalUrl.replace(primaryHost!, failbackHost);
+    try {
+      const url = new URL(this.originalUrl);
+      const originalHost = url.host;
+
+      // Replace host with failback host, keeping the path
+      url.host = this.failbackHosts[attempt];
+
+      return url.toString();
+    } catch {
+      return null;
+    }
   }
 
   private loadUrl(url: string) {
@@ -181,7 +173,6 @@ class FailbackLoader implements Loader<LoaderContext> {
     xhr.onreadystatechange = () => this.onReadyStateChange(xhr, url);
     xhr.onprogress = this.onProgress.bind(this);
 
-    // Setup timeout
     const { maxTimeToFirstByteMs, maxLoadTimeMs } = config.loadPolicy;
     const timeout =
       maxTimeToFirstByteMs && Number.isFinite(maxTimeToFirstByteMs)
@@ -281,7 +272,7 @@ class FailbackLoader implements Loader<LoaderContext> {
 
     this.callbacks?.onError?.(
       { code: status, text: xhr.statusText },
-      this.context as LoaderContext,
+      this.context as FragmentLoaderContext,
       xhr,
       this.stats,
     );
@@ -317,7 +308,7 @@ class FailbackLoader implements Loader<LoaderContext> {
     this.abortInternal();
     this.callbacks?.onTimeout?.(
       this.stats,
-      this.context as LoaderContext,
+      this.context as FragmentLoaderContext,
       this.loader,
     );
   }
