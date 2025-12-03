@@ -1,16 +1,16 @@
 {
   "name": "@armdborg/hls.js",
-  "version": "1.6.0-failback.1",
+  "version": "1.6.0-failback.2",
   "license": "Apache-2.0",
   "description": "HLS.js with automatic failback support for fragment loading",
-  "homepage": "https://github.com/ArmDB/hls.js",
+  "homepage": "https://github.com/cheluskin/hls.js",
   "authors": "ArmDB Team",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ArmDB/hls.js"
+    "url": "https://github.com/cheluskin/hls.js"
   },
   "bugs": {
-    "url": "https://github.com/ArmDB/hls.js/issues"
+    "url": "https://github.com/cheluskin/hls.js/issues"
   },
   "main": "./dist/hls.js",
   "module": "./dist/hls.mjs",
