@@ -1,15 +1,16 @@
 {
-  "name": "hls.js",
+  "name": "@armdborg/hls.js",
+  "version": "1.6.0-failback.1",
   "license": "Apache-2.0",
-  "description": "JavaScript HLS client using MediaSourceExtension",
-  "homepage": "https://github.com/video-dev/hls.js",
-  "authors": "Guillaume du Pontavice <g.du.pontavice@gmail.com>",
+  "description": "HLS.js with automatic failback support for fragment loading",
+  "homepage": "https://github.com/ArmDB/hls.js",
+  "authors": "ArmDB Team",
   "repository": {
     "type": "git",
-    "url": "https://github.com/video-dev/hls.js"
+    "url": "https://github.com/ArmDB/hls.js"
   },
   "bugs": {
-    "url": "https://github.com/video-dev/hls.js/issues"
+    "url": "https://github.com/ArmDB/hls.js/issues"
   },
   "main": "./dist/hls.js",
   "module": "./dist/hls.mjs",

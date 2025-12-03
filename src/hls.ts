@@ -16,6 +16,7 @@ import PlaylistLoader from './loader/playlist-loader';
 import { MetadataSchema } from './types/demuxer';
 import { type HdcpLevel, isHdcpLevel, type Level } from './types/level';
 import { PlaylistLevelType } from './types/loader';
+import FailbackLoader from './utils/failback-loader';
 import { enableLogs, type ILogger } from './utils/logger';
 import { getMediaDecodingInfoPromise } from './utils/mediacapabilities-helper';
 import { getMediaSource } from './utils/mediasource-helper';
@@ -71,6 +72,12 @@ import type XhrLoader from './utils/xhr-loader';
  * @public
  */
 export default class Hls implements HlsEventEmitter {
+  /**
+   * Custom fragment loader with automatic failback support.
+   * Use as `fLoader: Hls.FailbackLoader` in config.
+   */
+  static readonly FailbackLoader = FailbackLoader;
+
   private static defaultConfig: HlsConfig | undefined;
 
   /**

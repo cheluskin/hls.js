@@ -2067,6 +2067,8 @@ class Hls implements HlsEventEmitter {
     static get ErrorTypes(): typeof ErrorTypes;
     // (undocumented)
     static get Events(): typeof Events;
+    // Warning: (ae-forgotten-export) The symbol "FailbackLoader" needs to be exported by the entry point hls.d.ts
+    static readonly FailbackLoader: typeof FailbackLoader;
     // (undocumented)
     get firstAutoLevel(): number;
     get firstLevel(): number;

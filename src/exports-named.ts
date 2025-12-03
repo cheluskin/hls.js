@@ -14,6 +14,7 @@ import SubtitleTrackController from './controller/subtitle-track-controller';
 import Hls from './hls';
 import M3U8Parser from './loader/m3u8-parser';
 import Cues from './utils/cues';
+import FailbackLoader from './utils/failback-loader';
 import FetchLoader from './utils/fetch-loader';
 import XhrLoader from './utils/xhr-loader';
 
@@ -36,6 +37,7 @@ export {
   SubtitleTrackController,
   XhrLoader,
   FetchLoader,
+  FailbackLoader,
   Cues,
   M3U8Parser,
 };

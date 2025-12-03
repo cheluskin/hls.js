@@ -1,0 +1,68 @@
+name: Sync with upstream hls.js
+
+on:
+  schedule:
+    # Запускать каждый день в 3:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch: # Позволяет запускать вручную
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/video-dev/hls.js.git || true
+          git fetch upstream
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          UPSTREAM_COMMITS=$(git rev-list HEAD..upstream/master --count)
+          echo "upstream_commits=$UPSTREAM_COMMITS" >> $GITHUB_OUTPUT
+          echo "Found $UPSTREAM_COMMITS new commits from upstream"
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.upstream_commits != '0'
+        run: |
+          git checkout master
+          git merge upstream/master --no-edit -m "Merge upstream hls.js changes"
+        continue-on-error: true
+
+      - name: Check for merge conflicts
+        if: steps.check.outputs.upstream_commits != '0'
+        id: conflicts
+        run: |
+          if git diff --check 2>/dev/null; then
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push changes
+        if: steps.check.outputs.upstream_commits != '0' && steps.conflicts.outputs.has_conflicts != 'true'
+        run: git push origin master
+
+      - name: Create issue on conflict
+        if: steps.conflicts.outputs.has_conflicts == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Merge conflict with upstream hls.js',
+              body: 'Automatic sync with upstream hls.js failed due to merge conflicts. Please resolve manually.',
+              labels: ['merge-conflict', 'upstream-sync']
+            })
