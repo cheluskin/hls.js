@@ -2,9 +2,9 @@ name: Sync with upstream hls.js
 
 on:
   schedule:
-    # Запускать каждый день в 3:00 UTC
+    # Каждый день в 3:00 UTC
     - cron: '0 3 * * *'
-  workflow_dispatch: # Позволяет запускать вручную
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -21,10 +21,15 @@ jobs:
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/video-dev/hls.js.git || true
-          git fetch upstream
+          git fetch upstream --tags
 
       - name: Check for upstream changes
         id: check
@@ -35,27 +40,60 @@ jobs:
 
       - name: Merge upstream changes
         if: steps.check.outputs.upstream_commits != '0'
+        id: merge
         run: |
           git checkout master
-          git merge upstream/master --no-edit -m "Merge upstream hls.js changes"
-        continue-on-error: true
-
-      - name: Check for merge conflicts
-        if: steps.check.outputs.upstream_commits != '0'
-        id: conflicts
-        run: |
-          if git diff --check 2>/dev/null; then
-            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+          if git merge upstream/master --no-edit -m "Merge upstream hls.js changes"; then
+            echo "merge_success=true" >> $GITHUB_OUTPUT
           else
-            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            git merge --abort || true
           fi
 
-      - name: Push changes
-        if: steps.check.outputs.upstream_commits != '0' && steps.conflicts.outputs.has_conflicts != 'true'
-        run: git push origin master
+      - name: Get upstream version and create new version
+        if: steps.check.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'true'
+        id: version
+        run: |
+          # Получить версию из upstream package.json
+          UPSTREAM_VERSION=$(git show upstream/master:package.json | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin').toString()).version")
+          echo "Upstream version: $UPSTREAM_VERSION"
+
+          # Найти следующий failback номер для этой версии
+          FAILBACK_NUM=1
+          while git tag | grep -q "v${UPSTREAM_VERSION}-failback.${FAILBACK_NUM}"; do
+            FAILBACK_NUM=$((FAILBACK_NUM + 1))
+          done
+
+          NEW_VERSION="${UPSTREAM_VERSION}-failback.${FAILBACK_NUM}"
+          echo "New version: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update package.json version
+        if: steps.version.outputs.new_version != ''
+        run: |
+          # Обновить версию в package.json
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json'));
+            pkg.version = '${{ steps.version.outputs.new_version }}';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+          # Обновить package-lock.json
+          npm install --package-lock-only || true
+
+          git add package.json package-lock.json
+          git commit -m "Bump version to ${{ steps.version.outputs.new_version }}"
+
+      - name: Push changes and create tag
+        if: steps.version.outputs.new_version != ''
+        run: |
+          git push origin master
+          git tag "v${{ steps.version.outputs.new_version }}"
+          git push origin "v${{ steps.version.outputs.new_version }}"
 
       - name: Create issue on conflict
-        if: steps.conflicts.outputs.has_conflicts == 'true'
+        if: steps.check.outputs.upstream_commits != '0' && steps.merge.outputs.merge_success == 'false'
         uses: actions/github-script@v7
         with:
           script: |
@@ -63,6 +101,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'Merge conflict with upstream hls.js',
-              body: 'Automatic sync with upstream hls.js failed due to merge conflicts. Please resolve manually.',
+              body: 'Automatic sync with upstream hls.js failed due to merge conflicts. Please resolve manually.\n\nUpstream: https://github.com/video-dev/hls.js',
               labels: ['merge-conflict', 'upstream-sync']
             })
