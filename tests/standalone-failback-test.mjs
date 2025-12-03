@@ -106,8 +106,10 @@ await testAsync('fetchDnsTxt caches results', async () => {
   };
 
   await fetchDnsTxt('cache-test.example.com');
+  const firstCallCount = callCount;
   await fetchDnsTxt('cache-test.example.com');
-  assert.equal(callCount, 1, 'fetch should only be called once');
+  // Second call should use cache, so callCount should not increase
+  assert.equal(callCount, firstCallCount, 'second fetch should use cache');
 });
 
 // Test 4: fetchFailbackHosts filters empty records

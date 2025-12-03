@@ -37,7 +37,8 @@ describe('dns-txt-resolver', function () {
       const result = await fetchDnsTxt('test.example.com');
 
       expect(result).to.deep.equal(['host1.example.com', 'host2.example.com']);
-      expect(self.fetch.calledOnce).to.be.true;
+      // Parallel requests to all providers
+      expect(self.fetch.called).to.be.true;
       expect(self.fetch.firstCall.args[0]).to.include('test.example.com');
       expect(self.fetch.firstCall.args[0]).to.include('type=TXT');
     });
@@ -87,13 +88,14 @@ describe('dns-txt-resolver', function () {
 
       // First call
       const result1 = await fetchDnsTxt('cached.example.com');
+      const callCountAfterFirst = self.fetch.callCount;
       // Second call - should use cache
       const result2 = await fetchDnsTxt('cached.example.com');
 
       expect(result1).to.deep.equal(['cached-host']);
       expect(result2).to.deep.equal(['cached-host']);
-      // fetch should only be called once due to caching
-      expect(self.fetch.calledOnce).to.be.true;
+      // Second call should use cache, so callCount should not increase
+      expect(self.fetch.callCount).to.equal(callCountAfterFirst);
     });
 
     it('should filter only TXT records (type 16)', async function () {
@@ -116,13 +118,13 @@ describe('dns-txt-resolver', function () {
       expect(result).to.deep.equal(['txt-record']);
     });
 
-    it('should fallback to next provider on failure', async function () {
+    it('should succeed when at least one provider succeeds', async function () {
       const mockResponse = {
         Status: 0,
-        Answer: [{ type: 16, data: '"fallback-host"' }],
+        Answer: [{ type: 16, data: '"success-host"' }],
       };
 
-      // First provider fails, second succeeds
+      // First provider fails, second succeeds (parallel requests)
       self.fetch = sinon.stub();
       self.fetch.onFirstCall().resolves({ ok: false });
       self.fetch.onSecondCall().resolves({
@@ -132,8 +134,9 @@ describe('dns-txt-resolver', function () {
 
       const result = await fetchDnsTxt('test.example.com');
 
-      expect(result).to.deep.equal(['fallback-host']);
-      expect(self.fetch.calledTwice).to.be.true;
+      expect(result).to.deep.equal(['success-host']);
+      // Both providers are called in parallel
+      expect(self.fetch.called).to.be.true;
     });
 
     it('should return empty array when all providers fail', async function () {
@@ -277,14 +280,15 @@ describe('dns-txt-resolver', function () {
 
       // First call populates cache
       await fetchDnsTxt('test.example.com');
-      expect(self.fetch.calledOnce).to.be.true;
+      const callCountAfterFirst = self.fetch.callCount;
 
       // Clear cache
       clearDnsCache();
 
       // Second call should fetch again
       await fetchDnsTxt('test.example.com');
-      expect(self.fetch.calledTwice).to.be.true;
+      // Call count should increase after cache clear
+      expect(self.fetch.callCount).to.be.greaterThan(callCountAfterFirst);
     });
   });
 });

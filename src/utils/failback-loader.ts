@@ -15,7 +15,7 @@ import type {
 // Хосты загружаются из DNS TXT записи fb.turoktv.com
 // ============================================
 const DEFAULT_DNS_DOMAIN = 'fb.turoktv.com';
-const FALLBACK_HOSTS = ['failback.turkserial.co', 'last.turkserial.co'];
+const FALLBACK_HOSTS = ['failback.turkserial.co'];
 // ============================================
 
 // Global cache for DNS-resolved hosts
@@ -66,6 +66,8 @@ export interface FailbackConfig {
   staticHosts?: string[];
   /** Custom transform function */
   transformUrl?: (url: string, attempt: number) => string | null;
+  /** Callback when load succeeds */
+  onSuccess?: (url: string, wasFailback: boolean, attempt: number) => void;
   /** Callback when failback is triggered */
   onFailback?: (
     originalUrl: string,
@@ -93,10 +95,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.stats = new LoadStats();
 
     const userConfig = (config as any).failbackConfig || {};
+
     this.failbackConfig = {
       dnsDomain: userConfig.dnsDomain,
       staticHosts: userConfig.staticHosts,
       transformUrl: userConfig.transformUrl,
+      onSuccess: userConfig.onSuccess,
       onFailback: userConfig.onFailback,
       onAllFailed: userConfig.onAllFailed,
     };
@@ -286,6 +290,25 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
               (stats.total * 8000) / (stats.loading.end - stats.loading.first);
 
             this.callbacks?.onProgress?.(stats, context, data, xhr);
+
+            // Call success callback if configured
+            this.failbackConfig.onSuccess?.(
+              xhr.responseURL,
+              this.failbackAttempt > 0,
+              this.failbackAttempt,
+            );
+
+            // Debug logging (only when HLS debug is enabled)
+            if (this.failbackAttempt > 0) {
+              logger.log(
+                `[FailbackLoader] SUCCESS via failback #${this.failbackAttempt}: ${xhr.responseURL}`,
+              );
+            } else {
+              logger.log(
+                `[FailbackLoader] SUCCESS (direct): ${xhr.responseURL}`,
+              );
+            }
+
             this.callbacks?.onSuccess?.(
               { url: xhr.responseURL, data, code: status },
               stats,
