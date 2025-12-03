@@ -2,8 +2,8 @@ name: Sync with upstream hls.js
 
 on:
   schedule:
-    # Каждый день в 3:00 UTC
-    - cron: '0 3 * * *'
+    # Каждые 6 часов
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -31,10 +31,29 @@ jobs:
           git remote add upstream https://github.com/video-dev/hls.js.git || true
           git fetch upstream --tags
 
-      - name: Check for upstream changes
+      - name: Check for new upstream release
         id: check
         run: |
-          UPSTREAM_COMMITS=$(git rev-list HEAD..upstream/master --count)
+          # Получить последний тег upstream (релиз hls.js)
+          LATEST_UPSTREAM_TAG=$(git tag -l --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+          # Получить upstream версию
+          git fetch upstream --tags
+          UPSTREAM_TAGS=$(git ls-remote --tags upstream | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "Latest upstream release: $UPSTREAM_TAGS"
+
+          # Проверить, есть ли у нас уже failback версия для этого релиза
+          if git tag | grep -q "${UPSTREAM_TAGS}-failback"; then
+            echo "Already have failback for $UPSTREAM_TAGS"
+            echo "new_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "New upstream release found: $UPSTREAM_TAGS"
+            echo "new_release=true" >> $GITHUB_OUTPUT
+            echo "upstream_tag=$UPSTREAM_TAGS" >> $GITHUB_OUTPUT
+          fi
+
+          # Также проверить новые коммиты
+          UPSTREAM_COMMITS=$(git rev-list HEAD..upstream/master --count 2>/dev/null || echo "0")
           echo "upstream_commits=$UPSTREAM_COMMITS" >> $GITHUB_OUTPUT
           echo "Found $UPSTREAM_COMMITS new commits from upstream"
 
@@ -83,7 +102,7 @@ jobs:
           npm install --package-lock-only || true
 
           git add package.json package-lock.json
-          git commit -m "Bump version to ${{ steps.version.outputs.new_version }}"
+          git commit -m "Auto-sync with upstream and auto-publish new versions"
 
       - name: Push changes and create tag
         if: steps.version.outputs.new_version != ''
@@ -104,3 +123,11 @@ jobs:
               body: 'Automatic sync with upstream hls.js failed due to merge conflicts. Please resolve manually.\n\nUpstream: https://github.com/video-dev/hls.js',
               labels: ['merge-conflict', 'upstream-sync']
             })
+
+      - name: Summary
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Upstream commits: ${{ steps.check.outputs.upstream_commits }}" >> $GITHUB_STEP_SUMMARY
+          echo "- New release: ${{ steps.check.outputs.new_release }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Merge success: ${{ steps.merge.outputs.merge_success || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- New version: ${{ steps.version.outputs.new_version || 'none' }}" >> $GITHUB_STEP_SUMMARY
