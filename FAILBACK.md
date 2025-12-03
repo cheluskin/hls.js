@@ -3,7 +3,7 @@
 Форк библиотеки [hls.js](https://github.com/video-dev/hls.js) с добавлением системы автоматического переключения на резервные хосты при загрузке фрагментов видео.
 
 **Пакет:** `@armdborg/hls.js`
-**Версия:** 1.6.0-failback.2
+**Версия:** 1.6.0-failback.7
 **Репозиторий:** https://github.com/cheluskin/hls.js
 
 ---
@@ -50,7 +50,7 @@
 │                 ▼                      ▼                        │
 │         Возврат данных    ┌────────────────────────┐           │
 │                           │ Попытка failback #1     │           │
-│                           │ failback.turkserial.co  │           │
+│                           │ host1-from-dns.com      │           │
 │                           └────────────────────────┘           │
 │                                        │                        │
 │                              Успех?    │                        │
@@ -60,8 +60,8 @@
 │                           │                      │              │
 │                           ▼                      ▼              │
 │                   Возврат данных    ┌────────────────────────┐ │
-│                                     │ Попытка failback #2     │ │
-│                                     │ last.turkserial.co      │ │
+│                                     │ Попытка failback #N     │ │
+│                                     │ hostN-from-dns.com      │ │
 │                                     └────────────────────────┘ │
 │                                                  │              │
 │                                        Успех?    │              │
@@ -96,10 +96,14 @@
 
 **Провайдеры DoH:**
 
-1. Cloudflare (`cloudflare-dns.com/dns-query`)
-2. Google (`dns.google/resolve`) — fallback
+1. Gcore (`dns.gcore.com/dns-query`) — основной
+2. Google (`dns.google/resolve`) — резервный
 
-**Кеширование:** Результат кешируется на всю сессию (один DNS-запрос за сессию).
+**Особенности:**
+
+- Параллельные запросы ко всем провайдерам (первый успешный ответ побеждает)
+- Таймаут 3 секунды на каждый провайдер
+- Результат кешируется на всю сессию
 
 ---
 
@@ -120,7 +124,7 @@ hls.attachMedia(video);
 Failback включен по умолчанию с настройками:
 
 - **DNS домен:** `fb.turoktv.com`
-- **Fallback хосты:** `['failback.turkserial.co', 'last.turkserial.co']`
+- **Fallback хост:** `failback.turkserial.co` (если DNS недоступен)
 
 ### Кастомная конфигурация
 
@@ -198,6 +202,9 @@ interface FailbackConfig {
   /** Кастомная функция трансформации URL */
   transformUrl?: (url: string, attempt: number) => string | null;
 
+  /** Callback при успешной загрузке */
+  onSuccess?: (url: string, wasFailback: boolean, attempt: number) => void;
+
   /** Callback при переключении на резервный хост */
   onFailback?: (
     originalUrl: string,
@@ -241,8 +248,8 @@ const loader = Hls.FailbackLoader;
 
 ```
 Оригинал:     https://cdn.example.com/video/stream/segment001.ts?token=abc
-Failback #1:  https://failback.turkserial.co/video/stream/segment001.ts?token=abc
-Failback #2:  https://last.turkserial.co/video/stream/segment001.ts?token=abc
+Failback #1:  https://host1-from-dns.example.com/video/stream/segment001.ts?token=abc
+Failback #2:  https://host2-from-dns.example.com/video/stream/segment001.ts?token=abc
 ```
 
 ---
@@ -300,7 +307,7 @@ FailbackLoader выводит в консоль информативные со�
 
 ```
 [DNS-TXT] Resolved fb.turoktv.com: host1.com, host2.com
-[DNS-TXT] Provider cloudflare-dns.com failed: Error
+[DNS-TXT] Provider dns.gcore.com failed: Error
 [DNS-TXT] Failed to resolve fb.turoktv.com from all providers
 ```
 
@@ -352,8 +359,14 @@ src/hls.ts                # Hls.FailbackLoader (строка 79)
 ```typescript
 const hls = new Hls({
   failbackConfig: {
+    onSuccess: (url, wasFailback, attempt) => {
+      // Метрика успешной загрузки
+      if (wasFailback) {
+        analytics.track('hls_failback_success', { url, attempt });
+      }
+    },
     onFailback: (original, failback, attempt) => {
-      // Отправка метрики
+      // Метрика переключения на резервный хост
       analytics.track('hls_failback', {
         original_url: original,
         failback_url: failback,
@@ -381,6 +394,43 @@ import XhrLoader from '@armdborg/hls.js/dist/utils/xhr-loader';
 const hls = new Hls({
   fLoader: XhrLoader,
 });
+```
+
+---
+
+## Откат версии
+
+### Через GitHub Actions (рекомендуется)
+
+1. Перейдите в репозиторий: https://github.com/cheluskin/hls.js
+2. Откройте вкладку **Actions**
+3. Слева выберите **"Rollback npm version"**
+4. Нажмите **"Run workflow"**
+5. Введите версию для отката (например: `1.6.0-failback.6`)
+6. Нажмите **"Run workflow"**
+
+Workflow автоматически переключит тег `latest` и очистит кэш jsDelivr.
+
+### Через npm CLI
+
+```bash
+# Откатить latest на предыдущую версию
+npm dist-tag add @armdborg/hls.js@1.6.0-failback.6 latest
+
+# Очистить кэш jsDelivr
+curl "https://purge.jsdelivr.net/npm/@armdborg/hls.js/dist/hls.min.js"
+```
+
+### На оригинальный hls.js
+
+Замените URL скрипта:
+
+```html
+<!-- Было (форк) -->
+<script src="https://cdn.jsdelivr.net/npm/@armdborg/hls.js/dist/hls.min.js"></script>
+
+<!-- Стало (оригинал) -->
+<script src="https://cdn.jsdelivr.net/npm/hls.js/dist/hls.min.js"></script>
 ```
 
 ---
