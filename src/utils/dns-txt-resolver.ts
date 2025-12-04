@@ -7,8 +7,8 @@ import { logger } from './logger';
 
 // DNS-over-HTTPS providers
 const DOH_PROVIDERS = [
-  'https://dns.gcore.com/dns-query',
   'https://dns.google/resolve',
+  'https://common.dot.dns.yandex.net/dns-query',
 ];
 
 interface DohResponse {

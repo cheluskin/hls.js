@@ -312,7 +312,7 @@
             <div class="label">DNS TXT Record Domain</div>
             <div style="margin-top: 10px">
               <div class="value" style="color: #888">
-                dns.gcore.com, dns.google
+                dns.google, dns.yandex.net
               </div>
               <div class="label">
                 DoH Providers (parallel requests, first wins)
@@ -458,8 +458,8 @@
 
         // Try multiple DoH providers in parallel - first success wins
         const providers = [
-          'https://dns.gcore.com/dns-query',
           'https://dns.google/resolve',
+          'https://common.dot.dns.yandex.net/dns-query',
         ];
 
         try {
