@@ -5,10 +5,10 @@
 
 import { logger } from './logger';
 
-// DNS-over-HTTPS providers
+// DNS-over-HTTPS providers (must support CORS for browser requests)
 const DOH_PROVIDERS = [
   'https://dns.google/resolve',
-  'https://common.dot.dns.yandex.net/dns-query',
+  'https://cloudflare-dns.com/dns-query',
 ];
 
 interface DohResponse {
