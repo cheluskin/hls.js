@@ -233,6 +233,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     xhr.onreadystatechange = () => this.onReadyStateChange(xhr, url);
     xhr.onprogress = this.onProgress.bind(this);
+    xhr.onerror = () => this.onNetworkError(url);
 
     const { maxTimeToFirstByteMs, maxLoadTimeMs } = config.loadPolicy;
     const timeout =
@@ -390,6 +391,42 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       this.stats,
       this.context as FragmentLoaderContext,
       this.loader,
+    );
+  }
+
+  private onNetworkError(currentUrl: string) {
+    self.clearTimeout(this.requestTimeout);
+
+    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
+
+    if (failbackUrl && failbackUrl !== currentUrl) {
+      this.failbackAttempt++;
+
+      this.failbackConfig.onFailback?.(
+        this.originalUrl,
+        failbackUrl,
+        this.failbackAttempt,
+      );
+
+      logger.log(
+        `[FailbackLoader] ${currentUrl} network error, trying: ${failbackUrl}`,
+      );
+
+      this.loader = null;
+      this.loadUrl(failbackUrl);
+      return;
+    }
+
+    this.failbackConfig.onAllFailed?.(
+      this.originalUrl,
+      this.failbackAttempt + 1,
+    );
+
+    this.callbacks?.onError?.(
+      { code: 0, text: 'Network error' },
+      this.context as FragmentLoaderContext,
+      this.loader,
+      this.stats,
     );
   }
 
