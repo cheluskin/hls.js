@@ -1,8 +1,55 @@
+[![npm](https://img.shields.io/npm/v/@armdborg/hls.js.svg?style=flat)](https://npmjs.org/package/@armdborg/hls.js)
+[![](https://data.jsdelivr.com/v1/package/npm/@armdborg/hls.js/badge?style=rounded)](https://www.jsdelivr.com/package/npm/@armdborg/hls.js)
+
+# @armdborg/hls.js - Fork with Failback CDN Support
+
+This is a fork of [hls.js](https://github.com/video-dev/hls.js) with **automatic CDN failback** functionality. When a CDN is blocked or unreachable, the library automatically switches to backup servers.
+
+## Quick Start (Failback Version)
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/@armdborg/hls.js/dist/hls.min.js"></script>
+```
+
+Just replace the original hls.js - failback works automatically!
+
+## How Failback Works
+
+1. The library loads failback server list from DNS TXT record (`fb.turoktv.com`)
+2. When a segment fails to load (timeout/error), it automatically retries from failback CDN
+3. Failback hosts respect GeoDNS ordering for optimal performance
+4. Falls back to hardcoded hosts if DNS lookup fails
+
+## For Developers: Publishing New Version
+
+Publishing is automated via GitHub Actions:
+
+```bash
+# 1. Make your changes and commit
+git add .
+git commit -m "Your commit message"
+
+# 2. Bump version (creates git tag automatically)
+npm version prerelease --preid=failback
+
+# 3. Push changes and tag
+git push origin master
+git push origin v1.6.0-failback.XX  # replace XX with actual version
+
+# GitHub Actions will automatically:
+# - Build the library
+# - Run tests
+# - Publish to npm
+# - Create GitHub Release
+```
+
+---
+
+# Original HLS.js Documentation
+
 [![npm](https://img.shields.io/npm/v/hls.js.svg?style=flat)](https://npmjs.org/package/hls.js)
 [![npm](https://img.shields.io/npm/v/hls.js/canary.svg?style=flat)](https://www.npmjs.com/package/hls.js/v/canary)
 [![](https://data.jsdelivr.com/v1/package/npm/hls.js/badge?style=rounded)](https://www.jsdelivr.com/package/npm/hls.js)
-[![Sauce Test Status](https://saucelabs.com/buildstatus/robwalch)](https://app.saucelabs.com/u/robwalch)
-[![jsDeliver](https://data.jsdelivr.com/v1/package/npm/hls.js/badge)](https://www.jsdelivr.com/package/npm/hls.js)
 
 [comment]: <> ([![Sauce Test Status]&#40;https://saucelabs.com/browser-matrix/robwalch.svg&#41;]&#40;https://saucelabs.com/u/robwalch&#41;)
 
