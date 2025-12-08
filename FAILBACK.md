@@ -3,7 +3,7 @@
 Форк библиотеки [hls.js](https://github.com/video-dev/hls.js) с добавлением системы автоматического переключения на резервные хосты при загрузке фрагментов видео.
 
 **Пакет:** `@armdborg/hls.js`
-**Версия:** 1.6.0-failback.8
+**Версия:** 1.6.0-failback.13
 **Репозиторий:** https://github.com/cheluskin/hls.js
 
 ---
@@ -335,6 +335,53 @@ npm install @armdborg/hls.js
 - Drop-in замена: просто замените `hls.js` на `@armdborg/hls.js`
 - Автоматическая синхронизация с upstream (daily)
 - Версионирование: `{upstream-version}-failback.{N}`
+
+---
+
+## Релиз новой версии
+
+Публикация в npm происходит автоматически через GitHub Actions при пуше тега `v*`.
+
+### Процесс релиза
+
+```bash
+# 1. Убедиться что код собирается и тесты проходят
+npm run build
+npm run test:failback
+
+# 2. Закоммитить изменения
+git add -A
+git commit -m "fix/feat: описание изменений"
+
+# 3. Обновить версию (автоматически создаёт коммит и тег с префиксом v)
+npm version prerelease --preid=failback
+# Результат: v1.6.0-failback.14
+
+# 4. Пересобрать с новой версией в бандле
+npm run build
+
+# 5. Запушить коммиты и теги
+git push origin master --tags
+```
+
+### Что происходит автоматически
+
+После пуша тега `v*` GitHub Actions workflow (`.github/workflows/build-release.yml`):
+
+1. Собирает проект
+2. Запускает failback тесты
+3. Публикует в npm с тегом `failback`
+4. Создаёт GitHub Release с CDN ссылками
+
+### Проверка статуса
+
+```bash
+# Проверить статус workflow
+gh run list --repo cheluskin/hls.js --limit 3
+
+# Проверить опубликованную версию
+npm view @armdborg/hls.js versions --json | tail -5
+```
 
 ---
 
