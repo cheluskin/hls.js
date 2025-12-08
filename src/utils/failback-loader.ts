@@ -22,6 +22,40 @@ const FALLBACK_HOSTS = ['failback.turkserial.co'];
 let dnsHostsPromise: Promise<string[]> | null = null;
 let dnsHostsCache: string[] | null = null;
 
+// Global state for permanent failback mode
+// After N consecutive failures on original source, switch to failback permanently
+let consecutiveOriginalFailures = 0;
+let permanentFailbackMode = false;
+const PERMANENT_FAILBACK_THRESHOLD = 2;
+
+/**
+ * Get current failback state (for monitoring/debugging)
+ */
+export function getFailbackState(): {
+  consecutiveFailures: number;
+  permanentMode: boolean;
+  threshold: number;
+} {
+  return {
+    consecutiveFailures: consecutiveOriginalFailures,
+    permanentMode: permanentFailbackMode,
+    threshold: PERMANENT_FAILBACK_THRESHOLD,
+  };
+}
+
+/**
+ * Reset failback state (for debugging or when you want to retry original source)
+ * Use with caution in production!
+ */
+export function resetFailbackState(): void {
+  const wasInPermanentMode = permanentFailbackMode;
+  consecutiveOriginalFailures = 0;
+  permanentFailbackMode = false;
+  if (wasInPermanentMode) {
+    logger.log('[FailbackLoader] State reset - will try original source again');
+  }
+}
+
 /**
  * Preload failback hosts from DNS
  * Call this early in app initialization for best performance
@@ -173,6 +207,20 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.loaderConfig = config;
     this.failbackAttempt = 0;
     this.originalUrl = context.url;
+
+    // In permanent failback mode, skip original source entirely
+    if (permanentFailbackMode) {
+      const failbackUrl = this.getFailbackUrl(0);
+      if (failbackUrl) {
+        this.failbackAttempt = 1;
+        logger.log(
+          `[FailbackLoader] PERMANENT FAILBACK MODE - skipping original, using: ${failbackUrl}`,
+        );
+        this.loadUrl(failbackUrl);
+        return;
+      }
+    }
+
     this.loadUrl(context.url);
   }
 
@@ -197,9 +245,20 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     try {
       const url = new URL(this.originalUrl);
+      const failbackHost = hosts[attempt];
 
-      // Replace host with failback host, keeping the path
-      url.host = hosts[attempt];
+      // Parse failback host (may include port like "cdn.example.com:8080")
+      if (failbackHost.includes(':')) {
+        const [hostname, port] = failbackHost.split(':');
+        url.hostname = hostname;
+        url.port = port;
+      } else {
+        url.hostname = failbackHost;
+        url.port = ''; // Reset port to default for protocol
+      }
+
+      // Always use HTTPS for failback hosts (CDNs require it)
+      url.protocol = 'https:';
 
       return url.toString();
     } catch {
@@ -299,8 +358,23 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
               this.failbackAttempt,
             );
 
-            // Debug logging (only when HLS debug is enabled)
-            if (this.failbackAttempt > 0) {
+            // Track consecutive failures for permanent failback mode
+            if (this.failbackAttempt === 0 && !permanentFailbackMode) {
+              // Success on original source - reset failure counter
+              if (consecutiveOriginalFailures > 0) {
+                logger.log(
+                  `[FailbackLoader] Original source recovered, resetting failure counter`,
+                );
+              }
+              consecutiveOriginalFailures = 0;
+            }
+
+            // Debug logging
+            if (permanentFailbackMode) {
+              logger.log(
+                `[FailbackLoader] SUCCESS (permanent failback): ${xhr.responseURL}`,
+              );
+            } else if (this.failbackAttempt > 0) {
               logger.log(
                 `[FailbackLoader] SUCCESS via failback #${this.failbackAttempt}: ${xhr.responseURL}`,
               );
@@ -326,6 +400,22 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   private handleError(xhr: XMLHttpRequest, currentUrl: string, status: number) {
+    // Track failures on original source (not already in permanent mode)
+    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
+      consecutiveOriginalFailures++;
+      logger.log(
+        `[FailbackLoader] Original source failed (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+      );
+
+      // Check if we should switch to permanent failback mode
+      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        permanentFailbackMode = true;
+        logger.log(
+          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+        );
+      }
+    }
+
     const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
 
     if (failbackUrl && failbackUrl !== currentUrl) {
@@ -362,6 +452,21 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   private onTimeout(currentUrl: string) {
+    // Track failures on original source (not already in permanent mode)
+    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
+      consecutiveOriginalFailures++;
+      logger.log(
+        `[FailbackLoader] Original source timeout (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+      );
+
+      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        permanentFailbackMode = true;
+        logger.log(
+          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+        );
+      }
+    }
+
     const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
 
     if (failbackUrl && failbackUrl !== currentUrl) {
@@ -405,6 +510,21 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
 
     self.clearTimeout(this.requestTimeout);
+
+    // Track failures on original source (not already in permanent mode)
+    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
+      consecutiveOriginalFailures++;
+      logger.log(
+        `[FailbackLoader] Original source network error (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+      );
+
+      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        permanentFailbackMode = true;
+        logger.log(
+          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+        );
+      }
+    }
 
     const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
 
