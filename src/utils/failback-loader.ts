@@ -32,6 +32,10 @@ const PERMANENT_FAILBACK_THRESHOLD = 2; // Switch to permanent failback after 2 
 const STALL_TIMEOUT_MS = 5000; // 5 seconds without progress = stalled
 const STALL_CHECK_INTERVAL_MS = 1000; // Check every second
 
+// Minimum required throughput to consider connection healthy
+// 4KB/s is extremely low for video (even 144p), so if we are below this, we are definitely stalling/trickling
+const MIN_SPEED_BYTES_PER_SEC = 4096;
+
 /**
  * Get current failback state (for monitoring/debugging)
  */
@@ -133,6 +137,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private stallCheckInterval?: number;
   private currentUrl: string = '';
 
+  // Throughput detection
+  private lastTotalBytes: number = 0;
+  private lowSpeedDuration: number = 0;
+
   constructor(config: HlsConfig) {
     this.config = config;
     this.stats = new LoadStats();
@@ -189,12 +197,51 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.stopStallCheck();
     this.currentUrl = url;
     this.lastProgressTime = self.performance.now();
+    this.lastTotalBytes = this.stats.loaded || 0;
+    this.lowSpeedDuration = 0;
 
     this.stallCheckInterval = self.setInterval(() => {
-      const timeSinceProgress = self.performance.now() - this.lastProgressTime;
+      const now = self.performance.now();
+
+      // 1. Strict Silence Check (original logic)
+      // If we haven't received ANY event for STALL_TIMEOUT_MS
+      const timeSinceProgress = now - this.lastProgressTime;
       if (timeSinceProgress > STALL_TIMEOUT_MS) {
+        logger.log(
+          `[FailbackLoader] Strict stall detected (no events for ${timeSinceProgress}ms)`,
+        );
         this.onStall();
+        return;
       }
+
+      // 2. Minimum Throughput Check (trickle detection)
+      // Check how many bytes we received since last interval check
+      const currentLoaded = this.stats.loaded;
+      const bytesDiff = currentLoaded - this.lastTotalBytes;
+
+      // Calculate minimum bytes required per this interval (assuming 1s interval)
+      // If interval changes, this math needs adjustment
+      const minBytesRequired =
+        MIN_SPEED_BYTES_PER_SEC * (STALL_CHECK_INTERVAL_MS / 1000);
+
+      // Only check for stalls if we have started loading (loaded > 0)
+      if (currentLoaded > 0 && bytesDiff < minBytesRequired) {
+        this.lowSpeedDuration += STALL_CHECK_INTERVAL_MS;
+        // logger.log(`[FailbackLoader] Low speed detected: ${bytesDiff} bytes in last interval. Duration: ${this.lowSpeedDuration}ms`);
+
+        if (this.lowSpeedDuration >= STALL_TIMEOUT_MS) {
+          logger.log(
+            `[FailbackLoader] Throughput stall detected (speed < ${MIN_SPEED_BYTES_PER_SEC} B/s for ${this.lowSpeedDuration}ms)`,
+          );
+          this.onStall();
+          return;
+        }
+      } else {
+        // Speed is good, reset counter
+        this.lowSpeedDuration = 0;
+      }
+
+      this.lastTotalBytes = currentLoaded;
     }, STALL_CHECK_INTERVAL_MS);
   }
 

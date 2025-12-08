@@ -211,7 +211,20 @@ function getFailbackUrl(originalUrl, hosts, attempt) {
   if (attempt >= hosts.length) return null;
   try {
     const url = new URL(originalUrl);
-    url.host = hosts[attempt];
+    const failbackHost = hosts[attempt];
+
+    // Parse failback host (may include port like "cdn.example.com:8080")
+    if (failbackHost.includes(':')) {
+      const [hostname, port] = failbackHost.split(':');
+      url.hostname = hostname;
+      url.port = port;
+    } else {
+      url.hostname = failbackHost;
+      url.port = ''; // Reset port to default
+    }
+
+    // Always use HTTPS for failback hosts (CDNs require it)
+    url.protocol = 'https:';
     return url.toString();
   } catch {
     return null;
@@ -256,14 +269,15 @@ test('URL preserves protocol (https)', () => {
   assert.equal(parsed.protocol, 'https:');
 });
 
-test('URL preserves protocol (http)', () => {
+test('URL upgrades http to https for failback', () => {
   const hosts = ['cdn.example.com'];
   const httpUrl = 'http://origin.example.com/video.ts';
 
   const failbackUrl = getFailbackUrl(httpUrl, hosts, 0);
   const parsed = new URL(failbackUrl);
 
-  assert.equal(parsed.protocol, 'http:');
+  // Failback always uses HTTPS (CDNs require it)
+  assert.equal(parsed.protocol, 'https:');
 });
 
 test('URL preserves port number', () => {
