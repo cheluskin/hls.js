@@ -233,7 +233,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     xhr.onreadystatechange = () => this.onReadyStateChange(xhr, url);
     xhr.onprogress = this.onProgress.bind(this);
-    xhr.onerror = () => this.onNetworkError(url);
+    xhr.onerror = () => this.onNetworkError(xhr, url);
 
     const { maxTimeToFirstByteMs, maxLoadTimeMs } = config.loadPolicy;
     const timeout =
@@ -398,7 +398,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     );
   }
 
-  private onNetworkError(currentUrl: string) {
+  private onNetworkError(xhr: XMLHttpRequest, currentUrl: string) {
+    // Ignore if this is not the current loader (stale callback from previous request)
+    if (this.loader !== xhr) {
+      return;
+    }
+
     self.clearTimeout(this.requestTimeout);
 
     const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
