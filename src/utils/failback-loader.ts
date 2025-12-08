@@ -26,7 +26,11 @@ let dnsHostsCache: string[] | null = null;
 // After N consecutive failures on original source, switch to failback permanently
 let consecutiveOriginalFailures = 0;
 let permanentFailbackMode = false;
-const PERMANENT_FAILBACK_THRESHOLD = 2;
+const PERMANENT_FAILBACK_THRESHOLD = 2; // Switch to permanent failback after 2 consecutive failures
+
+// Stall detection: if no progress for this duration, trigger failback
+const STALL_TIMEOUT_MS = 5000; // 5 seconds without progress = stalled
+const STALL_CHECK_INTERVAL_MS = 1000; // Check every second
 
 /**
  * Get current failback state (for monitoring/debugging)
@@ -124,6 +128,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private requestTimeout?: number;
   private loaderConfig: LoaderConfiguration | null = null;
 
+  // Stall detection
+  private lastProgressTime: number = 0;
+  private stallCheckInterval?: number;
+  private currentUrl: string = '';
+
   constructor(config: HlsConfig) {
     this.config = config;
     this.stats = new LoadStats();
@@ -162,18 +171,96 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   destroy() {
     this.abortInternal();
+    this.stopStallCheck();
     this.loader = null;
     this.callbacks = null;
     this.context = null;
     this.loaderConfig = null;
   }
 
+  private stopStallCheck() {
+    if (this.stallCheckInterval) {
+      self.clearInterval(this.stallCheckInterval);
+      this.stallCheckInterval = undefined;
+    }
+  }
+
+  private startStallCheck(url: string) {
+    this.stopStallCheck();
+    this.currentUrl = url;
+    this.lastProgressTime = self.performance.now();
+
+    this.stallCheckInterval = self.setInterval(() => {
+      const timeSinceProgress = self.performance.now() - this.lastProgressTime;
+      if (timeSinceProgress > STALL_TIMEOUT_MS) {
+        this.onStall();
+      }
+    }, STALL_CHECK_INTERVAL_MS);
+  }
+
+  private onStall() {
+    const currentUrl = this.currentUrl;
+    this.stopStallCheck();
+
+    // Track failures on original source (not already in permanent mode)
+    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
+      consecutiveOriginalFailures++;
+      logger.log(
+        `[FailbackLoader] Original source stalled - no progress for ${STALL_TIMEOUT_MS}ms (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+      );
+
+      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        permanentFailbackMode = true;
+        logger.log(
+          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+        );
+      }
+    }
+
+    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
+
+    if (failbackUrl && failbackUrl !== currentUrl) {
+      this.failbackAttempt++;
+      this.abortInternal();
+      // Reset aborted flag so failback response is not ignored
+      this.stats.aborted = false;
+
+      this.failbackConfig.onFailback?.(
+        this.originalUrl,
+        failbackUrl,
+        this.failbackAttempt,
+      );
+
+      logger.log(
+        `[FailbackLoader] ${currentUrl} stalled, trying: ${failbackUrl}`,
+      );
+
+      this.loader = null;
+      this.loadUrl(failbackUrl);
+      return;
+    }
+
+    this.failbackConfig.onAllFailed?.(
+      this.originalUrl,
+      this.failbackAttempt + 1,
+    );
+
+    this.abortInternal();
+    this.callbacks?.onTimeout?.(
+      this.stats,
+      this.context as FragmentLoaderContext,
+      this.loader,
+    );
+  }
+
   private abortInternal() {
     const loader = this.loader;
     self.clearTimeout(this.requestTimeout);
+    this.stopStallCheck();
     if (loader) {
       loader.onreadystatechange = null;
       loader.onprogress = null;
+      loader.onerror = null; // Clear error handler to prevent stale callbacks
       if (loader.readyState !== 4) {
         this.stats.aborted = true;
         loader.abort();
@@ -304,6 +391,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.requestTimeout = self.setTimeout(() => this.onTimeout(url), timeout);
 
     xhr.send();
+
+    // Start stall detection (separate from timeout - detects when download stalls)
+    this.startStallCheck(url);
   }
 
   private onReadyStateChange(xhr: XMLHttpRequest, currentUrl: string) {
@@ -329,6 +419,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
       if (xhr.readyState === 4) {
         self.clearTimeout(this.requestTimeout);
+        this.stopStallCheck();
         xhr.onreadystatechange = null;
         xhr.onprogress = null;
 
@@ -400,6 +491,8 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   private handleError(xhr: XMLHttpRequest, currentUrl: string, status: number) {
+    this.stopStallCheck(); // Ensure stall check is stopped
+
     // Track failures on original source (not already in permanent mode)
     if (this.failbackAttempt === 0 && !permanentFailbackMode) {
       consecutiveOriginalFailures++;
@@ -510,6 +603,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
 
     self.clearTimeout(this.requestTimeout);
+    this.stopStallCheck();
 
     // Track failures on original source (not already in permanent mode)
     if (this.failbackAttempt === 0 && !permanentFailbackMode) {
@@ -566,6 +660,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     if (event.lengthComputable) {
       this.stats.total = event.total;
     }
+
+    // Update last progress time for stall detection
+    this.lastProgressTime = self.performance.now();
   }
 
   getCacheAge(): number | null {

@@ -1,0 +1,770 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>HLS.js Failback - RKN Blocking Simulator</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+        background: #1a1a2e;
+        color: #eee;
+      }
+
+      h1 {
+        color: #ff4757;
+        margin-bottom: 5px;
+      }
+
+      .subtitle {
+        color: #888;
+        margin-bottom: 20px;
+      }
+
+      .container {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+      }
+
+      @media (max-width: 1000px) {
+        .container {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .section {
+        background: #16213e;
+        padding: 20px;
+        border-radius: 10px;
+      }
+
+      .section h3 {
+        color: #00d4ff;
+        margin: 0 0 15px 0;
+      }
+
+      video {
+        width: 100%;
+        background: #000;
+        border-radius: 5px;
+      }
+
+      /* Blocking mode selector */
+      .blocking-controls {
+        grid-column: 1 / -1;
+      }
+
+      .mode-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 10px;
+        margin-bottom: 15px;
+      }
+
+      .mode-card {
+        background: #0f3460;
+        padding: 15px;
+        border-radius: 8px;
+        cursor: pointer;
+        border: 2px solid transparent;
+        transition: all 0.2s;
+      }
+
+      .mode-card:hover {
+        border-color: #00d4ff;
+      }
+
+      .mode-card.active {
+        border-color: #ff4757;
+        background: #1a1a3e;
+      }
+
+      .mode-card h4 {
+        margin: 0 0 5px 0;
+        color: #ff4757;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .mode-card p {
+        margin: 0;
+        font-size: 12px;
+        color: #888;
+      }
+
+      .mode-icon {
+        font-size: 18px;
+      }
+
+      /* Stats */
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 10px;
+        margin-top: 15px;
+      }
+
+      .stat-box {
+        background: #0f3460;
+        padding: 15px;
+        border-radius: 8px;
+        text-align: center;
+      }
+
+      .stat-box .value {
+        font-size: 24px;
+        font-weight: bold;
+      }
+
+      .stat-box .label {
+        font-size: 11px;
+        color: #888;
+        margin-top: 5px;
+      }
+
+      .stat-direct .value {
+        color: #00ff88;
+      }
+      .stat-failback .value {
+        color: #ffaa00;
+      }
+      .stat-blocked .value {
+        color: #ff4757;
+      }
+      .stat-errors .value {
+        color: #ff6b6b;
+      }
+
+      /* Logs */
+      .logs-section {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .logs-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+
+      .clear-btn {
+        background: #ff4757;
+        color: white;
+        border: none;
+        padding: 5px 15px;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+
+      #logs {
+        background: #0a0a15;
+        padding: 15px;
+        border-radius: 8px;
+        height: 400px;
+        overflow-y: auto;
+        font-family: 'Monaco', 'Menlo', monospace;
+        font-size: 12px;
+        flex-grow: 1;
+      }
+
+      .log-entry {
+        padding: 8px 10px;
+        margin-bottom: 5px;
+        border-radius: 4px;
+        border-left: 3px solid;
+      }
+
+      .log-info {
+        background: #1a1a3e;
+        border-color: #00d4ff;
+        color: #00d4ff;
+      }
+      .log-success {
+        background: #1a3e1a;
+        border-color: #00ff88;
+        color: #00ff88;
+      }
+      .log-failback {
+        background: #3e3a1a;
+        border-color: #ffaa00;
+        color: #ffaa00;
+      }
+      .log-blocked {
+        background: #3e1a2a;
+        border-color: #ff4757;
+        color: #ff4757;
+      }
+      .log-error {
+        background: #3e1a1a;
+        border-color: #ff6b6b;
+        color: #ff6b6b;
+      }
+
+      .log-time {
+        color: #666;
+        margin-right: 10px;
+      }
+
+      .log-url {
+        color: #888;
+        font-size: 11px;
+        margin-top: 3px;
+        word-break: break-all;
+      }
+
+      .log-details {
+        color: #666;
+        font-size: 10px;
+        margin-top: 2px;
+      }
+
+      /* Test controls */
+      .test-controls {
+        display: flex;
+        gap: 10px;
+        margin-top: 15px;
+      }
+
+      .btn {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        font-weight: bold;
+        transition: all 0.2s;
+      }
+
+      .btn-primary {
+        background: #00d4ff;
+        color: #1a1a2e;
+      }
+
+      .btn-danger {
+        background: #ff4757;
+        color: white;
+      }
+
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+      }
+
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .all-blocked-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        cursor: pointer;
+        padding: 10px 15px;
+        background: #0f3460;
+        border-radius: 5px;
+        font-size: 13px;
+        transition: all 0.2s;
+      }
+
+      .all-blocked-toggle:hover {
+        background: #1a3e6e;
+      }
+
+      .all-blocked-toggle input[type='checkbox'] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+        accent-color: #ff4757;
+      }
+
+      .all-blocked-toggle input:checked + span {
+        color: #ff4757;
+      }
+
+      /* SW status */
+      .sw-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 12px;
+        border-radius: 20px;
+        font-size: 12px;
+        background: #0f3460;
+      }
+
+      .sw-status.active {
+        background: #1a3e1a;
+        color: #00ff88;
+      }
+
+      .sw-status.inactive {
+        background: #3e1a1a;
+        color: #ff4757;
+      }
+
+      .sw-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      /* Legend */
+      .legend {
+        display: flex;
+        gap: 15px;
+        margin-top: 15px;
+        flex-wrap: wrap;
+        font-size: 12px;
+      }
+
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .legend-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+      }
+    </style>
+    <script src="../dist/hls.js"></script>
+  </head>
+
+  <body>
+    <h1>RKN Blocking Simulator</h1>
+    <p class="subtitle">
+      Test failback behavior against different Roskomnadzor blocking methods
+    </p>
+
+    <div class="container">
+      <!-- Blocking Mode Selection -->
+      <div class="section blocking-controls">
+        <h3>
+          Blocking Mode
+          <span id="sw-status" class="sw-status inactive">
+            <span class="sw-dot"></span>
+            <span>SW not ready</span>
+          </span>
+        </h3>
+
+        <div class="mode-grid">
+          <div class="mode-card active" data-mode="reset">
+            <h4><span class="mode-icon">X</span> Connection Reset</h4>
+            <p>net::ERR_CONNECTION_RESET - instant TCP reset</p>
+          </div>
+
+          <div class="mode-card" data-mode="timeout">
+            <h4><span class="mode-icon">...</span> Infinite Timeout</h4>
+            <p>Request hangs forever - DPI deep inspection</p>
+          </div>
+
+          <div class="mode-card" data-mode="403">
+            <h4><span class="mode-icon">!</span> HTTP 403</h4>
+            <p>ISP block page - instant forbidden response</p>
+          </div>
+
+          <div class="mode-card" data-mode="dns">
+            <h4><span class="mode-icon">?</span> DNS Failure</h4>
+            <p>net::ERR_NAME_NOT_RESOLVED - poisoned DNS</p>
+          </div>
+
+          <div class="mode-card" data-mode="slow-403">
+            <h4><span class="mode-icon">~</span> Slow 403</h4>
+            <p>2-5 sec delay then 403 - DPI with delay</p>
+          </div>
+
+          <div class="mode-card" data-mode="partial">
+            <h4><span class="mode-icon">▌</span> Partial Stall</h4>
+            <p>Send headers + 1-5KB then stall forever - real CDN behavior</p>
+          </div>
+
+          <div class="mode-card" data-mode="mixed">
+            <h4><span class="mode-icon">*</span> Mixed (Random)</h4>
+            <p>Random blocking method for each request</p>
+          </div>
+        </div>
+
+        <div class="test-controls">
+          <button id="btn-start" class="btn btn-primary">Start Test</button>
+          <button id="btn-stop" class="btn btn-danger" disabled>
+            Stop Test
+          </button>
+          <label class="all-blocked-toggle">
+            <input type="checkbox" id="all-blocked" />
+            <span>All segments blocked (full CDN block)</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Video Player -->
+      <div class="section">
+        <h3>Video Player</h3>
+        <video id="video" controls></video>
+
+        <div class="stats">
+          <div class="stat-box stat-direct">
+            <div class="value" id="stat-direct">0</div>
+            <div class="label">Direct Success</div>
+          </div>
+          <div class="stat-box stat-failback">
+            <div class="value" id="stat-failback">0</div>
+            <div class="label">Failback Success</div>
+          </div>
+          <div class="stat-box stat-blocked">
+            <div class="value" id="stat-blocked">0</div>
+            <div class="label">Blocked Attempts</div>
+          </div>
+          <div class="stat-box stat-errors">
+            <div class="value" id="stat-errors">0</div>
+            <div class="label">Total Failures</div>
+          </div>
+        </div>
+
+        <div class="legend">
+          <div class="legend-item">
+            <div class="legend-dot" style="background: #00ff88"></div>
+            Direct
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: #ffaa00"></div>
+            Failback
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: #ff4757"></div>
+            Blocked
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background: #ff6b6b"></div>
+            Error
+          </div>
+        </div>
+      </div>
+
+      <!-- Event Log -->
+      <div class="section logs-section">
+        <div class="logs-header">
+          <h3>Event Log</h3>
+          <button class="clear-btn" onclick="clearLogs()">Clear</button>
+        </div>
+        <div id="logs"></div>
+      </div>
+    </div>
+
+    <script>
+      // ============================================
+      // Configuration
+      // ============================================
+      const BLOCKED_PORT = 8081;
+      const CONTROL_PORT = 8082;
+      const BLOCKED_HOST = `localhost:${BLOCKED_PORT}`;
+      const BACKUP_HOST = 'test-streams.mux.dev';
+
+      // ============================================
+      // Blocking Server Control
+      // ============================================
+      let currentMode = 'reset';
+      let serverConnected = false;
+
+      async function checkServerStatus() {
+        try {
+          const res = await fetch(`http://localhost:${CONTROL_PORT}/status`);
+          const data = await res.json();
+          serverConnected = true;
+          updateServerStatus(true, data.mode);
+          return data;
+        } catch (e) {
+          serverConnected = false;
+          updateServerStatus(false);
+          return null;
+        }
+      }
+
+      function updateServerStatus(connected, mode = null) {
+        const el = document.getElementById('sw-status');
+        if (connected) {
+          el.className = 'sw-status active';
+          el.innerHTML = `<span class="sw-dot"></span><span>Server: ${mode || currentMode}</span>`;
+        } else {
+          el.className = 'sw-status inactive';
+          el.innerHTML =
+            '<span class="sw-dot"></span><span>Server offline</span>';
+        }
+      }
+
+      // ============================================
+      // Mode Selection
+      // ============================================
+      document.querySelectorAll('.mode-card').forEach((card) => {
+        card.addEventListener('click', async () => {
+          document
+            .querySelectorAll('.mode-card')
+            .forEach((c) => c.classList.remove('active'));
+          card.classList.add('active');
+          currentMode = card.dataset.mode;
+
+          // Update server if connected
+          if (serverConnected) {
+            await setServerBlockingMode(currentMode);
+            updateServerStatus(true, currentMode);
+          }
+        });
+      });
+
+      // ============================================
+      // Stats & Logging
+      // ============================================
+      const video = document.getElementById('video');
+      const logsEl = document.getElementById('logs');
+      let stats = { direct: 0, failback: 0, blocked: 0, errors: 0 };
+
+      function updateStats() {
+        document.getElementById('stat-direct').textContent = stats.direct;
+        document.getElementById('stat-failback').textContent = stats.failback;
+        document.getElementById('stat-blocked').textContent = stats.blocked;
+        document.getElementById('stat-errors').textContent = stats.errors;
+      }
+
+      function log(message, type = 'info', url = null, details = null) {
+        const div = document.createElement('div');
+        div.className = `log-entry log-${type}`;
+
+        const time = new Date().toLocaleTimeString();
+        let html = `<span class="log-time">${time}</span>${message}`;
+
+        if (url) {
+          try {
+            const u = new URL(url);
+            const pathParts = u.pathname.split('/').filter(Boolean);
+            const shortPath = pathParts.slice(-2).join('/');
+            html += `<div class="log-url">${u.host}/.../${shortPath}</div>`;
+          } catch {
+            html += `<div class="log-url">${url}</div>`;
+          }
+        }
+
+        if (details) {
+          html += `<div class="log-details">${details}</div>`;
+        }
+
+        div.innerHTML = html;
+        logsEl.appendChild(div);
+        logsEl.scrollTop = logsEl.scrollHeight;
+      }
+
+      function clearLogs() {
+        logsEl.innerHTML = '';
+        stats = { direct: 0, failback: 0, blocked: 0, errors: 0 };
+        updateStats();
+      }
+
+      // ============================================
+      // HLS Player
+      // ============================================
+      let hls = null;
+
+      // Check if blocking server is running
+      async function checkBlockingServer() {
+        try {
+          const res = await fetch(`http://localhost:${CONTROL_PORT}/status`);
+          const data = await res.json();
+          log(
+            `Blocking server connected (mode: ${data.mode})`,
+            'info',
+            null,
+            `Requests served: ${data.requestCount}`
+          );
+          return true;
+        } catch (e) {
+          log(
+            'Blocking server not running!',
+            'error',
+            null,
+            'Run: node demo/blocking-server.mjs'
+          );
+          return false;
+        }
+      }
+
+      // Set blocking mode on server
+      async function setServerBlockingMode(mode) {
+        try {
+          await fetch(`http://localhost:${CONTROL_PORT}/mode`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode }),
+          });
+        } catch (e) {
+          console.error('Failed to set blocking mode:', e);
+        }
+      }
+
+      // Create playlist with blocked segments
+      function createTestPlaylist() {
+        const allBlocked = document.getElementById('all-blocked').checked;
+
+        // Mix of blocked (localhost) and direct (real CDN) segments
+        // When allBlocked=true, ALL segments go through blocked host
+        const segments = [
+          { blocked: allBlocked || false, index: 462 },
+          { blocked: allBlocked || false, index: 463 },
+          { blocked: allBlocked || true, index: 464 },
+          { blocked: allBlocked || false, index: 465 },
+          { blocked: allBlocked || true, index: 466 },
+          { blocked: allBlocked || true, index: 467 },
+          { blocked: allBlocked || false, index: 468 },
+          { blocked: allBlocked || true, index: 469 },
+          { blocked: allBlocked || false, index: 470 },
+          { blocked: allBlocked || true, index: 471 },
+          { blocked: allBlocked || false, index: 472 },
+          { blocked: allBlocked || false, index: 473 },
+        ];
+
+        let playlist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-TARGETDURATION:11
+`;
+
+        segments.forEach((seg) => {
+          const duration = seg.index === 469 ? '9.950' : '10.000';
+          const host = seg.blocked ? BLOCKED_HOST : BACKUP_HOST;
+          const protocol = seg.blocked ? 'http' : 'https';
+          playlist += `#EXTINF:${duration},
+${protocol}://${host}/x36xhzz/url_0/url_${seg.index}/193039199_mp4_h264_aac_hd_7.ts
+`;
+        });
+
+        playlist += '#EXT-X-ENDLIST\n';
+        return playlist;
+      }
+
+      async function startTest() {
+        if (hls) {
+          hls.destroy();
+        }
+
+        clearLogs();
+
+        // Check blocking server
+        const serverOk = await checkBlockingServer();
+        if (!serverOk) {
+          return;
+        }
+
+        // Set blocking mode on server
+        await setServerBlockingMode(currentMode);
+
+        const allBlocked = document.getElementById('all-blocked').checked;
+        log(
+          `Starting test with blocking mode: ${currentMode}${allBlocked ? ' (ALL SEGMENTS BLOCKED)' : ''}`,
+          'info',
+          null,
+          allBlocked
+            ? `All segments via blocked CDN - testing full failback`
+            : `Blocked: localhost:${BLOCKED_PORT}, Backup: ${BACKUP_HOST}`
+        );
+
+        hls = new Hls({
+          debug: false, // Set to true to see FailbackLoader logs in console
+          failbackConfig: {
+            staticHosts: [BACKUP_HOST],
+
+            onSuccess: (url, wasFailback, attempt) => {
+              if (wasFailback) {
+                stats.failback++;
+                log(`SUCCESS via failback #${attempt}`, 'success', url);
+              } else {
+                stats.direct++;
+                log('SUCCESS (direct)', 'success', url);
+              }
+              updateStats();
+            },
+
+            onFailback: (originalUrl, failbackUrl, attempt) => {
+              stats.blocked++;
+              updateStats();
+              log(
+                `BLOCKED - trying failback #${attempt}`,
+                'blocked',
+                failbackUrl,
+                `Original: ${new URL(originalUrl).host}`
+              );
+            },
+
+            onAllFailed: (originalUrl, attempts) => {
+              stats.errors++;
+              updateStats();
+              log(
+                `FAILED - all ${attempts} attempts exhausted`,
+                'error',
+                originalUrl
+              );
+            },
+          },
+        });
+
+        // Create blob URL for playlist
+        const playlistContent = createTestPlaylist();
+        const blob = new Blob([playlistContent], {
+          type: 'application/vnd.apple.mpegurl',
+        });
+        const playlistUrl = URL.createObjectURL(blob);
+
+        hls.loadSource(playlistUrl);
+        hls.attachMedia(video);
+
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          log('Manifest loaded, starting playback', 'info');
+          video.play().catch(() => {
+            log('Click video to start playback', 'info');
+          });
+        });
+
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          if (data.fatal) {
+            log(`Fatal error: ${data.details}`, 'error');
+          }
+        });
+
+        document.getElementById('btn-start').disabled = true;
+        document.getElementById('btn-stop').disabled = false;
+      }
+
+      function stopTest() {
+        if (hls) {
+          hls.destroy();
+          hls = null;
+        }
+        video.src = '';
+        log('Test stopped', 'info');
+
+        document.getElementById('btn-start').disabled = false;
+        document.getElementById('btn-stop').disabled = true;
+      }
+
+      // ============================================
+      // Event Handlers
+      // ============================================
+      document.getElementById('btn-start').addEventListener('click', startTest);
+      document.getElementById('btn-stop').addEventListener('click', stopTest);
+
+      // Initialize - check server status on load and periodically
+      checkServerStatus();
+      setInterval(checkServerStatus, 5000);
+    </script>
+  </body>
+</html>
