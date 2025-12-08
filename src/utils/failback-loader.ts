@@ -330,6 +330,8 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     if (failbackUrl && failbackUrl !== currentUrl) {
       this.failbackAttempt++;
+      // Reset aborted flag so failback response is not ignored
+      this.stats.aborted = false;
 
       this.failbackConfig.onFailback?.(
         this.originalUrl,
@@ -365,6 +367,8 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     if (failbackUrl && failbackUrl !== currentUrl) {
       this.failbackAttempt++;
       this.abortInternal();
+      // Reset aborted flag so failback response is not ignored
+      this.stats.aborted = false;
 
       this.failbackConfig.onFailback?.(
         this.originalUrl,
@@ -401,6 +405,8 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     if (failbackUrl && failbackUrl !== currentUrl) {
       this.failbackAttempt++;
+      // Reset aborted flag so failback response is not ignored
+      this.stats.aborted = false;
 
       this.failbackConfig.onFailback?.(
         this.originalUrl,
