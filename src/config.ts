@@ -49,12 +49,14 @@ export type ABRControllerConfig = {
   abrBandWidthFactor: number;
   abrBandWidthUpFactor: number;
   abrMaxWithRealBitrate: boolean;
+  abrSwitchInterval: number;
   maxStarvationDelay: number;
   maxLoadingDelay: number;
 };
 
 export type BufferControllerConfig = {
   appendErrorMaxRetry: number;
+  appendTimeout: number;
   backBufferLength: number;
   frontBufferFlushThreshold: number;
   liveDurationInfinity: boolean;
@@ -408,6 +410,7 @@ export const hlsDefaultConfig: HlsConfig = {
   fpsDroppedMonitoringPeriod: 5000, // used by fps-controller
   fpsDroppedMonitoringThreshold: 0.2, // used by fps-controller
   appendErrorMaxRetry: 3, // used by buffer-controller
+  appendTimeout: Infinity, // used by buffer-controller
   ignorePlaylistParsingErrors: false,
   loader: XhrLoader,
   // loader: FetchLoader,
@@ -433,6 +436,7 @@ export const hlsDefaultConfig: HlsConfig = {
   abrBandWidthFactor: 0.95, // used by abr-controller
   abrBandWidthUpFactor: 0.7, // used by abr-controller
   abrMaxWithRealBitrate: false, // used by abr-controller
+  abrSwitchInterval: 0, // used by level-controller
   maxStarvationDelay: 4, // used by abr-controller
   maxLoadingDelay: 4, // used by abr-controller
   minAutoBitrate: 0, // used by hls
