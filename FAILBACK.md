@@ -3,7 +3,7 @@
 Форк библиотеки [hls.js](https://github.com/video-dev/hls.js) с добавлением системы автоматического переключения на резервные хосты при загрузке фрагментов видео.
 
 **Пакет:** `@armdborg/hls.js`
-**Версия:** 1.6.0-failback.13
+**Версия:** 1.6.0-failback.16
 **Репозиторий:** https://github.com/cheluskin/hls.js
 
 ---
@@ -27,7 +27,175 @@
 
 ---
 
-## Архитектура
+## Архитектура HLS.js Fragment Loading
+
+### Общая архитектура загрузки фрагментов в HLS.js
+
+HLS.js использует многоуровневую систему загрузки медиа-контента:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            HLS Instance                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                     StreamController                                 │   │
+│  │  Управляет буферизацией, определяет какие фрагменты загружать       │   │
+│  └───────────────────────────────┬─────────────────────────────────────┘   │
+│                                  │                                          │
+│                                  ▼                                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                     FragmentLoader                                   │   │
+│  │  src/loader/fragment-loader.ts                                      │   │
+│  │  • Создаёт контекст загрузки (URL, headers, range)                   │   │
+│  │  • Управляет жизненным циклом Loader                                 │   │
+│  │  • Обрабатывает callbacks (onSuccess, onError, onTimeout)            │   │
+│  └───────────────────────────────┬─────────────────────────────────────┘   │
+│                                  │                                          │
+│              ┌───────────────────┼───────────────────┐                     │
+│              │                   │                   │                      │
+│              ▼                   ▼                   ▼                      │
+│     ┌────────────────┐  ┌────────────────┐  ┌────────────────┐             │
+│     │   XhrLoader    │  │  FetchLoader   │  │ FailbackLoader │             │
+│     │   (default)    │  │   (optional)   │  │   (failback)   │             │
+│     └────────────────┘  └────────────────┘  └────────────────┘             │
+│                                                     │                       │
+│                                                     │ Наша доработка        │
+└─────────────────────────────────────────────────────┼───────────────────────┘
+                                                      │
+                                                      ▼
+                                            ┌─────────────────┐
+                                            │  DNS TXT Cache  │
+                                            │  Failback Hosts │
+                                            └─────────────────┘
+```
+
+### Конфигурация загрузчиков
+
+В `src/config.ts` определены три типа загрузчиков:
+
+```typescript
+{
+  loader: XhrLoader,      // Базовый загрузчик для плейлистов и ключей
+  fLoader: FailbackLoader, // Fragment Loader - для сегментов видео/аудио
+  pLoader: undefined,      // Playlist Loader - можно переопределить
+}
+```
+
+**`fLoader` (Fragment Loader)** — специализированный загрузчик для медиа-сегментов:
+
+- Используется для `.ts`, `.m4s`, `.aac` сегментов
+- Получает конфигурацию из `fragLoadPolicy`
+- Наша модификация: по умолчанию `FailbackLoader`
+
+**`pLoader` (Playlist Loader)** — для манифестов и плейлистов:
+
+- Используется для `.m3u8` файлов
+- Получает конфигурацию из `playlistLoadPolicy`
+- По умолчанию: `undefined` (используется `loader`)
+
+**`loader`** — базовый загрузчик:
+
+- Fallback если `fLoader`/`pLoader` не определены
+- По умолчанию: `XhrLoader`
+
+### Интерфейс Loader
+
+Все загрузчики реализуют единый интерфейс:
+
+```typescript
+interface Loader<T extends LoaderContext> {
+  stats: LoaderStats; // Статистика загрузки
+  context: T | null; // Контекст текущего запроса
+
+  load( // Запуск загрузки
+    context: T,
+    config: LoaderConfiguration,
+    callbacks: LoaderCallbacks<T>,
+  ): void;
+
+  abort(): void; // Отмена текущей загрузки
+  destroy(): void; // Освобождение ресурсов
+
+  getCacheAge(): number | null; // HTTP cache age
+  getResponseHeader(name: string): string | null;
+}
+
+interface LoaderCallbacks<T> {
+  onSuccess: (response, stats, context, networkDetails) => void;
+  onError: (response, context, networkDetails, stats) => void;
+  onTimeout: (stats, context, networkDetails) => void;
+  onAbort: (stats, context, networkDetails) => void;
+  onProgress?: (stats, context, data, networkDetails) => void;
+}
+```
+
+### Жизненный цикл загрузки фрагмента
+
+```
+1. StreamController определяет следующий фрагмент для загрузки
+                    │
+                    ▼
+2. FragmentLoader.load(fragment) вызывается
+   │
+   ├── Создаёт LoaderContext из Fragment:
+   │   • url: fragment.url
+   │   • responseType: 'arraybuffer'
+   │   • rangeStart/rangeEnd (если byte-range)
+   │   • headers (custom headers)
+   │
+   ├── Получает LoaderConfiguration из fragLoadPolicy:
+   │   • maxTimeToFirstByteMs: 10000
+   │   • maxLoadTimeMs: 120000
+   │   • (retry отключён, т.к. failback внутри loader)
+   │
+   └── Инстанциирует Loader:
+       const loader = config.fLoader
+         ? new config.fLoader(config)     // FailbackLoader
+         : new config.loader(config);     // XhrLoader
+                    │
+                    ▼
+3. loader.load(context, config, callbacks)
+   │
+   ├── [FailbackLoader] Проверяет permanentFailbackMode
+   │   • Если true → сразу использует failback хост
+   │
+   ├── Выполняет HTTP запрос (XMLHttpRequest)
+   │   • Устанавливает таймауты
+   │   • Запускает stall detection
+   │
+   └── Обрабатывает результат:
+       │
+       ├── Успех (200-299):
+       │   • Вызывает callbacks.onSuccess
+       │   • Обновляет stats (bandwidth, timing)
+       │   • [FailbackLoader] Сбрасывает счётчик ошибок
+       │
+       ├── Ошибка (HTTP error, timeout, network):
+       │   • [XhrLoader] Вызывает callbacks.onError
+       │   • [FailbackLoader] Пробует следующий failback хост
+       │       │
+       │       ├── Есть следующий хост → повторяет запрос
+       │       └── Хосты исчерпаны → callbacks.onError
+       │
+       └── Stall detected:
+           • [FailbackLoader] Переключается на failback хост
+           • Инкрементирует счётчик ошибок
+                    │
+                    ▼
+4. FragmentLoader обрабатывает callback:
+   │
+   ├── onSuccess → Promise resolve → данные в buffer
+   ├── onError → Promise reject → ErrorController
+   └── onTimeout → Promise reject → ErrorController
+                    │
+                    ▼
+5. StreamController получает данные или ошибку
+   • Успех → передаёт в BufferController для декодирования
+   • Ошибка → ErrorController решает: retry, switch quality, fatal
+```
+
+---
+
+### Архитектура FailbackLoader
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -37,41 +205,77 @@
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                     FailbackLoader                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 1. Загрузка с основного хоста                           │   │
-│  │    https://cdn.example.com/video/segment.ts             │   │
-│  └─────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Состояние (глобальное, shared между всеми instances):    │   │
+│  │ • consecutiveOriginalFailures: number                     │   │
+│  │ • permanentFailbackMode: boolean                          │   │
+│  │ • dnsHostsCache: string[]                                │   │
+│  │ • fragmentsSinceLastProbe: number                         │   │
+│  │ • recoveryVideoElement: HTMLVideoElement | null          │   │
+│  └──────────────────────────────────────────────────────────┘   │
 │                              │                                   │
-│                    Успех?    │                                   │
-│                   ┌──────────┴──────────┐                       │
-│                   ▼                     ▼                       │
-│               [Да]                  [Нет]                       │
-│                 │                      │                        │
-│                 ▼                      ▼                        │
-│         Возврат данных    ┌────────────────────────┐           │
-│                           │ Попытка failback #1     │           │
-│                           │ host1-from-dns.com      │           │
-│                           └────────────────────────┘           │
-│                                        │                        │
-│                              Успех?    │                        │
-│                             ┌──────────┴──────────┐             │
-│                             ▼                     ▼             │
-│                         [Да]                  [Нет]             │
-│                           │                      │              │
-│                           ▼                      ▼              │
-│                   Возврат данных    ┌────────────────────────┐ │
-│                                     │ Попытка failback #N     │ │
-│                                     │ hostN-from-dns.com      │ │
-│                                     └────────────────────────┘ │
-│                                                  │              │
-│                                        Успех?    │              │
-│                                       ┌──────────┴──────────┐   │
-│                                       ▼                     ▼   │
-│                                   [Да]                  [Нет]   │
-│                                     │                      │    │
-│                                     ▼                      ▼    │
-│                             Возврат данных         Ошибка HLS   │
-└─────────────────────────────────────────────────────────────────┘
+│              permanentFailbackMode?                              │
+│              ┌───────────────┴───────────────┐                  │
+│              ▼                               ▼                   │
+│          [true]                          [false]                 │
+│              │                               │                   │
+│              ▼                               ▼                   │
+│   Skip original host              Load from original host        │
+│   Use failback #1 directly        https://cdn.example.com        │
+│                                              │                   │
+│                                    Успех?    │                   │
+│                                   ┌──────────┴──────────┐       │
+│                                   ▼                     ▼       │
+│                               [Да]                  [Нет]       │
+│                                 │                      │        │
+│                                 │               consecutiveOriginalFailures++
+│                                 │                      │        │
+│                                 │         >= THRESHOLD (2)?     │
+│                                 │         ┌──────────┴──────┐   │
+│                                 │         ▼                 ▼   │
+│                                 │     [Да]              [Нет]   │
+│                                 │         │                 │   │
+│                                 │   permanentFailbackMode=true  │
+│                                 │         │                 │   │
+│                                 │         └────────┬────────┘   │
+│                                 │                  │            │
+│                                 │                  ▼            │
+│                                 │    ┌────────────────────────┐ │
+│                                 │    │ Попытка failback #1     │ │
+│                                 │    │ host1-from-dns.com      │ │
+│                                 │    └────────────────────────┘ │
+│                                 │                  │            │
+│                                 │        Успех?    │            │
+│                                 │       ┌──────────┴──────────┐ │
+│                                 │       ▼                     ▼ │
+│                                 │   [Да]                  [Нет] │
+│                                 │     │                      │  │
+│                                 │     │                      ▼  │
+│                                 │     │       ┌────────────────────────┐
+│                                 │     │       │ Попытка failback #N     │
+│                                 │     │       │ hostN-from-dns.com      │
+│                                 │     │       └────────────────────────┘
+│                                 │     │                      │  │
+│                                 │     │            Успех?    │  │
+│                                 │     │           ┌──────────┴──────┐
+│                                 │     │           ▼               ▼ │
+│                                 │     │       [Да]            [Нет] │
+│                                 │     │         │                │  │
+│  ┌──────────────────────────────┼─────┼─────────┘                │  │
+│  │                              │     │                          ▼  │
+│  ▼                              │     │                   Ошибка HLS │
+│  Успех                          │     │                             │
+│  │                              │     │                             │
+│  ├── consecutiveOriginalFailures = 0  │                             │
+│  │   (если это был original host)     │                             │
+│  │                              │     │                             │
+│  ├── В permanent mode:          │     │                             │
+│  │   fragmentsSinceLastProbe++  │     │                             │
+│  │   if >= 6 → tryRecoverToOriginalCDN()                            │
+│  │                              │     │                             │
+│  └── callbacks.onSuccess()      │     │                             │
+└─────────────────────────────────┴─────┴─────────────────────────────┘
 ```
 
 ---
@@ -86,6 +290,9 @@
 
 - Автоматический перебор резервных хостов при ошибке
 - Поддержка таймаутов и HTTP-ошибок
+- **Детекция зависания (stall detection)** — переключение на резервный хост если нет данных 5 секунд
+- **Детекция низкой скорости (throughput detection)** — переключение если скорость < 4KB/s в течение 5 секунд
+- **Режим постоянного failback** — после 2 последовательных ошибок на оригинальном источнике, все последующие запросы идут напрямую на резервные хосты
 - Кастомная трансформация URL через callback
 - Сбор статистики загрузки (timing, bandwidth)
 - Прогресс-события
@@ -231,6 +438,24 @@ export async function fetchFailbackHosts(domain?: string): Promise<string[]>;
 
 // Очистка DNS кеша
 export function clearDnsCache(): void;
+
+// Получение состояния failback (для мониторинга)
+export function getFailbackState(): {
+  consecutiveFailures: number; // Количество последовательных ошибок
+  permanentMode: boolean; // Включён ли постоянный failback
+  threshold: number; // Порог для постоянного режима (по умолчанию 2)
+};
+
+// Сброс состояния failback (для ручного возврата на основной CDN)
+// При выходе из permanent mode счётчик ошибок = 1, первый фейл вернёт обратно
+export function resetFailbackState(): void;
+
+// Установка video элемента для автоматического восстановления на основной CDN
+// Передайте video для включения, null для отключения
+export function setRecoveryVideoElement(video: HTMLVideoElement | null): void;
+
+// Полный сброс состояния (при уничтожении HLS инстанса)
+export function destroyFailbackState(): void;
 ```
 
 ### Статический доступ к FailbackLoader
@@ -284,6 +509,9 @@ FailbackLoader перехватывает следующие ситуации:
 
 1. **HTTP ошибки** (status не в диапазоне 200-299)
 2. **Таймауты** (превышение `maxTimeToFirstByteMs` или `maxLoadTimeMs`)
+3. **Сетевые ошибки** (network error)
+4. **Зависание загрузки** (stall detection) — нет данных более 5 секунд
+5. **Низкая скорость** (throughput detection) — скорость < 4KB/s более 5 секунд
 
 При каждой ошибке:
 
@@ -292,6 +520,77 @@ FailbackLoader перехватывает следующие ситуации:
 3. Выполняется новый запрос
 4. При успехе — данные возвращаются
 5. При исчерпании всех хостов — стандартная ошибка HLS
+
+### Режим постоянного failback
+
+После **2 последовательных ошибок** на оригинальном источнике, библиотека переключается в **режим постоянного failback**:
+
+- Все новые запросы идут сразу на резервные хосты (минуя оригинальный)
+- Это ускоряет загрузку когда оригинальный источник полностью недоступен
+
+```typescript
+import { getFailbackState, resetFailbackState } from '@armdborg/hls.js';
+
+// Проверка текущего состояния
+const state = getFailbackState();
+console.log(state);
+// { consecutiveFailures: 2, permanentMode: true, threshold: 2 }
+
+// Сброс состояния (вернуться к оригинальному источнику)
+resetFailbackState();
+```
+
+### Автоматическое восстановление на основной CDN
+
+Библиотека автоматически пробует вернуться на основной CDN без участия пользователя:
+
+**Как это работает:**
+
+1. Каждые **6 фрагментов** (~2 минуты при 20-сек фрагментах) в режиме permanent failback проверяется основной CDN
+2. Перед проверкой убеждаемся, что буфер видео >= **40 секунд** (достаточно для безопасного переключения)
+3. Выполняется Range-запрос первого 1KB сегмента с основного CDN (таймаут 3 сек)
+4. Если запрос успешен — переключаемся обратно на основной CDN
+5. При первой же ошибке на основном CDN — мгновенно возвращаемся в permanent failback mode
+
+**Защита от проблем:**
+
+- **Seek во время проверки** — буфер проверяется повторно после probe, если упал < 40 сек — переключение отменяется
+- **Параллельные проверки** — блокируются, только одна проверка одновременно
+- **Недостаточный буфер** — проверка пропускается до накопления буфера
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Permanent Failback Mode                                    │
+│                                                             │
+│  Каждые 6 фрагментов:                                       │
+│  ├── Буфер < 40 сек? → пропускаем проверку                  │
+│  └── Буфер >= 40 сек? → probe 1KB с основного CDN           │
+│      ├── Успех → выход из permanent mode                    │
+│      │           (первый фейл вернёт обратно)               │
+│      └── Провал → остаёмся в permanent mode                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Включение автоматического восстановления:**
+
+```typescript
+import Hls, { setRecoveryVideoElement } from '@armdborg/hls.js';
+
+const video = document.getElementById('video');
+const hls = new Hls();
+
+hls.attachMedia(video);
+
+// Включаем автоматическое восстановление (передаём video для проверки буфера)
+setRecoveryVideoElement(video);
+
+hls.loadSource('https://example.com/playlist.m3u8');
+
+// При уничтожении плеера
+hls.on(Hls.Events.DESTROYING, () => {
+  setRecoveryVideoElement(null);
+});
+```
 
 ---
 
@@ -303,7 +602,29 @@ FailbackLoader выводит в консоль информативные со�
 [FailbackLoader] DNS hosts loaded: host1.com, host2.com
 [FailbackLoader] https://cdn.example.com/seg.ts failed (503), trying: https://host1.com/seg.ts
 [FailbackLoader] https://host1.com/seg.ts timeout, trying: https://host2.com/seg.ts
+[FailbackLoader] Original source stalled - no progress for 5000ms (1/2)
+[FailbackLoader] Strict stall detected (no events for 5100ms)
+[FailbackLoader] Throughput stall detected (speed < 4096 B/s for 5000ms)
+[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable
+[FailbackLoader] PERMANENT FAILBACK MODE - skipping original, using: https://host1.com/seg.ts
+[FailbackLoader] SUCCESS (permanent failback): https://host1.com/seg.ts [3/6]
+[FailbackLoader] SUCCESS via failback #1: https://host1.com/seg.ts
 ```
+
+**Автоматическое восстановление:**
+
+```
+[FailbackLoader] Recovery skipped - buffer 25.3s < 40s required
+[FailbackLoader] Recovery skipped - probe already in progress
+[FailbackLoader] Probing original CDN (buffer=45.2s)...
+[FailbackLoader] ✓ Original CDN recovered - switching back (first fail will return to permanent)
+[FailbackLoader] State reset - will try original source (failures=1, first fail returns to permanent)
+[FailbackLoader] ✗ Original CDN still unavailable
+[FailbackLoader] Recovery aborted - buffer dropped to 15.0s during probe
+[FailbackLoader] Recovery aborted - no longer in permanent mode
+```
+
+**DNS резолвер:**
 
 ```
 [DNS-TXT] Resolved fb.turoktv.com: host1.com, host2.com
@@ -342,12 +663,30 @@ npm install @armdborg/hls.js
 
 Публикация в npm происходит автоматически через GitHub Actions при пуше тега `v*`.
 
-### Процесс релиза
+### Быстрый деплой (одной командой)
+
+```bash
+# Закоммитить изменения и выполнить деплой
+git add -A
+git commit -m "fix/feat: описание изменений"
+npm run deploy
+```
+
+Команда `npm run deploy` автоматически:
+
+1. Запускает тесты failback
+2. Собирает проект
+3. Обновляет версию (создаёт тег `v*`)
+4. Пересобирает с новой версией
+5. Пушит изменения и теги в GitHub
+6. GitHub Actions публикует в npm
+
+### Ручной процесс релиза
 
 ```bash
 # 1. Убедиться что код собирается и тесты проходят
 npm run build
-npm run test:failback
+npm test
 
 # 2. Закоммитить изменения
 git add -A
@@ -355,7 +694,7 @@ git commit -m "fix/feat: описание изменений"
 
 # 3. Обновить версию (автоматически создаёт коммит и тег с префиксом v)
 npm version prerelease --preid=failback
-# Результат: v1.6.0-failback.14
+# Результат: v1.6.0-failback.17
 
 # 4. Пересобрать с новой версией в бандле
 npm run build
@@ -385,16 +724,45 @@ npm view @armdborg/hls.js versions --json | tail -5
 
 ---
 
+## Тестирование
+
+```bash
+# Все тесты (unit + integration)
+npm test
+
+# Только unit тесты
+npm run test:failback
+
+# Только integration тесты
+npm run test:failback:integration
+
+# Все failback тесты явно
+npm run test:failback:all
+```
+
+### Покрытие тестами
+
+- **Unit тесты (39):** DNS resolver, URL transformation, state management, exports
+- **Integration тесты (18):** Полные сценарии failback, recovery, race conditions
+
+---
+
 ## Структура файлов доработки
 
 ```
 src/utils/
-├── failback-loader.ts    # Основной загрузчик с failback
+├── failback-loader.ts    # Основной загрузчик с failback и CDN recovery
 ├── dns-txt-resolver.ts   # DNS-over-HTTPS резолвер
 └── ...
 
 src/config.ts             # fLoader: FailbackLoader (строка 414)
 src/hls.ts                # Hls.FailbackLoader (строка 79)
+src/exports-named.ts      # Экспорты функций failback
+
+tests/
+├── standalone-failback-test.mjs   # Unit тесты
+├── integration-failback-test.mjs  # Integration тесты
+└── ...
 ```
 
 ---

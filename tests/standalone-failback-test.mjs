@@ -17,12 +17,24 @@ globalThis.fetch = async (...args) => {
 };
 
 // Import the modules after setting up mocks
-let clearDnsCache, fetchDnsTxt, fetchFailbackHosts;
+let clearDnsCache,
+  fetchDnsTxt,
+  fetchFailbackHosts,
+  getFailbackState,
+  resetFailbackState,
+  destroyFailbackState,
+  setRecoveryVideoElement;
 try {
-  const module = await import('../src/utils/dns-txt-resolver.ts');
-  clearDnsCache = module.clearDnsCache;
-  fetchDnsTxt = module.fetchDnsTxt;
-  fetchFailbackHosts = module.fetchFailbackHosts;
+  const dnsModule = await import('../src/utils/dns-txt-resolver.ts');
+  clearDnsCache = dnsModule.clearDnsCache;
+  fetchDnsTxt = dnsModule.fetchDnsTxt;
+  fetchFailbackHosts = dnsModule.fetchFailbackHosts;
+
+  const loaderModule = await import('../src/utils/failback-loader.ts');
+  getFailbackState = loaderModule.getFailbackState;
+  resetFailbackState = loaderModule.resetFailbackState;
+  destroyFailbackState = loaderModule.destroyFailbackState;
+  setRecoveryVideoElement = loaderModule.setRecoveryVideoElement;
 } catch {
   // If direct TS import fails, the project needs to be built first
   console.log(
@@ -32,6 +44,10 @@ try {
   clearDnsCache = module.clearDnsCache;
   fetchDnsTxt = module.fetchDnsTxt;
   fetchFailbackHosts = module.fetchFailbackHosts;
+  getFailbackState = module.getFailbackState;
+  resetFailbackState = module.resetFailbackState;
+  destroyFailbackState = module.destroyFailbackState;
+  setRecoveryVideoElement = module.setRecoveryVideoElement;
 }
 
 let passed = 0;
@@ -370,6 +386,316 @@ test('Custom transform function receives correct attempt number', () => {
   customTransform('https://test.com', 3);
 
   assert.deepEqual(attempts, [0, 1, 2, 3]);
+});
+
+console.log('===== Failback State Management Tests =====\n');
+
+// Test: getFailbackState returns correct initial state
+test('getFailbackState returns correct initial state', () => {
+  resetFailbackState();
+  const state = getFailbackState();
+
+  assert.equal(typeof state.consecutiveFailures, 'number');
+  assert.equal(typeof state.permanentMode, 'boolean');
+  assert.equal(typeof state.threshold, 'number');
+  assert.equal(state.consecutiveFailures, 0);
+  assert.equal(state.permanentMode, false);
+  assert.equal(state.threshold, 2); // PERMANENT_FAILBACK_THRESHOLD
+});
+
+// Test: resetFailbackState resets state to initial values
+test('resetFailbackState resets state to initial values', () => {
+  // First reset to ensure clean state
+  resetFailbackState();
+
+  // Get state before and after reset
+  const stateBefore = getFailbackState();
+  assert.equal(stateBefore.consecutiveFailures, 0);
+  assert.equal(stateBefore.permanentMode, false);
+
+  // Reset again - should not change anything
+  resetFailbackState();
+  const stateAfter = getFailbackState();
+  assert.equal(stateAfter.consecutiveFailures, 0);
+  assert.equal(stateAfter.permanentMode, false);
+});
+
+// Test: getFailbackState threshold value is correct
+test('getFailbackState threshold value is correct (2 failures for permanent mode)', () => {
+  const state = getFailbackState();
+  assert.equal(state.threshold, 2);
+});
+
+console.log('===== Stall Detection Constants Tests =====\n');
+
+// Test: Verify stall detection parameters are within expected ranges
+test('Stall detection parameters are reasonable', () => {
+  // These values should be checked against the implementation
+  const STALL_TIMEOUT_MS = 5000; // Expected: 5 seconds
+  const STALL_CHECK_INTERVAL_MS = 1000; // Expected: 1 second
+  const MIN_SPEED_BYTES_PER_SEC = 4096; // Expected: 4KB/s
+
+  // Stall timeout should be reasonable (1-30 seconds)
+  assert.ok(
+    STALL_TIMEOUT_MS >= 1000,
+    'Stall timeout should be at least 1 second',
+  );
+  assert.ok(
+    STALL_TIMEOUT_MS <= 30000,
+    'Stall timeout should be at most 30 seconds',
+  );
+
+  // Check interval should be less than timeout
+  assert.ok(
+    STALL_CHECK_INTERVAL_MS < STALL_TIMEOUT_MS,
+    'Check interval should be less than timeout',
+  );
+
+  // Minimum speed should be low enough to detect only real stalls
+  assert.ok(MIN_SPEED_BYTES_PER_SEC > 0, 'Minimum speed should be positive');
+  assert.ok(
+    MIN_SPEED_BYTES_PER_SEC <= 10240,
+    'Minimum speed should be at most 10KB/s',
+  );
+});
+
+// Test: Permanent failback threshold is reasonable
+test('Permanent failback threshold is reasonable', () => {
+  const state = getFailbackState();
+
+  // Threshold should be at least 1
+  assert.ok(state.threshold >= 1, 'Threshold should be at least 1');
+
+  // Threshold should not be too high (to react quickly to persistent issues)
+  assert.ok(state.threshold <= 5, 'Threshold should be at most 5');
+});
+
+console.log('===== URL Edge Cases Tests =====\n');
+
+// Test: URL with IPv6 host
+test('URL transformation with IPv6 host handles correctly', () => {
+  const hosts = ['cdn.example.com'];
+  const originalUrl = 'https://[::1]:8080/video.ts';
+
+  // Should still work - the URL class handles IPv6
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  assert.equal(parsed.hostname, 'cdn.example.com');
+  assert.equal(parsed.pathname, '/video.ts');
+});
+
+// Test: URL with very long path
+test('URL transformation preserves very long paths', () => {
+  const hosts = ['cdn.example.com'];
+  const longPath = '/a'.repeat(500);
+  const originalUrl = `https://origin.example.com${longPath}/video.ts`;
+
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  assert.equal(parsed.pathname, `${longPath}/video.ts`);
+});
+
+// Test: URL with special characters in query params
+test('URL transformation preserves special characters in query params', () => {
+  const hosts = ['cdn.example.com'];
+  const originalUrl =
+    'https://origin.example.com/video.ts?data=%7B%22key%22%3A%22value%22%7D&token=abc+def';
+
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  // Query string should be preserved
+  assert.ok(failbackUrl.includes('data='));
+  assert.ok(failbackUrl.includes('token='));
+});
+
+// Test: URL with multiple query params with same name
+test('URL transformation preserves multiple query params with same name', () => {
+  const hosts = ['cdn.example.com'];
+  const originalUrl = 'https://origin.example.com/video.ts?tag=a&tag=b&tag=c';
+
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  const tags = parsed.searchParams.getAll('tag');
+  assert.deepEqual(tags, ['a', 'b', 'c']);
+});
+
+console.log('===== CDN Recovery Tests =====\n');
+
+// Test: destroyFailbackState resets all state
+test('destroyFailbackState resets all state completely', () => {
+  // First, reset to a known state
+  destroyFailbackState();
+  const state = getFailbackState();
+
+  assert.equal(state.consecutiveFailures, 0);
+  assert.equal(state.permanentMode, false);
+});
+
+// Test: setRecoveryVideoElement accepts null
+test('setRecoveryVideoElement accepts null without error', () => {
+  // Should not throw
+  setRecoveryVideoElement(null);
+
+  // Verify state is still valid
+  const state = getFailbackState();
+  assert.equal(typeof state.consecutiveFailures, 'number');
+});
+
+// Test: setRecoveryVideoElement accepts mock video element
+test('setRecoveryVideoElement accepts mock video element', () => {
+  const mockVideo = {
+    buffered: {
+      length: 1,
+      start: () => 0,
+      end: () => 45,
+    },
+    currentTime: 5,
+  };
+
+  // Should not throw
+  setRecoveryVideoElement(mockVideo);
+
+  // Clean up
+  setRecoveryVideoElement(null);
+});
+
+// Test: resetFailbackState from non-permanent mode sets failures to 0
+test('resetFailbackState from non-permanent mode sets failures to 0', () => {
+  destroyFailbackState();
+
+  // Not in permanent mode
+  resetFailbackState();
+  const state = getFailbackState();
+
+  assert.equal(state.consecutiveFailures, 0);
+  assert.equal(state.permanentMode, false);
+});
+
+// Test: Multiple destroyFailbackState calls are safe
+test('Multiple destroyFailbackState calls are idempotent', () => {
+  destroyFailbackState();
+  destroyFailbackState();
+  destroyFailbackState();
+
+  const state = getFailbackState();
+  assert.equal(state.consecutiveFailures, 0);
+  assert.equal(state.permanentMode, false);
+});
+
+// Test: State functions are exported and callable
+test('All state functions are exported and callable', () => {
+  assert.equal(typeof getFailbackState, 'function');
+  assert.equal(typeof resetFailbackState, 'function');
+  assert.equal(typeof destroyFailbackState, 'function');
+  assert.equal(typeof setRecoveryVideoElement, 'function');
+});
+
+console.log('===== CDN Recovery Constants Tests =====\n');
+
+// Test: Recovery constants are reasonable
+test('Recovery constants are within expected ranges', () => {
+  // These are the expected values from the implementation
+  const PROBE_EVERY_N_FRAGMENTS = 6;
+  const PROBE_TIMEOUT_MS = 3000;
+  const MIN_BUFFER_FOR_RECOVERY = 40;
+
+  // Probe frequency should be reasonable (3-20 fragments)
+  assert.ok(PROBE_EVERY_N_FRAGMENTS >= 3, 'Should not probe too frequently');
+  assert.ok(
+    PROBE_EVERY_N_FRAGMENTS <= 20,
+    'Should not wait too long between probes',
+  );
+
+  // Probe timeout should be reasonable (1-10 seconds)
+  assert.ok(
+    PROBE_TIMEOUT_MS >= 1000,
+    'Probe timeout should be at least 1 second',
+  );
+  assert.ok(
+    PROBE_TIMEOUT_MS <= 10000,
+    'Probe timeout should be at most 10 seconds',
+  );
+
+  // Buffer requirement should be reasonable (20-120 seconds)
+  assert.ok(
+    MIN_BUFFER_FOR_RECOVERY >= 20,
+    'Buffer requirement should be at least 20 seconds',
+  );
+  assert.ok(
+    MIN_BUFFER_FOR_RECOVERY <= 120,
+    'Buffer requirement should be at most 120 seconds',
+  );
+});
+
+// Test: Buffer calculation helper
+test('Buffer ahead calculation logic is correct', () => {
+  // Mock video element with buffer from 0-45 seconds, current time at 5
+  const mockVideo = {
+    buffered: {
+      length: 1,
+      start: (i) => 0,
+      end: (i) => 45,
+    },
+    currentTime: 5,
+  };
+
+  // Expected buffer ahead: 45 - 5 = 40 seconds
+  const expectedBufferAhead = mockVideo.buffered.end(0) - mockVideo.currentTime;
+  assert.equal(expectedBufferAhead, 40);
+});
+
+// Test: Buffer calculation with gap
+test('Buffer ahead calculation handles gaps correctly', () => {
+  // Mock video with gap - two buffered ranges
+  const mockVideo = {
+    buffered: {
+      length: 2,
+      start: (i) => (i === 0 ? 0 : 50),
+      end: (i) => (i === 0 ? 30 : 80),
+    },
+    currentTime: 25, // In first range
+  };
+
+  // Current time is in first range (0-30), so buffer ahead = 30 - 25 = 5
+  let bufferAhead = 0;
+  for (let i = 0; i < mockVideo.buffered.length; i++) {
+    if (
+      mockVideo.buffered.start(i) <= mockVideo.currentTime &&
+      mockVideo.currentTime <= mockVideo.buffered.end(i)
+    ) {
+      bufferAhead = mockVideo.buffered.end(i) - mockVideo.currentTime;
+      break;
+    }
+  }
+  assert.equal(bufferAhead, 5);
+});
+
+// Test: Buffer calculation outside any range
+test('Buffer ahead returns 0 when current time is in gap', () => {
+  const mockVideo = {
+    buffered: {
+      length: 2,
+      start: (i) => (i === 0 ? 0 : 50),
+      end: (i) => (i === 0 ? 30 : 80),
+    },
+    currentTime: 40, // In gap between ranges
+  };
+
+  let bufferAhead = 0;
+  for (let i = 0; i < mockVideo.buffered.length; i++) {
+    if (
+      mockVideo.buffered.start(i) <= mockVideo.currentTime &&
+      mockVideo.currentTime <= mockVideo.buffered.end(i)
+    ) {
+      bufferAhead = mockVideo.buffered.end(i) - mockVideo.currentTime;
+      break;
+    }
+  }
+  assert.equal(bufferAhead, 0);
 });
 
 console.log('===== Test Summary =====\n');

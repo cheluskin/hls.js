@@ -78,6 +78,89 @@
         margin-top: 5px;
       }
 
+      /* Failback State Display */
+      .state-section {
+        background: #0f3460;
+        padding: 15px;
+        border-radius: 8px;
+        margin-top: 15px;
+      }
+
+      .state-section h4 {
+        color: #00d4ff;
+        margin: 0 0 10px 0;
+        font-size: 14px;
+      }
+
+      #failback-state {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .state-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .state-label {
+        color: #888;
+        font-size: 12px;
+      }
+
+      .state-value {
+        font-family: 'Monaco', 'Menlo', monospace;
+        font-size: 12px;
+        color: #00ff88;
+      }
+
+      .state-value.permanent {
+        color: #ff4757;
+        font-weight: bold;
+      }
+
+      .state-value.normal {
+        color: #00ff88;
+      }
+
+      /* Control Buttons */
+      .control-buttons {
+        display: flex;
+        gap: 10px;
+        margin-top: 15px;
+      }
+
+      .btn {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: bold;
+        transition: all 0.2s;
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+      }
+
+      .btn-reset {
+        background: #ffaa00;
+        color: #1a1a2e;
+      }
+
+      .btn-destroy {
+        background: #e94560;
+        color: white;
+      }
+
+      .btn-reinit {
+        background: #00d4ff;
+        color: #1a1a2e;
+      }
+
       .logs-section {
         background: #16213e;
         padding: 20px;
@@ -411,6 +494,37 @@
             Info
           </div>
         </div>
+
+        <!-- Failback State Section -->
+        <div class="state-section">
+          <h4>Failback State (Live)</h4>
+          <div id="failback-state">
+            <div class="state-item">
+              <span class="state-label">Mode:</span>
+              <span class="state-value normal">Normal</span>
+            </div>
+            <div class="state-item">
+              <span class="state-label">Consecutive Failures:</span>
+              <span class="state-value">0/2</span>
+            </div>
+            <div class="state-item">
+              <span class="state-label">Buffer:</span>
+              <span class="state-value">0s</span>
+            </div>
+          </div>
+
+          <div class="control-buttons">
+            <button class="btn btn-reset" onclick="resetState()">
+              Reset State
+            </button>
+            <button class="btn btn-destroy" onclick="destroyPlayer()">
+              Destroy
+            </button>
+            <button class="btn btn-reinit" onclick="initPlayer()">
+              Re-init
+            </button>
+          </div>
+        </div>
       </div>
 
       <div class="logs-section">
@@ -573,10 +687,25 @@
       // Backup host for failback
       const backupHost = 'test-streams.mux.dev';
 
-      if (Hls.isSupported()) {
+      // Import failback state functions
+      const {
+        getFailbackState,
+        resetFailbackState,
+        setRecoveryVideoElement,
+        destroyFailbackState,
+      } = Hls;
+
+      let hls = null;
+
+      function initPlayer() {
+        if (!Hls.isSupported()) {
+          log('HLS.js not supported in this browser', 'error');
+          return;
+        }
+
         log('HLS.js initialized, FailbackLoader enabled by default', 'info');
 
-        const hls = new Hls({
+        hls = new Hls({
           debug: true, // Enable debug logs to see FailbackLoader messages in console
           failbackConfig: {
             staticHosts: [backupHost],
@@ -589,6 +718,8 @@
                 updateStats();
                 log('✅ SUCCESS (direct load)', 'success', url);
               }
+              // Update state display
+              updateFailbackStateDisplay();
             },
 
             onFailback: (originalUrl, failbackUrl, attempt) => {
@@ -599,6 +730,8 @@
                 'failback',
                 failbackUrl
               );
+              // Update state display
+              updateFailbackStateDisplay();
             },
 
             onAllFailed: (originalUrl, attempts) => {
@@ -629,6 +762,10 @@
         hls.loadSource('/demo/broken-playlist.m3u8');
         hls.attachMedia(video);
 
+        // Enable automatic CDN recovery by setting video element
+        setRecoveryVideoElement(video);
+        log('🔄 Auto-recovery enabled (video element set)', 'info');
+
         hls.on(Hls.Events.MANIFEST_PARSED, function () {
           log('📺 Manifest loaded, ready to play', 'info');
           video.play().catch(() => {
@@ -643,9 +780,52 @@
             log(`💀 Fatal error: ${data.details}`, 'error');
           }
         });
-      } else {
-        log('HLS.js not supported in this browser', 'error');
+
+        // Update state display periodically
+        setInterval(updateFailbackStateDisplay, 1000);
       }
+
+      function updateFailbackStateDisplay() {
+        const stateEl = document.getElementById('failback-state');
+        if (!stateEl) return;
+
+        const state = getFailbackState();
+        const modeClass = state.permanentMode ? 'permanent' : 'normal';
+        stateEl.innerHTML = `
+          <div class="state-item">
+            <span class="state-label">Mode:</span>
+            <span class="state-value ${modeClass}">${state.permanentMode ? 'PERMANENT FAILBACK' : 'Normal'}</span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">Consecutive Failures:</span>
+            <span class="state-value">${state.consecutiveFailures}/${state.threshold}</span>
+          </div>
+          <div class="state-item">
+            <span class="state-label">Buffer:</span>
+            <span class="state-value">${video.buffered.length > 0 ? (video.buffered.end(video.buffered.length - 1) - video.currentTime).toFixed(1) + 's' : '0s'}</span>
+          </div>
+        `;
+      }
+
+      function resetState() {
+        resetFailbackState();
+        log('🔄 Failback state reset manually', 'info');
+        updateFailbackStateDisplay();
+      }
+
+      function destroyPlayer() {
+        if (hls) {
+          hls.destroy();
+          hls = null;
+        }
+        setRecoveryVideoElement(null);
+        destroyFailbackState();
+        log('🗑️ Player destroyed, state cleared', 'info');
+        updateFailbackStateDisplay();
+      }
+
+      // Initialize player
+      initPlayer();
     </script>
   </body>
 </html>

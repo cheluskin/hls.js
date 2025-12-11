@@ -28,6 +28,15 @@ let consecutiveOriginalFailures = 0;
 let permanentFailbackMode = false;
 const PERMANENT_FAILBACK_THRESHOLD = 2; // Switch to permanent failback after 2 consecutive failures
 
+// CDN Recovery: probe original CDN every N fragments while in permanent failback mode
+let fragmentsSinceLastProbe = 0;
+const PROBE_EVERY_N_FRAGMENTS = 6; // ~2 min with 20-sec fragments
+const PROBE_TIMEOUT_MS = 3000;
+const MIN_BUFFER_FOR_RECOVERY = 40; // seconds - need enough buffer for safe switch
+let lastSuccessfulOriginalUrl: string | null = null; // Store original URL for probing
+let recoveryVideoElement: HTMLVideoElement | null = null; // Reference to video element for buffer check
+let isProbeInProgress = false; // Prevent concurrent probes
+
 // Stall detection: if no progress for this duration, trigger failback
 const STALL_TIMEOUT_MS = 5000; // 5 seconds without progress = stalled
 const STALL_CHECK_INTERVAL_MS = 1000; // Check every second
@@ -57,11 +66,153 @@ export function getFailbackState(): {
  */
 export function resetFailbackState(): void {
   const wasInPermanentMode = permanentFailbackMode;
+  permanentFailbackMode = false;
+  fragmentsSinceLastProbe = 0;
+  // Note: isProbeInProgress is managed by tryRecoverToOriginalCDN's finally block
+
+  if (wasInPermanentMode) {
+    // When exiting permanent mode, set failures to threshold-1
+    // so first failure returns us immediately to permanent mode
+    consecutiveOriginalFailures = PERMANENT_FAILBACK_THRESHOLD - 1;
+    logger.log(
+      `[FailbackLoader] State reset - will try original source (failures=${consecutiveOriginalFailures}, first fail returns to permanent)`,
+    );
+  } else {
+    consecutiveOriginalFailures = 0;
+  }
+}
+
+/**
+ * Full reset of all failback state (for when HLS instance is destroyed)
+ */
+export function destroyFailbackState(): void {
   consecutiveOriginalFailures = 0;
   permanentFailbackMode = false;
-  if (wasInPermanentMode) {
-    logger.log('[FailbackLoader] State reset - will try original source again');
+  fragmentsSinceLastProbe = 0;
+  lastSuccessfulOriginalUrl = null;
+  recoveryVideoElement = null;
+  isProbeInProgress = false;
+  logger.log('[FailbackLoader] State fully destroyed');
+}
+
+/**
+ * Set video element reference for buffer checking during CDN recovery
+ */
+export function setRecoveryVideoElement(video: HTMLVideoElement | null): void {
+  recoveryVideoElement = video;
+}
+
+/**
+ * Get buffer ahead of current playback position
+ */
+function getBufferAhead(): number {
+  if (!recoveryVideoElement) return 0;
+
+  const video = recoveryVideoElement;
+  const buffered = video.buffered;
+  const currentTime = video.currentTime;
+
+  for (let i = 0; i < buffered.length; i++) {
+    if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
+      return buffered.end(i) - currentTime;
+    }
   }
+  return 0;
+}
+
+/**
+ * Probe original CDN with a Range request to check if it's back online
+ */
+function probeOriginalCDN(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const controller = new AbortController();
+    const timeoutId = self.setTimeout(
+      () => controller.abort(),
+      PROBE_TIMEOUT_MS,
+    );
+
+    fetch(url, {
+      method: 'GET',
+      headers: { Range: 'bytes=0-1023' },
+      signal: controller.signal,
+    })
+      .then((response) => {
+        self.clearTimeout(timeoutId);
+        resolve(response.status === 200 || response.status === 206);
+      })
+      .catch(() => {
+        self.clearTimeout(timeoutId);
+        resolve(false);
+      });
+  });
+}
+
+/**
+ * Try to recover to original CDN if conditions are met
+ */
+function tryRecoverToOriginalCDN(): void {
+  // Prevent concurrent probes
+  if (isProbeInProgress) {
+    logger.log('[FailbackLoader] Recovery skipped - probe already in progress');
+    return;
+  }
+
+  // Must be in permanent failback mode
+  if (!permanentFailbackMode) return;
+
+  // Need a URL to probe
+  if (!lastSuccessfulOriginalUrl) return;
+
+  // Check buffer - need enough runway for safe switch
+  const bufferAhead = getBufferAhead();
+  if (bufferAhead < MIN_BUFFER_FOR_RECOVERY) {
+    logger.log(
+      `[FailbackLoader] Recovery skipped - buffer ${bufferAhead.toFixed(1)}s < ${MIN_BUFFER_FOR_RECOVERY}s required`,
+    );
+    return;
+  }
+
+  isProbeInProgress = true;
+  logger.log(
+    `[FailbackLoader] Probing original CDN (buffer=${bufferAhead.toFixed(1)}s)...`,
+  );
+
+  const urlToProbe = lastSuccessfulOriginalUrl;
+
+  probeOriginalCDN(urlToProbe)
+    .then((isAlive) => {
+      // Re-check conditions after async probe - state may have changed
+      if (!permanentFailbackMode) {
+        logger.log(
+          '[FailbackLoader] Recovery aborted - no longer in permanent mode',
+        );
+        return;
+      }
+
+      // Re-check buffer after probe (user may have seeked)
+      const bufferAfterProbe = getBufferAhead();
+      if (bufferAfterProbe < MIN_BUFFER_FOR_RECOVERY) {
+        logger.log(
+          `[FailbackLoader] Recovery aborted - buffer dropped to ${bufferAfterProbe.toFixed(1)}s during probe`,
+        );
+        return;
+      }
+
+      if (isAlive) {
+        logger.log(
+          '[FailbackLoader] ✓ Original CDN recovered - switching back (first fail will return to permanent)',
+        );
+        resetFailbackState();
+      } else {
+        logger.log('[FailbackLoader] ✗ Original CDN still unavailable');
+      }
+    })
+    .catch(() => {
+      logger.log('[FailbackLoader] ✗ Original CDN probe failed');
+    })
+    .finally(() => {
+      isProbeInProgress = false;
+    });
 }
 
 /**
@@ -507,11 +658,24 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
               consecutiveOriginalFailures = 0;
             }
 
-            // Debug logging
+            // Store original URL for future recovery probes
+            if (this.failbackAttempt === 0) {
+              lastSuccessfulOriginalUrl = this.originalUrl;
+            }
+
+            // CDN Recovery: count fragments and probe when in permanent failback mode
             if (permanentFailbackMode) {
+              fragmentsSinceLastProbe++;
               logger.log(
-                `[FailbackLoader] SUCCESS (permanent failback): ${xhr.responseURL}`,
+                `[FailbackLoader] SUCCESS (permanent failback): ${xhr.responseURL} [${fragmentsSinceLastProbe}/${PROBE_EVERY_N_FRAGMENTS}]`,
               );
+
+              // Time to probe original CDN?
+              if (fragmentsSinceLastProbe >= PROBE_EVERY_N_FRAGMENTS) {
+                fragmentsSinceLastProbe = 0;
+                // Fire and forget - don't block the current request
+                tryRecoverToOriginalCDN();
+              }
             } else if (this.failbackAttempt > 0) {
               logger.log(
                 `[FailbackLoader] SUCCESS via failback #${this.failbackAttempt}: ${xhr.responseURL}`,

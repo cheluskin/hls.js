@@ -340,6 +340,36 @@
         height: 10px;
         border-radius: 50%;
       }
+
+      /* Failback state styles */
+      .failback-state-bar {
+        background: #0f3460;
+        padding: 10px 15px;
+        border-radius: 5px;
+        margin-top: 15px;
+        font-size: 12px;
+        font-family: 'Monaco', 'Menlo', monospace;
+      }
+
+      .failback-state-bar .permanent {
+        color: #ff4757;
+        font-weight: bold;
+      }
+
+      .failback-state-bar .normal {
+        color: #00ff88;
+      }
+
+      .btn-reset-state {
+        background: #ffaa00;
+        color: #1a1a2e;
+        border: none;
+        padding: 5px 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 11px;
+        margin-left: 15px;
+      }
     </style>
     <script src="../dist/hls.js"></script>
   </head>
@@ -451,6 +481,17 @@
             <div class="legend-dot" style="background: #ff6b6b"></div>
             Error
           </div>
+        </div>
+
+        <!-- Failback State Display -->
+        <div class="failback-state-bar">
+          <strong>Failback:</strong>
+          <span id="failback-state-display">
+            <span class="normal">Normal</span> | Failures: 0/2 | Buffer: 0s
+          </span>
+          <button class="btn-reset-state" onclick="manualResetState()">
+            Reset
+          </button>
         </div>
       </div>
 
@@ -575,6 +616,28 @@
       // HLS Player
       // ============================================
       let hls = null;
+
+      // Import failback state functions
+      const {
+        getFailbackState,
+        resetFailbackState,
+        setRecoveryVideoElement,
+        destroyFailbackState,
+      } = Hls;
+
+      // Update failback state display
+      function updateFailbackStateDisplay() {
+        const stateEl = document.getElementById('failback-state-display');
+        if (!stateEl) return;
+
+        const state = getFailbackState();
+        const modeClass = state.permanentMode ? 'permanent' : 'normal';
+        stateEl.innerHTML = `
+          <span class="${modeClass}">${state.permanentMode ? 'PERMANENT' : 'Normal'}</span>
+          | Failures: ${state.consecutiveFailures}/${state.threshold}
+          | Buffer: ${video.buffered.length > 0 ? (video.buffered.end(video.buffered.length - 1) - video.currentTime).toFixed(1) + 's' : '0s'}
+        `;
+      }
 
       // Check if blocking server is running
       async function checkBlockingServer() {
@@ -740,6 +803,13 @@ ${protocol}://${host}/x36xhzz/url_0/url_${seg.index}/193039199_mp4_h264_aac_hd_7
           }
         });
 
+        // Enable automatic CDN recovery
+        setRecoveryVideoElement(video);
+        log('Auto-recovery enabled', 'info');
+
+        // Update state display periodically
+        setInterval(updateFailbackStateDisplay, 1000);
+
         document.getElementById('btn-start').disabled = true;
         document.getElementById('btn-stop').disabled = false;
       }
@@ -749,11 +819,19 @@ ${protocol}://${host}/x36xhzz/url_0/url_${seg.index}/193039199_mp4_h264_aac_hd_7
           hls.destroy();
           hls = null;
         }
+        setRecoveryVideoElement(null);
+        destroyFailbackState();
         video.src = '';
-        log('Test stopped', 'info');
+        log('Test stopped, state cleared', 'info');
 
         document.getElementById('btn-start').disabled = false;
         document.getElementById('btn-stop').disabled = true;
+      }
+
+      function manualResetState() {
+        resetFailbackState();
+        log('Failback state reset manually', 'info');
+        updateFailbackStateDisplay();
       }
 
       // ============================================
