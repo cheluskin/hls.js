@@ -850,6 +850,50 @@ curl "https://purge.jsdelivr.net/npm/@armdborg/hls.js/dist/hls.min.js"
 
 ---
 
+## Синхронизация с upstream hls.js
+
+Этот форк периодически нужно синхронизировать с оригинальным [video-dev/hls.js](https://github.com/video-dev/hls.js) для получения исправлений и новых функций.
+
+### Первоначальная настройка (один раз)
+
+```bash
+git remote add upstream https://github.com/video-dev/hls.js.git
+```
+
+### Процесс синхронизации
+
+```bash
+# 1. Получить последние изменения из upstream
+git fetch upstream
+
+# 2. Убедиться что вы на master
+git checkout master
+
+# 3. Смержить изменения upstream
+git merge upstream/master
+
+# 4. Разрешить конфликты если есть
+#    - Сохранить свою версию (с суффиксом -failback)
+#    - Принять изменения upstream для остального кода
+git add .
+git commit -m "Merge upstream hls.js changes"
+
+# 5. Задеплоить новую версию
+npm run deploy
+```
+
+### Разрешение конфликтов версии
+
+При конфликте в `package.json` сохраняйте свой формат версии:
+
+```json
+"version": "X.Y.Z-failback.N"
+```
+
+Где X.Y.Z = версия upstream, N = номер вашего патча.
+
+---
+
 ## Лицензия
 
 Apache-2.0 (как и оригинальный hls.js)
