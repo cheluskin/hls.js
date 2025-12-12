@@ -390,10 +390,13 @@ test('Custom transform function receives correct attempt number', () => {
 
 console.log('===== Failback State Management Tests =====\n');
 
+// Mock config object for WeakMap key
+const mockConfig = {};
+
 // Test: getFailbackState returns correct initial state
 test('getFailbackState returns correct initial state', () => {
-  resetFailbackState();
-  const state = getFailbackState();
+  resetFailbackState(mockConfig);
+  const state = getFailbackState(mockConfig);
 
   assert.equal(typeof state.consecutiveFailures, 'number');
   assert.equal(typeof state.permanentMode, 'boolean');
@@ -406,23 +409,23 @@ test('getFailbackState returns correct initial state', () => {
 // Test: resetFailbackState resets state to initial values
 test('resetFailbackState resets state to initial values', () => {
   // First reset to ensure clean state
-  resetFailbackState();
+  resetFailbackState(mockConfig);
 
   // Get state before and after reset
-  const stateBefore = getFailbackState();
+  const stateBefore = getFailbackState(mockConfig);
   assert.equal(stateBefore.consecutiveFailures, 0);
   assert.equal(stateBefore.permanentMode, false);
 
   // Reset again - should not change anything
-  resetFailbackState();
-  const stateAfter = getFailbackState();
+  resetFailbackState(mockConfig);
+  const stateAfter = getFailbackState(mockConfig);
   assert.equal(stateAfter.consecutiveFailures, 0);
   assert.equal(stateAfter.permanentMode, false);
 });
 
 // Test: getFailbackState threshold value is correct
 test('getFailbackState threshold value is correct (2 failures for permanent mode)', () => {
-  const state = getFailbackState();
+  const state = getFailbackState(mockConfig);
   assert.equal(state.threshold, 2);
 });
 
@@ -461,7 +464,7 @@ test('Stall detection parameters are reasonable', () => {
 
 // Test: Permanent failback threshold is reasonable
 test('Permanent failback threshold is reasonable', () => {
-  const state = getFailbackState();
+  const state = getFailbackState(mockConfig);
 
   // Threshold should be at least 1
   assert.ok(state.threshold >= 1, 'Threshold should be at least 1');
@@ -528,8 +531,8 @@ console.log('===== CDN Recovery Tests =====\n');
 // Test: destroyFailbackState resets all state
 test('destroyFailbackState resets all state completely', () => {
   // First, reset to a known state
-  destroyFailbackState();
-  const state = getFailbackState();
+  destroyFailbackState(mockConfig);
+  const state = getFailbackState(mockConfig);
 
   assert.equal(state.consecutiveFailures, 0);
   assert.equal(state.permanentMode, false);
@@ -538,10 +541,10 @@ test('destroyFailbackState resets all state completely', () => {
 // Test: setRecoveryVideoElement accepts null
 test('setRecoveryVideoElement accepts null without error', () => {
   // Should not throw
-  setRecoveryVideoElement(null);
+  setRecoveryVideoElement(mockConfig, null);
 
   // Verify state is still valid
-  const state = getFailbackState();
+  const state = getFailbackState(mockConfig);
   assert.equal(typeof state.consecutiveFailures, 'number');
 });
 
@@ -557,19 +560,19 @@ test('setRecoveryVideoElement accepts mock video element', () => {
   };
 
   // Should not throw
-  setRecoveryVideoElement(mockVideo);
+  setRecoveryVideoElement(mockConfig, mockVideo);
 
   // Clean up
-  setRecoveryVideoElement(null);
+  setRecoveryVideoElement(mockConfig, null);
 });
 
 // Test: resetFailbackState from non-permanent mode sets failures to 0
 test('resetFailbackState from non-permanent mode sets failures to 0', () => {
-  destroyFailbackState();
+  destroyFailbackState(mockConfig);
 
   // Not in permanent mode
-  resetFailbackState();
-  const state = getFailbackState();
+  resetFailbackState(mockConfig);
+  const state = getFailbackState(mockConfig);
 
   assert.equal(state.consecutiveFailures, 0);
   assert.equal(state.permanentMode, false);
@@ -577,11 +580,11 @@ test('resetFailbackState from non-permanent mode sets failures to 0', () => {
 
 // Test: Multiple destroyFailbackState calls are safe
 test('Multiple destroyFailbackState calls are idempotent', () => {
-  destroyFailbackState();
-  destroyFailbackState();
-  destroyFailbackState();
+  destroyFailbackState(mockConfig);
+  destroyFailbackState(mockConfig);
+  destroyFailbackState(mockConfig);
 
-  const state = getFailbackState();
+  const state = getFailbackState(mockConfig);
   assert.equal(state.consecutiveFailures, 0);
   assert.equal(state.permanentMode, false);
 });

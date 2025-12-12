@@ -571,25 +571,31 @@ resetFailbackState();
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Включение автоматического восстановления:**
+**Автоматическое восстановление включено по умолчанию:**
 
 ```typescript
-import Hls, { setRecoveryVideoElement } from '@armdborg/hls.js';
+import Hls from '@armdborg/hls.js';
 
 const video = document.getElementById('video');
 const hls = new Hls();
 
+// setRecoveryVideoElement вызывается автоматически при attachMedia()
 hls.attachMedia(video);
-
-// Включаем автоматическое восстановление (передаём video для проверки буфера)
-setRecoveryVideoElement(video);
-
 hls.loadSource('https://example.com/playlist.m3u8');
 
-// При уничтожении плеера
-hls.on(Hls.Events.DESTROYING, () => {
-  setRecoveryVideoElement(null);
-});
+// При detachMedia() ссылка на video очищается автоматически
+```
+
+**Ручное управление (при необходимости):**
+
+```typescript
+import { setRecoveryVideoElement } from '@armdborg/hls.js';
+
+// Отключить автоматическое восстановление
+setRecoveryVideoElement(null);
+
+// Или установить другой video элемент
+setRecoveryVideoElement(anotherVideo);
 ```
 
 ---

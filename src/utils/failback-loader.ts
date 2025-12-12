@@ -18,99 +18,151 @@ const DEFAULT_DNS_DOMAIN = 'fb.turoktv.com';
 const FALLBACK_HOSTS = ['failback.turkserial.co'];
 // ============================================
 
-// Global cache for DNS-resolved hosts
+// Global cache for DNS-resolved hosts (Shared across all instances, this is safe/desired)
 let dnsHostsPromise: Promise<string[]> | null = null;
 let dnsHostsCache: string[] | null = null;
 
-// Global state for permanent failback mode
-// After N consecutive failures on original source, switch to failback permanently
-let consecutiveOriginalFailures = 0;
-let permanentFailbackMode = false;
-const PERMANENT_FAILBACK_THRESHOLD = 2; // Switch to permanent failback after 2 consecutive failures
+// ============================================
+// FAILBACK STATE ISOLATION
+// State is stored per HlsConfig instance to support multiple players on one page
+// ============================================
 
-// CDN Recovery: probe original CDN every N fragments while in permanent failback mode
-let fragmentsSinceLastProbe = 0;
-const PROBE_EVERY_N_FRAGMENTS = 6; // ~2 min with 20-sec fragments
+interface FailbackSessionState {
+  consecutiveOriginalFailures: number;
+  permanentFailbackMode: boolean;
+  threshold: number;
+  fragmentsSinceLastProbe: number;
+  lastSuccessfulOriginalUrl: string | null;
+  recoveryMediaElement: HTMLMediaElement | null;
+  isProbeInProgress: boolean;
+}
+
+const failbackStates = new WeakMap<HlsConfig, FailbackSessionState>();
+
+const PERMANENT_FAILBACK_THRESHOLD = 2;
+const PROBE_EVERY_N_FRAGMENTS = 6;
 const PROBE_TIMEOUT_MS = 3000;
-const MIN_BUFFER_FOR_RECOVERY = 40; // seconds - need enough buffer for safe switch
-let lastSuccessfulOriginalUrl: string | null = null; // Store original URL for probing
-let recoveryVideoElement: HTMLVideoElement | null = null; // Reference to video element for buffer check
-let isProbeInProgress = false; // Prevent concurrent probes
-
-// Stall detection: if no progress for this duration, trigger failback
-const STALL_TIMEOUT_MS = 5000; // 5 seconds without progress = stalled
-const STALL_CHECK_INTERVAL_MS = 1000; // Check every second
-
-// Minimum required throughput to consider connection healthy
-// 4KB/s is extremely low for video (even 144p), so if we are below this, we are definitely stalling/trickling
+const MIN_BUFFER_FOR_RECOVERY = 25;
+const STALL_TIMEOUT_MS = 5000;
+const STALL_CHECK_INTERVAL_MS = 1000;
 const MIN_SPEED_BYTES_PER_SEC = 4096;
 
 /**
- * Get current failback state (for monitoring/debugging)
+ * Get or initialize state for a specific config instance
  */
-export function getFailbackState(): {
+function getSessionState(config: HlsConfig): FailbackSessionState {
+  let state = failbackStates.get(config);
+  if (!state) {
+    state = {
+      consecutiveOriginalFailures: 0,
+      permanentFailbackMode: false,
+      threshold: PERMANENT_FAILBACK_THRESHOLD,
+      fragmentsSinceLastProbe: 0,
+      lastSuccessfulOriginalUrl: null,
+      recoveryMediaElement: null,
+      isProbeInProgress: false,
+    };
+    failbackStates.set(config, state);
+  }
+  return state;
+}
+
+/**
+ * Get current failback state (for monitoring/debugging)
+ * Requires the HlsConfig instance to identify the player
+ */
+export function getFailbackState(config: HlsConfig): {
   consecutiveFailures: number;
   permanentMode: boolean;
   threshold: number;
 } {
+  const state = getSessionState(config);
   return {
-    consecutiveFailures: consecutiveOriginalFailures,
-    permanentMode: permanentFailbackMode,
-    threshold: PERMANENT_FAILBACK_THRESHOLD,
+    consecutiveFailures: state.consecutiveOriginalFailures,
+    permanentMode: state.permanentFailbackMode,
+    threshold: state.threshold,
+  };
+}
+
+/**
+ * Get extended failback state including CDN recovery info (for debugging)
+ */
+export function getExtendedFailbackState(config: HlsConfig): {
+  consecutiveFailures: number;
+  permanentMode: boolean;
+  threshold: number;
+  fragmentsSinceLastProbe: number;
+  probeEveryNFragments: number;
+  lastSuccessfulOriginalUrl: string | null;
+  hasRecoveryMediaElement: boolean;
+  isProbeInProgress: boolean;
+  minBufferForRecovery: number;
+} {
+  const state = getSessionState(config);
+  return {
+    consecutiveFailures: state.consecutiveOriginalFailures,
+    permanentMode: state.permanentFailbackMode,
+    threshold: state.threshold,
+    fragmentsSinceLastProbe: state.fragmentsSinceLastProbe,
+    probeEveryNFragments: PROBE_EVERY_N_FRAGMENTS,
+    lastSuccessfulOriginalUrl: state.lastSuccessfulOriginalUrl,
+    hasRecoveryMediaElement: state.recoveryMediaElement !== null,
+    isProbeInProgress: state.isProbeInProgress,
+    minBufferForRecovery: MIN_BUFFER_FOR_RECOVERY,
   };
 }
 
 /**
  * Reset failback state (for debugging or when you want to retry original source)
- * Use with caution in production!
  */
-export function resetFailbackState(): void {
-  const wasInPermanentMode = permanentFailbackMode;
-  permanentFailbackMode = false;
-  fragmentsSinceLastProbe = 0;
-  // Note: isProbeInProgress is managed by tryRecoverToOriginalCDN's finally block
+export function resetFailbackState(config: HlsConfig): void {
+  const state = getSessionState(config);
+  const wasInPermanentMode = state.permanentFailbackMode;
+
+  state.permanentFailbackMode = false;
+  state.fragmentsSinceLastProbe = 0;
 
   if (wasInPermanentMode) {
-    // When exiting permanent mode, set failures to threshold-1
-    // so first failure returns us immediately to permanent mode
-    consecutiveOriginalFailures = PERMANENT_FAILBACK_THRESHOLD - 1;
+    state.consecutiveOriginalFailures = PERMANENT_FAILBACK_THRESHOLD - 1;
     logger.log(
-      `[FailbackLoader] State reset - will try original source (failures=${consecutiveOriginalFailures}, first fail returns to permanent)`,
+      `[FailbackLoader] State reset - will try original source (failures=${state.consecutiveOriginalFailures}, first fail returns to permanent)`,
     );
   } else {
-    consecutiveOriginalFailures = 0;
+    state.consecutiveOriginalFailures = 0;
   }
 }
 
 /**
  * Full reset of all failback state (for when HLS instance is destroyed)
  */
-export function destroyFailbackState(): void {
-  consecutiveOriginalFailures = 0;
-  permanentFailbackMode = false;
-  fragmentsSinceLastProbe = 0;
-  lastSuccessfulOriginalUrl = null;
-  recoveryVideoElement = null;
-  isProbeInProgress = false;
-  logger.log('[FailbackLoader] State fully destroyed');
+export function destroyFailbackState(config: HlsConfig): void {
+  if (failbackStates.has(config)) {
+    failbackStates.delete(config);
+    logger.log('[FailbackLoader] State fully destroyed');
+  }
 }
 
 /**
- * Set video element reference for buffer checking during CDN recovery
+ * Set media element reference for buffer checking during CDN recovery
+ * Supports both HTMLVideoElement and HTMLAudioElement
  */
-export function setRecoveryVideoElement(video: HTMLVideoElement | null): void {
-  recoveryVideoElement = video;
+export function setRecoveryVideoElement(
+  config: HlsConfig,
+  media: HTMLMediaElement | null,
+): void {
+  const state = getSessionState(config);
+  state.recoveryMediaElement = media;
 }
 
 /**
  * Get buffer ahead of current playback position
  */
-function getBufferAhead(): number {
-  if (!recoveryVideoElement) return 0;
+function getBufferAhead(state: FailbackSessionState): number {
+  if (!state.recoveryMediaElement) return 0;
 
-  const video = recoveryVideoElement;
-  const buffered = video.buffered;
-  const currentTime = video.currentTime;
+  const media = state.recoveryMediaElement;
+  const buffered = media.buffered;
+  const currentTime = media.currentTime;
 
   for (let i = 0; i < buffered.length; i++) {
     if (buffered.start(i) <= currentTime && currentTime <= buffered.end(i)) {
@@ -122,8 +174,12 @@ function getBufferAhead(): number {
 
 /**
  * Probe original CDN with a Range request to check if it's back online
+ * Supports headers (e.g. for Auth)
  */
-function probeOriginalCDN(url: string): Promise<boolean> {
+function probeOriginalCDN(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<boolean> {
   return new Promise((resolve) => {
     const controller = new AbortController();
     const timeoutId = self.setTimeout(
@@ -131,9 +187,14 @@ function probeOriginalCDN(url: string): Promise<boolean> {
       PROBE_TIMEOUT_MS,
     );
 
+    const mergedHeaders: Record<string, string> = {
+      Range: 'bytes=0-1023',
+      ...headers,
+    };
+
     fetch(url, {
       method: 'GET',
-      headers: { Range: 'bytes=0-1023' },
+      headers: mergedHeaders,
       signal: controller.signal,
     })
       .then((response) => {
@@ -150,21 +211,32 @@ function probeOriginalCDN(url: string): Promise<boolean> {
 /**
  * Try to recover to original CDN if conditions are met
  */
-function tryRecoverToOriginalCDN(): void {
+function tryRecoverToOriginalCDN(
+  config: HlsConfig,
+  headers?: Record<string, string>,
+): void {
+  const state = getSessionState(config);
+
   // Prevent concurrent probes
-  if (isProbeInProgress) {
+  if (state.isProbeInProgress) {
     logger.log('[FailbackLoader] Recovery skipped - probe already in progress');
     return;
   }
 
   // Must be in permanent failback mode
-  if (!permanentFailbackMode) return;
+  if (!state.permanentFailbackMode) {
+    logger.log('[FailbackLoader] Recovery skipped - not in permanent mode');
+    return;
+  }
 
   // Need a URL to probe
-  if (!lastSuccessfulOriginalUrl) return;
+  if (!state.lastSuccessfulOriginalUrl) {
+    logger.log('[FailbackLoader] Recovery skipped - no original URL stored');
+    return;
+  }
 
   // Check buffer - need enough runway for safe switch
-  const bufferAhead = getBufferAhead();
+  const bufferAhead = getBufferAhead(state);
   if (bufferAhead < MIN_BUFFER_FOR_RECOVERY) {
     logger.log(
       `[FailbackLoader] Recovery skipped - buffer ${bufferAhead.toFixed(1)}s < ${MIN_BUFFER_FOR_RECOVERY}s required`,
@@ -172,17 +244,17 @@ function tryRecoverToOriginalCDN(): void {
     return;
   }
 
-  isProbeInProgress = true;
+  state.isProbeInProgress = true;
   logger.log(
     `[FailbackLoader] Probing original CDN (buffer=${bufferAhead.toFixed(1)}s)...`,
   );
 
-  const urlToProbe = lastSuccessfulOriginalUrl;
+  const urlToProbe = state.lastSuccessfulOriginalUrl;
 
-  probeOriginalCDN(urlToProbe)
+  probeOriginalCDN(urlToProbe, headers)
     .then((isAlive) => {
       // Re-check conditions after async probe - state may have changed
-      if (!permanentFailbackMode) {
+      if (!state.permanentFailbackMode) {
         logger.log(
           '[FailbackLoader] Recovery aborted - no longer in permanent mode',
         );
@@ -190,7 +262,7 @@ function tryRecoverToOriginalCDN(): void {
       }
 
       // Re-check buffer after probe (user may have seeked)
-      const bufferAfterProbe = getBufferAhead();
+      const bufferAfterProbe = getBufferAhead(state);
       if (bufferAfterProbe < MIN_BUFFER_FOR_RECOVERY) {
         logger.log(
           `[FailbackLoader] Recovery aborted - buffer dropped to ${bufferAfterProbe.toFixed(1)}s during probe`,
@@ -202,7 +274,7 @@ function tryRecoverToOriginalCDN(): void {
         logger.log(
           '[FailbackLoader] ✓ Original CDN recovered - switching back (first fail will return to permanent)',
         );
-        resetFailbackState();
+        resetFailbackState(config);
       } else {
         logger.log('[FailbackLoader] ✗ Original CDN still unavailable');
       }
@@ -211,7 +283,7 @@ function tryRecoverToOriginalCDN(): void {
       logger.log('[FailbackLoader] ✗ Original CDN probe failed');
     })
     .finally(() => {
-      isProbeInProgress = false;
+      state.isProbeInProgress = false;
     });
 }
 
@@ -269,6 +341,8 @@ export interface FailbackConfig {
   ) => void;
   /** Callback when all attempts failed */
   onAllFailed?: (originalUrl: string, attempts: number) => void;
+  /** Disable Cache-Control header (useful for dev/test servers with strict CORS) */
+  disableCacheControlHeader?: boolean;
 }
 
 class FailbackLoader implements Loader<FragmentLoaderContext> {
@@ -305,7 +379,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       onSuccess: userConfig.onSuccess,
       onFailback: userConfig.onFailback,
       onAllFailed: userConfig.onAllFailed,
+      disableCacheControlHeader: userConfig.disableCacheControlHeader,
     };
+
+    // Ensure state exists for this config
+    getSessionState(config);
 
     // Start DNS preload if not already started (fire and forget)
     preloadFailbackHosts().catch(() => {
@@ -335,6 +413,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.callbacks = null;
     this.context = null;
     this.loaderConfig = null;
+    // Note: We do NOT destroy state here automatically because other loaders
+    // might still be active or the Hls instance might be reused.
+    // Explicit clean up should be done via Hls.destroy() which calls destroyFailbackState
   }
 
   private stopStallCheck() {
@@ -399,16 +480,17 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private onStall() {
     const currentUrl = this.currentUrl;
     this.stopStallCheck();
+    const state = getSessionState(this.config);
 
     // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
-      consecutiveOriginalFailures++;
+    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
+      state.consecutiveOriginalFailures++;
       logger.log(
-        `[FailbackLoader] Original source stalled - no progress for ${STALL_TIMEOUT_MS}ms (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+        `[FailbackLoader] Original source stalled - no progress for ${STALL_TIMEOUT_MS}ms (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
       );
 
-      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        permanentFailbackMode = true;
+      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        state.permanentFailbackMode = true;
         logger.log(
           `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
         );
@@ -493,8 +575,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.failbackAttempt = 0;
     this.originalUrl = context.url;
 
+    const state = getSessionState(this.config);
+
     // In permanent failback mode, skip original source entirely
-    if (permanentFailbackMode) {
+    if (state.permanentFailbackMode) {
       const failbackUrl = this.getFailbackUrl(0);
       if (failbackUrl) {
         this.failbackAttempt = 1;
@@ -570,7 +654,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     // Disable browser cache to prevent auto-adding Range headers from stale cache
     // This fixes ISP blocking issues where browser returns incomplete cached data
-    xhr.setRequestHeader('Cache-Control', 'no-store');
+    if (!this.failbackConfig.disableCacheControlHeader) {
+      xhr.setRequestHeader('Cache-Control', 'no-store');
+    }
 
     if (context.rangeEnd) {
       xhr.setRequestHeader(
@@ -652,33 +738,39 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
             );
 
             // Track consecutive failures for permanent failback mode
-            if (this.failbackAttempt === 0 && !permanentFailbackMode) {
+            const state = getSessionState(this.config);
+            if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
               // Success on original source - reset failure counter
-              if (consecutiveOriginalFailures > 0) {
+              if (state.consecutiveOriginalFailures > 0) {
                 logger.log(
                   `[FailbackLoader] Original source recovered, resetting failure counter`,
                 );
               }
-              consecutiveOriginalFailures = 0;
+              state.consecutiveOriginalFailures = 0;
             }
 
             // Store original URL for future recovery probes
-            if (this.failbackAttempt === 0) {
-              lastSuccessfulOriginalUrl = this.originalUrl;
+            // Always store it - even if we loaded from failback, we want to probe original later
+            if (
+              !state.lastSuccessfulOriginalUrl ||
+              this.failbackAttempt === 0
+            ) {
+              state.lastSuccessfulOriginalUrl = this.originalUrl;
             }
 
             // CDN Recovery: count fragments and probe when in permanent failback mode
-            if (permanentFailbackMode) {
-              fragmentsSinceLastProbe++;
+            if (state.permanentFailbackMode) {
+              state.fragmentsSinceLastProbe++;
               logger.log(
-                `[FailbackLoader] SUCCESS (permanent failback): ${xhr.responseURL} [${fragmentsSinceLastProbe}/${PROBE_EVERY_N_FRAGMENTS}]`,
+                `[FailbackLoader] SUCCESS (permanent failback): ${xhr.responseURL} [${state.fragmentsSinceLastProbe}/${PROBE_EVERY_N_FRAGMENTS}]`,
               );
 
               // Time to probe original CDN?
-              if (fragmentsSinceLastProbe >= PROBE_EVERY_N_FRAGMENTS) {
-                fragmentsSinceLastProbe = 0;
+              if (state.fragmentsSinceLastProbe >= PROBE_EVERY_N_FRAGMENTS) {
+                state.fragmentsSinceLastProbe = 0;
                 // Fire and forget - don't block the current request
-                tryRecoverToOriginalCDN();
+                // Pass headers for authenticated probe (if any)
+                tryRecoverToOriginalCDN(this.config, context.headers);
               }
             } else if (this.failbackAttempt > 0) {
               logger.log(
@@ -707,17 +799,18 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   private handleError(xhr: XMLHttpRequest, currentUrl: string, status: number) {
     this.stopStallCheck(); // Ensure stall check is stopped
+    const state = getSessionState(this.config);
 
     // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
-      consecutiveOriginalFailures++;
+    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
+      state.consecutiveOriginalFailures++;
       logger.log(
-        `[FailbackLoader] Original source failed (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+        `[FailbackLoader] Original source failed (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
       );
 
       // Check if we should switch to permanent failback mode
-      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        permanentFailbackMode = true;
+      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        state.permanentFailbackMode = true;
         logger.log(
           `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
         );
@@ -760,15 +853,17 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   private onTimeout(currentUrl: string) {
+    const state = getSessionState(this.config);
+
     // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
-      consecutiveOriginalFailures++;
+    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
+      state.consecutiveOriginalFailures++;
       logger.log(
-        `[FailbackLoader] Original source timeout (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+        `[FailbackLoader] Original source timeout (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
       );
 
-      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        permanentFailbackMode = true;
+      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        state.permanentFailbackMode = true;
         logger.log(
           `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
         );
@@ -819,16 +914,17 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     self.clearTimeout(this.requestTimeout);
     this.stopStallCheck();
+    const state = getSessionState(this.config);
 
     // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !permanentFailbackMode) {
-      consecutiveOriginalFailures++;
+    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
+      state.consecutiveOriginalFailures++;
       logger.log(
-        `[FailbackLoader] Original source network error (${consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+        `[FailbackLoader] Original source network error (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
       );
 
-      if (consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        permanentFailbackMode = true;
+      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+        state.permanentFailbackMode = true;
         logger.log(
           `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
         );

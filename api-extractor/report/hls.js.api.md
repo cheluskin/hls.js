@@ -2059,6 +2059,10 @@ class Hls implements HlsEventEmitter {
     // Warning: (ae-setter-with-docs) The doc comment for the property "DefaultConfig" must appear on the getter, not the setter.
     static set DefaultConfig(defaultConfig: HlsConfig);
     destroy(): void;
+    // Warning: (ae-forgotten-export) The symbol "destroyFailbackState" needs to be exported by the entry point hls.d.ts
+    //
+    // (undocumented)
+    static readonly destroyFailbackState: typeof destroyFailbackState;
     detachMedia(): void;
     get drift(): number | null;
     // (undocumented)
@@ -2077,6 +2081,12 @@ class Hls implements HlsEventEmitter {
     // Warning: (ae-setter-with-docs) The doc comment for the property "firstLevel" must appear on the getter, not the setter.
     set firstLevel(newLevel: number);
     get forceStartLoad(): boolean;
+    // Warning: (ae-forgotten-export) The symbol "getExtendedFailbackState" needs to be exported by the entry point hls.d.ts
+    //
+    // (undocumented)
+    static readonly getExtendedFailbackState: typeof getExtendedFailbackState;
+    // Warning: (ae-forgotten-export) The symbol "getFailbackState" needs to be exported by the entry point hls.d.ts
+    static readonly getFailbackState: typeof getFailbackState;
     getMediaDecodingInfo(level: Level, audioTracks?: MediaPlaylist[]): Promise<MediaDecodingInfo>;
     static getMediaSource(): typeof MediaSource | undefined;
     get hasEnoughToStart(): boolean;
@@ -2141,15 +2151,27 @@ class Hls implements HlsEventEmitter {
     get pathways(): string[];
     pauseBuffering(): void;
     get playingDate(): Date | null;
+    // Warning: (ae-forgotten-export) The symbol "preloadFailbackHosts" needs to be exported by the entry point hls.d.ts
+    //
+    // (undocumented)
+    static readonly preloadFailbackHosts: typeof preloadFailbackHosts;
     recoverMediaError(): void;
     // (undocumented)
     removeAllListeners<E extends keyof HlsListeners>(event?: E | undefined): void;
     // (undocumented)
     removeLevel(levelIndex: number): void;
+    // Warning: (ae-forgotten-export) The symbol "resetFailbackState" needs to be exported by the entry point hls.d.ts
+    //
+    // (undocumented)
+    static readonly resetFailbackState: typeof resetFailbackState;
     resumeBuffering(): void;
     // (undocumented)
     get sessionId(): string;
     setAudioOption(audioOption: MediaPlaylist | AudioSelectionOption | undefined): MediaPlaylist | null;
+    // Warning: (ae-forgotten-export) The symbol "setRecoveryVideoElement" needs to be exported by the entry point hls.d.ts
+    //
+    // (undocumented)
+    static readonly setRecoveryVideoElement: typeof setRecoveryVideoElement;
     setSubtitleOption(subtitleOption: MediaPlaylist | SubtitleSelectionOption | undefined): MediaPlaylist | null;
     get startLevel(): number;
     // Warning: (ae-setter-with-docs) The doc comment for the property "startLevel" must appear on the getter, not the setter.

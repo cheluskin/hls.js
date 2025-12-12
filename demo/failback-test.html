@@ -267,12 +267,15 @@
       .legend-dot.direct {
         background: #00ff88;
       }
+
       .legend-dot.failback {
         background: #ffaa00;
       }
+
       .legend-dot.error {
         background: #ff4444;
       }
+
       .legend-dot.info {
         background: #00d4ff;
       }
@@ -366,10 +369,12 @@
         background: #3e3a1a;
         color: #ffaa00;
       }
+
       .dns-status.success {
         background: #1a3e1a;
         color: #00ff88;
       }
+
       .dns-status.error {
         background: #3e1a1a;
         color: #ff4444;
@@ -458,6 +463,65 @@
           </div>
         </div>
       </div>
+
+      <!-- Chaos Control Section -->
+      <div
+        class="config-section"
+        style="border: 2px solid #e94560; background: #2a1a1a"
+      >
+        <h3 style="color: #ff4444">🔥 Chaos Controls (Simulate Failures)</h3>
+        <p style="color: #aaa; font-size: 13px; margin-bottom: 15px">
+          These controls sabotage <code>test-streams.mux.dev</code> requests to
+          force failback.
+        </p>
+
+        <div class="control-buttons">
+          <button
+            class="btn"
+            style="background: #333; color: #fff"
+            onclick="setChaosMode('none')"
+            id="chaos-none"
+          >
+            Normal Mode
+          </button>
+          <button
+            class="btn"
+            style="background: #e94560; color: #fff"
+            onclick="setChaosMode('500')"
+            id="chaos-500"
+          >
+            Simulate 500 Errors
+          </button>
+          <button
+            class="btn"
+            style="background: #ff4444; color: #fff"
+            onclick="setChaosMode('404')"
+            id="chaos-404"
+          >
+            Simulate 404 Errors
+          </button>
+          <button
+            class="btn"
+            style="background: #ffaa00; color: #000"
+            onclick="setChaosMode('timeout')"
+            id="chaos-timeout"
+          >
+            Simulate Timeouts
+          </button>
+        </div>
+        <div
+          id="chaos-status"
+          style="
+            margin-top: 10px;
+            color: #ffaa00;
+            font-size: 12px;
+            font-weight: bold;
+          "
+        >
+          Current Mode: Normal
+        </div>
+      </div>
+
       <div class="video-section">
         <video id="video" controls></video>
 
@@ -541,6 +605,94 @@
       const logsEl = document.getElementById('logs');
 
       let stats = { direct: 0, failback: 0, errors: 0 };
+
+      // ==========================================
+      // CHAOS MONKEY PATCHER (XHR Interceptor)
+      // ==========================================
+      let chaosMode = 'none'; // none, 500, 404, timeout
+      const OriginalXHR = window.XMLHttpRequest;
+
+      function setChaosMode(mode) {
+        chaosMode = mode;
+        document.getElementById('chaos-status').textContent =
+          `Current Mode: ${mode.toUpperCase()} (Targeting test-streams.mux.dev)`;
+
+        // Update UI active state
+        ['none', '500', '404', 'timeout'].forEach((m) => {
+          const btn = document.getElementById(`chaos-${m}`);
+          if (m === mode) {
+            btn.style.opacity = '1';
+            btn.style.transform = 'scale(1.05)';
+            btn.style.boxShadow = '0 0 10px rgba(255,0,0,0.5)';
+          } else {
+            btn.style.opacity = '0.7';
+            btn.style.transform = 'none';
+            btn.style.boxShadow = 'none';
+          }
+        });
+
+        log(`🔥 Chaos Mode set to: ${mode.toUpperCase()}`, 'failback');
+      }
+
+      // Patch XHR to simulate errors
+      window.XMLHttpRequest = class MockXHR extends OriginalXHR {
+        open(method, url, ...args) {
+          this._url = url;
+          super.open(method, url, ...args);
+        }
+
+        send(body) {
+          // Only target the primary host AND exclude failback requests
+          // We identify failback requests by the ?failback=true parameter added by transformUrl
+          const isTargetHost =
+            this._url && this._url.includes('test-streams.mux.dev');
+          const isFailbackRequest =
+            this._url && this._url.includes('failback=true');
+
+          if (chaosMode !== 'none' && isTargetHost && !isFailbackRequest) {
+            console.warn(
+              `[Chaos] Intercepting request to ${this._url} with mode ${chaosMode}`
+            );
+
+            if (chaosMode === 'timeout') {
+              // Do nothing - request will hang until default timeout
+              // Hls.js will interpret this as a timeout
+              log(`[Chaos] Simulating TIMEOUT for ${this._url}`, 'error');
+              return;
+            }
+
+            // For status errors, we need to let the browser process it a bit or just spoof response
+            // Easy way: spoof properties
+            Object.defineProperty(this, 'status', {
+              value: parseInt(chaosMode),
+            });
+            Object.defineProperty(this, 'statusText', {
+              value: 'Simulated Chaos Error',
+            });
+            Object.defineProperty(this, 'readyState', { value: 4 });
+
+            // Trigger error asynchronously
+            setTimeout(() => {
+              log(
+                `[Chaos] Simulating ${chaosMode} error for ${this._url}`,
+                'error'
+              );
+              if (this.onreadystatechange) this.onreadystatechange();
+              // Also trigger onload/onerror if they exist
+              if (parseInt(chaosMode) >= 400 && this.onerror) this.onerror();
+              else if (this.onload) this.onload();
+            }, 100);
+
+            return;
+          }
+
+          super.send(body);
+        }
+      };
+
+      // Initialize UI
+      setChaosMode('none');
+      // ==========================================
 
       // Fetch DNS hosts for display
       async function fetchDnsHostsForDisplay() {
@@ -684,21 +836,25 @@
         updateStats();
       }
 
-      // Backup host for failback
-      const backupHost = 'test-streams.mux.dev';
+      // Real CDN hosts - failback.turkserial.co is the backup
+      const mainHost = 'hls.armdb.org';
+      const backupHost = 'failback.turkserial.co';
 
       // Import failback state functions
-      const {
-        getFailbackState,
-        resetFailbackState,
-        setRecoveryVideoElement,
-        destroyFailbackState,
-      } = Hls;
+      // Add safety checks for Hls availability
+      const getFailbackState = Hls
+        ? Hls.getFailbackState
+        : () => ({ consecutiveFailures: 0 });
+      const resetFailbackState = Hls ? Hls.resetFailbackState : () => {};
+      const setRecoveryVideoElement = Hls
+        ? Hls.setRecoveryVideoElement
+        : () => {};
+      const destroyFailbackState = Hls ? Hls.destroyFailbackState : () => {};
 
       let hls = null;
 
       function initPlayer() {
-        if (!Hls.isSupported()) {
+        if (!Hls || !Hls.isSupported()) {
           log('HLS.js not supported in this browser', 'error');
           return;
         }
@@ -708,10 +864,36 @@
         hls = new Hls({
           debug: true, // Enable debug logs to see FailbackLoader messages in console
           failbackConfig: {
-            staticHosts: [backupHost],
+            // override DNS lookup with static hosts for reliable test environment
+            // bypasses CORS issues with DNS provider from localhost
+            staticHosts: ['test-streams.mux.dev'],
+
+            // Disable Cache-Control header to avoid CORS errors on mux.dev
+            disableCacheControlHeader: true,
+
+            // Custom transform to:
+            // 1. Point everything to mux.dev (since we only have one test stream)
+            // 2. Add ?failback=true so our Chaos Monkey knows to let this request through
+            transformUrl: (url, attempt) => {
+              try {
+                const u = new URL(url);
+                // Always use mux.dev for this test
+                u.hostname = 'test-streams.mux.dev';
+
+                // Add a marker so the MockXHR knows this is a "secure" failback request
+                // and shouldn't be sabotaged
+                u.searchParams.set('failback', 'true');
+
+                return u.toString();
+              } catch (e) {
+                return null;
+              }
+            },
 
             onSuccess: (url, wasFailback, attempt) => {
               if (wasFailback) {
+                stats.failback++;
+                updateStats();
                 log(`✅ SUCCESS (via failback #${attempt})`, 'success', url);
               } else {
                 stats.direct++;
@@ -723,8 +905,6 @@
             },
 
             onFailback: (originalUrl, failbackUrl, attempt) => {
-              stats.failback++;
-              updateStats();
               log(
                 `⚡ FAILBACK #${attempt}: Switching to backup server`,
                 'failback',
@@ -743,27 +923,16 @@
                 originalUrl
               );
             },
-
-            transformUrl: (url, attempt) => {
-              if (attempt === 0) {
-                try {
-                  const u = new URL(url);
-                  u.host = backupHost;
-                  return u.toString();
-                } catch (e) {
-                  return null;
-                }
-              }
-              return null;
-            },
           },
         });
 
-        hls.loadSource('/demo/broken-playlist.m3u8');
+        // Use CORS-enabled public test stream from Mux
+        // Original armdb.org stream blocks localhost CORS
+        hls.loadSource('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8');
         hls.attachMedia(video);
 
         // Enable automatic CDN recovery by setting video element
-        setRecoveryVideoElement(video);
+        setRecoveryVideoElement(hls.config, video);
         log('🔄 Auto-recovery enabled (video element set)', 'info');
 
         hls.on(Hls.Events.MANIFEST_PARSED, function () {
@@ -787,9 +956,9 @@
 
       function updateFailbackStateDisplay() {
         const stateEl = document.getElementById('failback-state');
-        if (!stateEl) return;
+        if (!stateEl || !hls || !hls.config) return;
 
-        const state = getFailbackState();
+        const state = getFailbackState(hls.config);
         const modeClass = state.permanentMode ? 'permanent' : 'normal';
         stateEl.innerHTML = `
           <div class="state-item">
@@ -802,26 +971,34 @@
           </div>
           <div class="state-item">
             <span class="state-label">Buffer:</span>
-            <span class="state-value">${video.buffered.length > 0 ? (video.buffered.end(video.buffered.length - 1) - video.currentTime).toFixed(1) + 's' : '0s'}</span>
+            <span class="state-value">${(video.buffered.length ? video.buffered.end(video.buffered.length - 1) - video.currentTime : 0).toFixed(1)}s</span>
           </div>
-        `;
+      `;
       }
 
       function resetState() {
-        resetFailbackState();
-        log('🔄 Failback state reset manually', 'info');
+        if (!hls || !hls.config) return;
+        resetFailbackState(hls.config);
+        log('🔄 Failback state reset (will try original source)', 'info');
         updateFailbackStateDisplay();
       }
 
       function destroyPlayer() {
         if (hls) {
           hls.destroy();
-          hls = null;
+          log('🛑 Player destroyed', 'info');
+
+          // Reset XHR Patcher to normal mode
+          setChaosMode('none');
+
+          // Clear UI state
+          const stateEl = document.getElementById('failback-state');
+          if (stateEl) {
+            stateEl.innerHTML = `
+            <div class="state-item"><span class="state-label">Status:</span><span class="state-value">Destroyed</span></div>
+          `;
+          }
         }
-        setRecoveryVideoElement(null);
-        destroyFailbackState();
-        log('🗑️ Player destroyed, state cleared', 'info');
-        updateFailbackStateDisplay();
       }
 
       // Initialize player

@@ -16,6 +16,7 @@ import M3U8Parser from './loader/m3u8-parser';
 import Cues from './utils/cues';
 import FailbackLoader, {
   destroyFailbackState,
+  getExtendedFailbackState,
   getFailbackState,
   preloadFailbackHosts,
   resetFailbackState,
@@ -78,6 +79,7 @@ export { getMediaSource } from './utils/mediasource-helper';
 export {
   destroyFailbackState,
   getFailbackState,
+  getExtendedFailbackState,
   preloadFailbackHosts,
   resetFailbackState,
   setRecoveryVideoElement,

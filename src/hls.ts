@@ -16,7 +16,14 @@ import PlaylistLoader from './loader/playlist-loader';
 import { MetadataSchema } from './types/demuxer';
 import { type HdcpLevel, isHdcpLevel, type Level } from './types/level';
 import { PlaylistLevelType } from './types/loader';
-import FailbackLoader from './utils/failback-loader';
+import FailbackLoader, {
+  destroyFailbackState,
+  getExtendedFailbackState,
+  getFailbackState,
+  preloadFailbackHosts,
+  resetFailbackState,
+  setRecoveryVideoElement,
+} from './utils/failback-loader';
 import { enableLogs, type ILogger } from './utils/logger';
 import { getMediaDecodingInfoPromise } from './utils/mediacapabilities-helper';
 import { getMediaSource } from './utils/mediasource-helper';
@@ -77,6 +84,17 @@ export default class Hls implements HlsEventEmitter {
    * Use as `fLoader: Hls.FailbackLoader` in config.
    */
   static readonly FailbackLoader = FailbackLoader;
+
+  /**
+   * Failback state management functions for CDN failover.
+   * These are exposed for advanced use cases and debugging.
+   */
+  static readonly getFailbackState = getFailbackState;
+  static readonly getExtendedFailbackState = getExtendedFailbackState;
+  static readonly resetFailbackState = resetFailbackState;
+  static readonly destroyFailbackState = destroyFailbackState;
+  static readonly setRecoveryVideoElement = setRecoveryVideoElement;
+  static readonly preloadFailbackHosts = preloadFailbackHosts;
 
   private static defaultConfig: HlsConfig | undefined;
 
@@ -451,6 +469,8 @@ export default class Hls implements HlsEventEmitter {
     this.coreComponents.length = 0;
     // Remove any references that could be held in config options or callbacks
     const config = this.config;
+    destroyFailbackState(config);
+
     config.xhrSetup = config.fetchSetup = undefined;
     // @ts-ignore
     this.userConfig = null;
@@ -479,6 +499,11 @@ export default class Hls implements HlsEventEmitter {
     const media = attachMediaSource ? data.media : data;
     const attachingData = attachMediaSource ? data : { media };
     this._media = media;
+    // Set media element for failback CDN recovery probing
+    // Support both HTMLVideoElement and HTMLAudioElement
+    if (media instanceof HTMLMediaElement) {
+      setRecoveryVideoElement(this.config, media);
+    }
     this.trigger(Events.MEDIA_ATTACHING, attachingData);
   }
 
@@ -490,6 +515,8 @@ export default class Hls implements HlsEventEmitter {
     const data = {};
     this.trigger(Events.MEDIA_DETACHING, data);
     this._media = null;
+    // Clear video element reference for failback recovery
+    setRecoveryVideoElement(this.config, null);
     this.trigger(Events.MEDIA_DETACHED, data);
   }
 
