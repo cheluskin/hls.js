@@ -43,49 +43,6 @@ git push origin v1.6.0-failback.XX  # replace XX with actual version
 # - Create GitHub Release
 ```
 
-## Syncing with Upstream hls.js
-
-This fork needs to be periodically synced with the original [video-dev/hls.js](https://github.com/video-dev/hls.js) repository to get bug fixes and new features.
-
-### One-time setup
-
-```bash
-# Add upstream remote (only needed once)
-git remote add upstream https://github.com/video-dev/hls.js.git
-```
-
-### Sync process
-
-```bash
-# 1. Fetch latest changes from upstream
-git fetch upstream
-
-# 2. Make sure you're on master
-git checkout master
-
-# 3. Merge upstream changes
-git merge upstream/master
-
-# 4. Resolve conflicts if any (usually in package.json version)
-#    - Keep your version number (with -failback suffix)
-#    - Accept upstream changes for everything else
-git add .
-git commit -m "Merge upstream hls.js changes"
-
-# 5. Deploy new version
-npm run deploy
-```
-
-### Handling version conflicts
-
-If `package.json` has conflicts, keep your version format:
-
-```json
-"version": "X.Y.Z-failback.N"
-```
-
-Where X.Y.Z matches upstream version and N is your patch number.
-
 ---
 
 # Original HLS.js Documentation
