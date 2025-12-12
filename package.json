@@ -1,6 +1,6 @@
 {
   "name": "@armdborg/hls.js",
-  "version": "1.6.0-failback.18",
+  "version": "1.6.0-failback.19",
   "license": "Apache-2.0",
   "description": "HLS.js with automatic failback support for fragment loading",
   "homepage": "https://github.com/cheluskin/hls.js",
