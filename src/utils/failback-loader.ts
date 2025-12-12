@@ -568,6 +568,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       }
     }
 
+    // Disable browser cache to prevent auto-adding Range headers from stale cache
+    // This fixes ISP blocking issues where browser returns incomplete cached data
+    xhr.setRequestHeader('Cache-Control', 'no-store');
+
     if (context.rangeEnd) {
       xhr.setRequestHeader(
         'Range',
