@@ -22,7 +22,6 @@ import FailbackLoader, {
   getFailbackState,
   preloadFailbackHosts,
   resetFailbackState,
-  setRecoveryVideoElement,
 } from './utils/failback-loader';
 import { enableLogs, type ILogger } from './utils/logger';
 import { getMediaDecodingInfoPromise } from './utils/mediacapabilities-helper';
@@ -93,7 +92,6 @@ export default class Hls implements HlsEventEmitter {
   static readonly getExtendedFailbackState = getExtendedFailbackState;
   static readonly resetFailbackState = resetFailbackState;
   static readonly destroyFailbackState = destroyFailbackState;
-  static readonly setRecoveryVideoElement = setRecoveryVideoElement;
   static readonly preloadFailbackHosts = preloadFailbackHosts;
 
   private static defaultConfig: HlsConfig | undefined;
@@ -499,11 +497,6 @@ export default class Hls implements HlsEventEmitter {
     const media = attachMediaSource ? data.media : data;
     const attachingData = attachMediaSource ? data : { media };
     this._media = media;
-    // Set media element for failback CDN recovery probing
-    // Support both HTMLVideoElement and HTMLAudioElement
-    if (media instanceof HTMLMediaElement) {
-      setRecoveryVideoElement(this.config, media);
-    }
     this.trigger(Events.MEDIA_ATTACHING, attachingData);
   }
 
@@ -515,8 +508,6 @@ export default class Hls implements HlsEventEmitter {
     const data = {};
     this.trigger(Events.MEDIA_DETACHING, data);
     this._media = null;
-    // Clear video element reference for failback recovery
-    setRecoveryVideoElement(this.config, null);
     this.trigger(Events.MEDIA_DETACHED, data);
   }
 

@@ -2168,10 +2168,6 @@ class Hls implements HlsEventEmitter {
     // (undocumented)
     get sessionId(): string;
     setAudioOption(audioOption: MediaPlaylist | AudioSelectionOption | undefined): MediaPlaylist | null;
-    // Warning: (ae-forgotten-export) The symbol "setRecoveryVideoElement" needs to be exported by the entry point hls.d.ts
-    //
-    // (undocumented)
-    static readonly setRecoveryVideoElement: typeof setRecoveryVideoElement;
     setSubtitleOption(subtitleOption: MediaPlaylist | SubtitleSelectionOption | undefined): MediaPlaylist | null;
     get startLevel(): number;
     // Warning: (ae-setter-with-docs) The doc comment for the property "startLevel" must appear on the getter, not the setter.

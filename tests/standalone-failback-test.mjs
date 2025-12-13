@@ -22,8 +22,7 @@ let clearDnsCache,
   fetchFailbackHosts,
   getFailbackState,
   resetFailbackState,
-  destroyFailbackState,
-  setRecoveryVideoElement;
+  destroyFailbackState;
 try {
   const dnsModule = await import('../src/utils/dns-txt-resolver.ts');
   clearDnsCache = dnsModule.clearDnsCache;
@@ -34,7 +33,6 @@ try {
   getFailbackState = loaderModule.getFailbackState;
   resetFailbackState = loaderModule.resetFailbackState;
   destroyFailbackState = loaderModule.destroyFailbackState;
-  setRecoveryVideoElement = loaderModule.setRecoveryVideoElement;
 } catch {
   // If direct TS import fails, the project needs to be built first
   console.log(
@@ -47,7 +45,6 @@ try {
   getFailbackState = module.getFailbackState;
   resetFailbackState = module.resetFailbackState;
   destroyFailbackState = module.destroyFailbackState;
-  setRecoveryVideoElement = module.setRecoveryVideoElement;
 }
 
 let passed = 0;
@@ -538,34 +535,6 @@ test('destroyFailbackState resets all state completely', () => {
   assert.equal(state.permanentMode, false);
 });
 
-// Test: setRecoveryVideoElement accepts null
-test('setRecoveryVideoElement accepts null without error', () => {
-  // Should not throw
-  setRecoveryVideoElement(mockConfig, null);
-
-  // Verify state is still valid
-  const state = getFailbackState(mockConfig);
-  assert.equal(typeof state.consecutiveFailures, 'number');
-});
-
-// Test: setRecoveryVideoElement accepts mock video element
-test('setRecoveryVideoElement accepts mock video element', () => {
-  const mockVideo = {
-    buffered: {
-      length: 1,
-      start: () => 0,
-      end: () => 45,
-    },
-    currentTime: 5,
-  };
-
-  // Should not throw
-  setRecoveryVideoElement(mockConfig, mockVideo);
-
-  // Clean up
-  setRecoveryVideoElement(mockConfig, null);
-});
-
 // Test: resetFailbackState from non-permanent mode sets failures to 0
 test('resetFailbackState from non-permanent mode sets failures to 0', () => {
   destroyFailbackState(mockConfig);
@@ -594,7 +563,6 @@ test('All state functions are exported and callable', () => {
   assert.equal(typeof getFailbackState, 'function');
   assert.equal(typeof resetFailbackState, 'function');
   assert.equal(typeof destroyFailbackState, 'function');
-  assert.equal(typeof setRecoveryVideoElement, 'function');
 });
 
 console.log('===== CDN Recovery Constants Tests =====\n');

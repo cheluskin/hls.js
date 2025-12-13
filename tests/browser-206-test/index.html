@@ -1,0 +1,426 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>206 Partial Content Detection Test</title>
+    <style>
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        max-width: 900px;
+        margin: 40px auto;
+        padding: 20px;
+        background: #1a1a2e;
+        color: #eee;
+      }
+      h1 {
+        color: #00d9ff;
+      }
+      .panel {
+        background: #16213e;
+        border-radius: 8px;
+        padding: 20px;
+        margin: 20px 0;
+      }
+      .log {
+        background: #0f0f23;
+        border-radius: 4px;
+        padding: 15px;
+        font-family: 'Monaco', 'Consolas', monospace;
+        font-size: 13px;
+        max-height: 400px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+      }
+      .log-entry {
+        margin: 4px 0;
+      }
+      .log-info {
+        color: #64ffda;
+      }
+      .log-warn {
+        color: #ffd93d;
+      }
+      .log-error {
+        color: #ff6b6b;
+      }
+      .log-success {
+        color: #6bcb77;
+      }
+      .log-failback {
+        color: #ff9f43;
+        background: #3d2914;
+        padding: 2px 6px;
+        border-radius: 3px;
+      }
+      .log-206 {
+        color: #ff6b6b;
+        background: #3d1414;
+        padding: 2px 6px;
+        border-radius: 3px;
+      }
+      button {
+        background: #00d9ff;
+        color: #000;
+        border: none;
+        padding: 12px 24px;
+        border-radius: 6px;
+        font-size: 16px;
+        cursor: pointer;
+        margin: 5px;
+      }
+      button:hover {
+        background: #00b8d9;
+      }
+      button:disabled {
+        background: #555;
+        color: #999;
+        cursor: not-allowed;
+      }
+      .status {
+        display: inline-block;
+        padding: 8px 16px;
+        border-radius: 4px;
+        font-weight: bold;
+      }
+      .status-waiting {
+        background: #3d3d14;
+        color: #ffd93d;
+      }
+      .status-running {
+        background: #143d3d;
+        color: #64ffda;
+      }
+      .status-success {
+        background: #143d14;
+        color: #6bcb77;
+      }
+      .status-fail {
+        background: #3d1414;
+        color: #ff6b6b;
+      }
+      video {
+        width: 100%;
+        max-height: 300px;
+        background: #000;
+        border-radius: 8px;
+      }
+      .config {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .config label {
+        display: block;
+        margin-bottom: 5px;
+        color: #aaa;
+      }
+      .config input,
+      .config select {
+        width: 100%;
+        padding: 8px;
+        border-radius: 4px;
+        border: 1px solid #333;
+        background: #0f0f23;
+        color: #eee;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🔍 206 Partial Content Detection Test</h1>
+
+    <div class="panel">
+      <h3>Test Scenario</h3>
+      <p>
+        This test simulates the browser cache issue from
+        <code>histoo.json</code>:
+      </p>
+      <ol>
+        <li>Request segment from primary CDN</li>
+        <li>
+          Primary CDN returns partial data then stalls (simulates DPI block)
+        </li>
+        <li>FailbackLoader detects stall → tries failback</li>
+        <li>Browser has cached partial data</li>
+        <li>Next request: browser auto-adds <code>Range</code> header</li>
+        <li>Primary CDN returns <code>HTTP 206</code> with partial content</li>
+        <li>
+          <strong>Our 206 detection should catch this and failback!</strong>
+        </li>
+      </ol>
+    </div>
+
+    <div class="panel">
+      <h3>Controls</h3>
+      <div style="margin-bottom: 10px">
+        <label style="color: #aaa; margin-right: 10px">Format:</label>
+        <select
+          id="formatSelect"
+          style="
+            padding: 8px;
+            border-radius: 4px;
+            background: #0f0f23;
+            color: #eee;
+            border: 1px solid #333;
+          "
+        >
+          <option value="ts">MPEG-TS (.ts)</option>
+          <option value="fmp4">fMP4 (.m4s)</option>
+        </select>
+      </div>
+      <button id="startTest" onclick="startTest()">▶ Start Test</button>
+      <button id="resetTest" onclick="resetTest()">↻ Reset</button>
+      <button onclick="clearLog()">🗑 Clear Log</button>
+      <span class="status status-waiting" id="status">Waiting...</span>
+    </div>
+
+    <div class="panel">
+      <h3>Video Player</h3>
+      <video id="video" controls muted></video>
+    </div>
+
+    <div class="panel">
+      <h3>Log</h3>
+      <div class="log" id="log"></div>
+    </div>
+
+    <script type="module">
+      import Hls, {
+        FailbackLoader,
+        getFailbackState,
+        destroyFailbackState,
+      } from '/hls.mjs';
+
+      window.Hls = Hls;
+      window.FailbackLoader = FailbackLoader;
+      window.getFailbackState = getFailbackState;
+      window.destroyFailbackState = destroyFailbackState;
+
+      const logEl = document.getElementById('log');
+      const statusEl = document.getElementById('status');
+      const videoEl = document.getElementById('video');
+
+      let hls = null;
+      let testResults = {
+        stallDetected: false,
+        failbackTriggered: false,
+        partialContentDetected: false,
+        finalSuccess: false,
+      };
+
+      window.log = function (message, type = 'info') {
+        const entry = document.createElement('div');
+        entry.className = `log-entry log-${type}`;
+
+        const time = new Date().toISOString().substr(11, 12);
+        entry.textContent = `[${time}] ${message}`;
+
+        // Highlight special events
+        if (message.includes('206') || message.includes('CACHE RANGE')) {
+          entry.className += ' log-206';
+        }
+        if (message.includes('FAILBACK')) {
+          entry.className += ' log-failback';
+        }
+
+        logEl.appendChild(entry);
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+
+      window.setStatus = function (text, type) {
+        statusEl.textContent = text;
+        statusEl.className = `status status-${type}`;
+      };
+
+      window.clearLog = function () {
+        logEl.innerHTML = '';
+      };
+
+      window.resetTest = function () {
+        if (hls) {
+          hls.destroy();
+          hls = null;
+        }
+        videoEl.src = '';
+        testResults = {
+          stallDetected: false,
+          failbackTriggered: false,
+          partialContentDetected: false,
+          finalSuccess: false,
+        };
+        setStatus('Waiting...', 'waiting');
+        log('Test reset', 'info');
+      };
+
+      window.startTest = function () {
+        resetTest();
+        setStatus('Running...', 'running');
+        log('='.repeat(50), 'info');
+        log('Starting 206 Partial Content Detection Test', 'info');
+        log('='.repeat(50), 'info');
+
+        // Create HLS instance with FailbackLoader
+        const config = {
+          debug: true, // Enable to see FailbackLoader logs
+          fLoader: FailbackLoader,
+          failbackConfig: {
+            // Use transformUrl to change /primary/ to /failback/
+            // This avoids needing DNS/hosts file changes
+            // Works with both .ts and .m4s segments
+            transformUrl: (url, attempt) => {
+              // Transform /primary/ to /failback/ for both TS and fMP4 segments
+              if (url.includes('/primary/')) {
+                return url.replace('/primary/', '/failback/');
+              }
+              return url;
+            },
+            onFailback: (orig, fb, attempt) => {
+              testResults.failbackTriggered = true;
+              log(`🔄 FAILBACK triggered! Attempt #${attempt}`, 'failback');
+              log(`   Original: ${orig}`, 'failback');
+              log(`   Failback: ${fb}`, 'failback');
+            },
+            onSuccess: (url, wasFailback, attempt) => {
+              if (wasFailback) {
+                testResults.finalSuccess = true;
+                log(
+                  `✅ SUCCESS via failback (attempt ${attempt}): ${url}`,
+                  'success',
+                );
+              } else {
+                log(`✅ SUCCESS (direct): ${url}`, 'success');
+              }
+            },
+            onAllFailed: (url, attempts) => {
+              log(`❌ ALL FAILED after ${attempts} attempts: ${url}`, 'error');
+            },
+          },
+          fragLoadPolicy: {
+            default: {
+              maxTimeToFirstByteMs: 10000,
+              maxLoadTimeMs: 120000,
+              timeoutRetry: {
+                maxNumRetry: 1,
+                retryDelayMs: 0,
+                maxRetryDelayMs: 0,
+              },
+              errorRetry: {
+                maxNumRetry: 2,
+                retryDelayMs: 1000,
+                maxRetryDelayMs: 8000,
+              },
+            },
+          },
+        };
+
+        hls = new Hls(config);
+
+        // HLS.js events
+        hls.on(Hls.Events.MANIFEST_LOADED, () => {
+          log('📋 Manifest loaded', 'info');
+        });
+
+        hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
+          log(`📥 Fragment loading: ${data.frag.url}`, 'info');
+        });
+
+        hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+          log(`📦 Fragment loaded: ${data.frag.url}`, 'success');
+
+          // Check final state
+          const state = getFailbackState(config);
+          log(
+            `📊 Failback state: failures=${state.consecutiveFailures}, permanentMode=${state.permanentMode}`,
+            'info',
+          );
+
+          // Test complete - evaluate results
+          setTimeout(() => {
+            evaluateResults();
+          }, 1000);
+        });
+
+        hls.on(Hls.Events.ERROR, (event, data) => {
+          log(`⚠️ HLS Error: ${data.type} - ${data.details}`, 'warn');
+          if (data.fatal) {
+            log(`❌ Fatal error!`, 'error');
+            setStatus('Failed', 'fail');
+          }
+        });
+
+        // Intercept FailbackLoader logging
+        const originalConsoleLog = console.log;
+        console.log = function (...args) {
+          const msg = args.join(' ');
+          if (msg.includes('[FailbackLoader]')) {
+            log(msg, 'info');
+
+            if (msg.includes('STALL DETECTED')) {
+              testResults.stallDetected = true;
+            }
+            if (msg.includes('CACHE RANGE ISSUE DETECTED')) {
+              testResults.partialContentDetected = true;
+              log('🎯 206 PARTIAL CONTENT DETECTED BY OUR CODE!', 'success');
+            }
+          }
+          originalConsoleLog.apply(console, args);
+        };
+
+        // Load the test stream based on selected format
+        const format = document.getElementById('formatSelect').value;
+        const playlistUrl =
+          format === 'fmp4'
+            ? 'http://localhost:8765/playlist-fmp4.m3u8'
+            : 'http://localhost:8765/playlist.m3u8';
+
+        log(`Loading ${format.toUpperCase()} playlist: ${playlistUrl}`, 'info');
+        hls.loadSource(playlistUrl);
+        hls.attachMedia(videoEl);
+      };
+
+      function evaluateResults() {
+        log('='.repeat(50), 'info');
+        log('Test Results:', 'info');
+        log(
+          `  Stall detected: ${testResults.stallDetected ? '✅' : '❌'}`,
+          testResults.stallDetected ? 'success' : 'error',
+        );
+        log(
+          `  Failback triggered: ${testResults.failbackTriggered ? '✅' : '❌'}`,
+          testResults.failbackTriggered ? 'success' : 'error',
+        );
+        log(
+          `  206 detection: ${testResults.partialContentDetected ? '✅' : '❌'}`,
+          testResults.partialContentDetected ? 'success' : 'error',
+        );
+        log(
+          `  Final success: ${testResults.finalSuccess ? '✅' : '❌'}`,
+          testResults.finalSuccess ? 'success' : 'error',
+        );
+        log('='.repeat(50), 'info');
+
+        if (testResults.failbackTriggered && testResults.finalSuccess) {
+          setStatus('Test Passed! ✅', 'success');
+          log(
+            '🎉 TEST PASSED: 206 detection and failback working correctly!',
+            'success',
+          );
+        } else {
+          setStatus('Test Failed ❌', 'fail');
+          log('❌ TEST FAILED: Check logs above for details', 'error');
+        }
+      }
+
+      // Instructions
+      log('Welcome to the 206 Partial Content Detection Test!', 'info');
+      log('', 'info');
+      log(
+        'This test verifies that our FailbackLoader correctly detects',
+        'info',
+      );
+      log('browser-initiated Range requests from cached partial data.', 'info');
+      log('', 'info');
+      log('Click "Start Test" to begin.', 'info');
+    </script>
+  </body>
+</html>

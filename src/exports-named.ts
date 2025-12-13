@@ -20,7 +20,6 @@ import FailbackLoader, {
   getFailbackState,
   preloadFailbackHosts,
   resetFailbackState,
-  setRecoveryVideoElement,
 } from './utils/failback-loader';
 import FetchLoader from './utils/fetch-loader';
 import XhrLoader from './utils/xhr-loader';
@@ -82,7 +81,6 @@ export {
   getExtendedFailbackState,
   preloadFailbackHosts,
   resetFailbackState,
-  setRecoveryVideoElement,
 };
 export {
   fetchDnsTxt,
