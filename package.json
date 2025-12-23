@@ -1,6 +1,6 @@
 {
   "name": "@armdborg/hls.js",
-  "version": "1.6.0-failback.21",
+  "version": "1.6.0-failback.23",
   "license": "Apache-2.0",
   "description": "HLS.js with automatic failback support for fragment loading",
   "homepage": "https://github.com/cheluskin/hls.js",
@@ -67,8 +67,8 @@
     "test:failback:integration": "node tests/integration-failback-test.mjs",
     "test:failback:all": "npm run test:failback && npm run test:failback:integration",
     "deploy": "npm run test:failback:all && npm version prerelease --preid=failback --no-git-tag-version && npm run build && npm run deploy:arm && npm run deploy:int",
-    "deploy:arm": "cp -r dist-armdb/* dist/ && npm publish --access public",
-    "deploy:int": "cp -r dist-intrdb/* dist/ && node scripts/publish-intrdb.js",
+    "deploy:arm": "node scripts/publish.js arm",
+    "deploy:int": "node scripts/publish.js int",
     "type-check": "tsc --noEmit",
     "type-check:watch": "npm run type-check -- --watch",
     "prepare": "husky"

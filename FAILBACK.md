@@ -676,33 +676,44 @@ npm install @intrdb/hls.js
 
 - Полная совместимость с API оригинального hls.js
 - Drop-in замена: просто замените `hls.js` на `@armdborg/hls.js`
-- Автоматическая синхронизация с upstream (daily)
 - Версионирование: `{upstream-version}-failback.{N}`
 
 ---
 
 ## Релиз новой версии
 
-Публикация в npm происходит автоматически через GitHub Actions при пуше тега `v*`.
-Оба пакета (`@armdborg/hls.js` и `@intrdb/hls.js`) публикуются одновременно.
+Публикация в npm выполняется локально через npm scripts.
+
+### Настройка npm авторизации (один раз)
+
+```bash
+# Вариант 1: Интерактивный логин
+npm login
+
+# Вариант 2: Токен с bypass 2FA
+# Создать на https://www.npmjs.com/settings/~/tokens → Granular Access Token
+npm config set //registry.npmjs.org/:_authToken=npm_ТВОЙ_ТОКЕН
+```
 
 ### Быстрый деплой (одной командой)
 
 ```bash
-# Закоммитить изменения и выполнить деплой обоих пакетов
-git add -A
-git commit -m "fix/feat: описание изменений"
 npm run deploy
 ```
 
 Команда `npm run deploy` автоматически:
 
 1. Запускает тесты failback
-2. Обновляет версию (создаёт тег `v*`)
+2. Увеличивает версию (`1.6.0-failback.N` → `1.6.0-failback.N+1`)
 3. Собирает оба варианта (`dist-armdb/` и `dist-intrdb/`)
 4. Публикует `@armdborg/hls.js`
 5. Публикует `@intrdb/hls.js`
-6. Пушит изменения и теги в GitHub
+
+После деплоя закоммитить изменения:
+
+```bash
+git add -A && git commit -m "1.6.0-failback.N" && git push
+```
 
 ### Раздельный деплой
 
@@ -717,10 +728,10 @@ npm run build:armdb
 npm run build:intrdb
 
 # Деплой только armdb
-npm run deploy:armdb
+npm run deploy:arm
 
 # Деплой только intrdb
-npm run deploy:intrdb
+npm run deploy:int
 ```
 
 ### Структура сборки
@@ -728,28 +739,16 @@ npm run deploy:intrdb
 ```
 dist-armdb/    ← @armdborg/hls.js (armfb.turoktv.com)
 dist-intrdb/   ← @intrdb/hls.js (intfb.turoktv.com)
-dist/          ← Рабочая папка для npm publish
 ```
 
-### Что происходит автоматически
-
-После пуша тега `v*` GitHub Actions workflow (`.github/workflows/build-release.yml`):
-
-1. Собирает оба варианта (`npm run build`)
-2. Запускает failback тесты
-3. Публикует `@armdborg/hls.js` в npm
-4. Публикует `@intrdb/hls.js` в npm
-5. Создаёт GitHub Release с CDN ссылками для обоих пакетов
+При публикации скрипт `scripts/publish.js` создаёт `package.json` в папке `dist-*` и публикует оттуда. Основной `package.json` не модифицируется.
 
 ### Проверка статуса
 
 ```bash
-# Проверить статус workflow
-gh run list --repo cheluskin/hls.js --limit 3
-
 # Проверить опубликованные версии
-npm view @armdborg/hls.js versions --json | tail -3
-npm view @intrdb/hls.js versions --json | tail -3
+npm view @armdborg/hls.js dist-tags
+npm view @intrdb/hls.js dist-tags
 ```
 
 ---
@@ -790,7 +789,7 @@ src/hls.ts                # Hls.FailbackLoader (строка 79)
 src/exports-named.ts      # Экспорты функций failback
 
 scripts/
-└── publish-intrdb.js     # Скрипт публикации @intrdb/hls.js
+└── publish.js            # Универсальный скрипт публикации (arm/int)
 
 build-config.js           # Env vars: FAILBACK_DNS_DOMAIN, FAILBACK_HOSTS
 
@@ -853,17 +852,6 @@ const hls = new Hls({
 
 ## Откат версии
 
-### Через GitHub Actions (рекомендуется)
-
-1. Перейдите в репозиторий: https://github.com/cheluskin/hls.js
-2. Откройте вкладку **Actions**
-3. Слева выберите **"Rollback npm version"**
-4. Нажмите **"Run workflow"**
-5. Введите версию для отката (например: `1.6.0-failback.6`)
-6. Нажмите **"Run workflow"**
-
-Workflow автоматически переключит тег `latest` и очистит кэш jsDelivr.
-
 ### Через npm CLI
 
 ```bash
@@ -922,6 +910,9 @@ git commit -m "Merge upstream hls.js changes"
 
 # 5. Задеплоить новую версию
 npm run deploy
+
+# 6. Закоммитить и запушить
+git add -A && git commit -m "Sync with upstream + 1.6.0-failback.N" && git push
 ```
 
 ### Разрешение конфликтов версии
