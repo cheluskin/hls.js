@@ -2,8 +2,11 @@
 
 Форк библиотеки [hls.js](https://github.com/video-dev/hls.js) с добавлением системы автоматического переключения на резервные хосты при загрузке фрагментов видео.
 
-**Пакет:** `@armdborg/hls.js`
-**Версия:** 1.6.0-failback.16
+**Пакеты:**
+
+- `@armdborg/hls.js` — DNS: `armfb.turoktv.com`, Fallback: `failback.turkserial.co`
+- `@intrdb/hls.js` — DNS: `intfb.turoktv.com`, Fallback: `failback.intrdb.com`
+
 **Репозиторий:** https://github.com/cheluskin/hls.js
 
 ---
@@ -328,10 +331,12 @@ hls.loadSource('https://example.com/playlist.m3u8');
 hls.attachMedia(video);
 ```
 
-Failback включен по умолчанию с настройками:
+Failback включен по умолчанию. Настройки зависят от пакета:
 
-- **DNS домен:** `fb.turoktv.com`
-- **Fallback хост:** `failback.turkserial.co` (если DNS недоступен)
+| Пакет              | DNS домен           | Fallback хост            |
+| ------------------ | ------------------- | ------------------------ |
+| `@armdborg/hls.js` | `armfb.turoktv.com` | `failback.turkserial.co` |
+| `@intrdb/hls.js`   | `intfb.turoktv.com` | `failback.intrdb.com`    |
 
 ### Кастомная конфигурация
 
@@ -481,9 +486,12 @@ Failback #2:  https://host2-from-dns.example.com/video/stream/segment001.ts?toke
 
 ## DNS TXT конфигурация
 
-Для динамического управления списком резервных хостов создайте TXT запись:
+Для динамического управления списком резервных хостов создайте TXT записи:
 
-**Домен:** `fb.turoktv.com` (или ваш кастомный)
+| Пакет              | DNS домен           |
+| ------------------ | ------------------- |
+| `@armdborg/hls.js` | `armfb.turoktv.com` |
+| `@intrdb/hls.js`   | `intfb.turoktv.com` |
 
 **Содержимое TXT записи:**
 
@@ -645,13 +653,21 @@ FailbackLoader выводит в консоль информативные со�
 ### npm
 
 ```bash
+# Вариант 1: armdb
 npm install @armdborg/hls.js
+
+# Вариант 2: intrdb
+npm install @intrdb/hls.js
 ```
 
 ### CDN
 
 ```html
+<!-- Вариант 1: armdb (DNS: armfb.turoktv.com) -->
 <script src="https://cdn.jsdelivr.net/npm/@armdborg/hls.js@latest/dist/hls.min.js"></script>
+
+<!-- Вариант 2: intrdb (DNS: intfb.turoktv.com) -->
+<script src="https://cdn.jsdelivr.net/npm/@intrdb/hls.js@latest/dist/hls.min.js"></script>
 ```
 
 ---
@@ -668,11 +684,12 @@ npm install @armdborg/hls.js
 ## Релиз новой версии
 
 Публикация в npm происходит автоматически через GitHub Actions при пуше тега `v*`.
+Оба пакета (`@armdborg/hls.js` и `@intrdb/hls.js`) публикуются одновременно.
 
 ### Быстрый деплой (одной командой)
 
 ```bash
-# Закоммитить изменения и выполнить деплой
+# Закоммитить изменения и выполнить деплой обоих пакетов
 git add -A
 git commit -m "fix/feat: описание изменений"
 npm run deploy
@@ -681,42 +698,48 @@ npm run deploy
 Команда `npm run deploy` автоматически:
 
 1. Запускает тесты failback
-2. Собирает проект
-3. Обновляет версию (создаёт тег `v*`)
-4. Пересобирает с новой версией
-5. Пушит изменения и теги в GitHub
-6. GitHub Actions публикует в npm
+2. Обновляет версию (создаёт тег `v*`)
+3. Собирает оба варианта (`dist-armdb/` и `dist-intrdb/`)
+4. Публикует `@armdborg/hls.js`
+5. Публикует `@intrdb/hls.js`
+6. Пушит изменения и теги в GitHub
 
-### Ручной процесс релиза
+### Раздельный деплой
 
 ```bash
-# 1. Убедиться что код собирается и тесты проходят
-npm run build
-npm test
-
-# 2. Закоммитить изменения
-git add -A
-git commit -m "fix/feat: описание изменений"
-
-# 3. Обновить версию (автоматически создаёт коммит и тег с префиксом v)
-npm version prerelease --preid=failback
-# Результат: v1.6.0-failback.17
-
-# 4. Пересобрать с новой версией в бандле
+# Только сборка (оба варианта)
 npm run build
 
-# 5. Запушить коммиты и теги
-git push origin master --tags
+# Только сборка armdb
+npm run build:armdb
+
+# Только сборка intrdb
+npm run build:intrdb
+
+# Деплой только armdb
+npm run deploy:armdb
+
+# Деплой только intrdb
+npm run deploy:intrdb
+```
+
+### Структура сборки
+
+```
+dist-armdb/    ← @armdborg/hls.js (armfb.turoktv.com)
+dist-intrdb/   ← @intrdb/hls.js (intfb.turoktv.com)
+dist/          ← Рабочая папка для npm publish
 ```
 
 ### Что происходит автоматически
 
 После пуша тега `v*` GitHub Actions workflow (`.github/workflows/build-release.yml`):
 
-1. Собирает проект
+1. Собирает оба варианта (`npm run build`)
 2. Запускает failback тесты
-3. Публикует в npm с тегом `failback`
-4. Создаёт GitHub Release с CDN ссылками
+3. Публикует `@armdborg/hls.js` в npm
+4. Публикует `@intrdb/hls.js` в npm
+5. Создаёт GitHub Release с CDN ссылками для обоих пакетов
 
 ### Проверка статуса
 
@@ -724,8 +747,9 @@ git push origin master --tags
 # Проверить статус workflow
 gh run list --repo cheluskin/hls.js --limit 3
 
-# Проверить опубликованную версию
-npm view @armdborg/hls.js versions --json | tail -5
+# Проверить опубликованные версии
+npm view @armdborg/hls.js versions --json | tail -3
+npm view @intrdb/hls.js versions --json | tail -3
 ```
 
 ---
@@ -764,6 +788,14 @@ src/utils/
 src/config.ts             # fLoader: FailbackLoader (строка 414)
 src/hls.ts                # Hls.FailbackLoader (строка 79)
 src/exports-named.ts      # Экспорты функций failback
+
+scripts/
+└── publish-intrdb.js     # Скрипт публикации @intrdb/hls.js
+
+build-config.js           # Env vars: FAILBACK_DNS_DOMAIN, FAILBACK_HOSTS
+
+dist-armdb/               # Сборка @armdborg/hls.js
+dist-intrdb/              # Сборка @intrdb/hls.js
 
 tests/
 ├── standalone-failback-test.mjs   # Unit тесты
@@ -835,11 +867,15 @@ Workflow автоматически переключит тег `latest` и оч
 ### Через npm CLI
 
 ```bash
-# Откатить latest на предыдущую версию
+# Откатить @armdborg latest на предыдущую версию
 npm dist-tag add @armdborg/hls.js@1.6.0-failback.6 latest
+
+# Откатить @intrdb latest на предыдущую версию
+npm dist-tag add @intrdb/hls.js@1.6.0-failback.6 latest
 
 # Очистить кэш jsDelivr
 curl "https://purge.jsdelivr.net/npm/@armdborg/hls.js/dist/hls.min.js"
+curl "https://purge.jsdelivr.net/npm/@intrdb/hls.js/dist/hls.min.js"
 ```
 
 ### На оригинальный hls.js

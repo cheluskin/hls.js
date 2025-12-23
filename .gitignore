@@ -46,3 +46,7 @@ _ReSharper*/
 
 # VSCode custom workspace settings
 .vscode/settings.json
+
+# Failback variant builds
+dist-armdb/
+dist-intrdb/

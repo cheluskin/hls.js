@@ -12,10 +12,14 @@ import type {
 
 // ============================================
 // FAILBACK КОНФИГУРАЦИЯ
-// Хосты загружаются из DNS TXT записи fb.turoktv.com
+// Значения подставляются при сборке через env vars:
+// FAILBACK_DNS_DOMAIN и FAILBACK_HOSTS
 // ============================================
-const DEFAULT_DNS_DOMAIN = 'fb.turoktv.com';
-const FALLBACK_HOSTS = ['failback.turkserial.co'];
+declare const __FAILBACK_DNS_DOMAIN__: string;
+declare const __FAILBACK_HOSTS__: string[];
+
+const DEFAULT_DNS_DOMAIN = __FAILBACK_DNS_DOMAIN__;
+const FALLBACK_HOSTS = __FAILBACK_HOSTS__;
 // ============================================
 
 // Global cache for DNS-resolved hosts (Shared across all instances, this is safe/desired)
@@ -148,15 +152,17 @@ function probeOriginalCDN(
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const controller = new AbortController();
-    const timeoutId = self.setTimeout(
-      () => controller.abort(),
-      PROBE_TIMEOUT_MS,
-    );
+    const timeoutId = self.setTimeout(() => {
+      logger.log(`[FailbackLoader] Probe timeout after ${PROBE_TIMEOUT_MS}ms`);
+      controller.abort();
+    }, PROBE_TIMEOUT_MS);
 
     const mergedHeaders: Record<string, string> = {
       Range: 'bytes=0-1023',
       ...headers,
     };
+
+    logger.log(`[FailbackLoader] Probe fetch starting: ${url}`);
 
     fetch(url, {
       method: 'GET',
@@ -165,10 +171,17 @@ function probeOriginalCDN(
     })
       .then((response) => {
         self.clearTimeout(timeoutId);
-        resolve(response.status === 200 || response.status === 206);
+        const isSuccess = response.status === 200 || response.status === 206;
+        logger.log(
+          `[FailbackLoader] Probe response: status=${response.status}, success=${isSuccess}`,
+        );
+        resolve(isSuccess);
       })
-      .catch(() => {
+      .catch((error) => {
         self.clearTimeout(timeoutId);
+        logger.log(
+          `[FailbackLoader] Probe fetch error: ${error?.message || error}`,
+        );
         resolve(false);
       });
   });
@@ -808,7 +821,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
               !state.lastSuccessfulOriginalUrl ||
               this.failbackAttempt === 0
             ) {
+              const wasNull = !state.lastSuccessfulOriginalUrl;
               state.lastSuccessfulOriginalUrl = this.originalUrl;
+              if (wasNull) {
+                logger.log(
+                  `[FailbackLoader] Stored original URL for recovery probes: ${this.originalUrl}`,
+                );
+              }
             }
 
             // Calculate download stats for logging
@@ -830,6 +849,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
               // Time to probe original CDN?
               if (state.fragmentsSinceLastProbe >= PROBE_EVERY_N_FRAGMENTS) {
                 state.fragmentsSinceLastProbe = 0;
+                logger.log(
+                  `[FailbackLoader] Triggering CDN probe:` +
+                    `\n  lastSuccessfulOriginalUrl: ${state.lastSuccessfulOriginalUrl}` +
+                    `\n  isProbeInProgress: ${state.isProbeInProgress}` +
+                    `\n  permanentFailbackMode: ${state.permanentFailbackMode}`,
+                );
                 // Fire and forget - don't block the current request
                 // Pass headers for authenticated probe (if any)
                 tryRecoverToOriginalCDN(this.config, context.headers);

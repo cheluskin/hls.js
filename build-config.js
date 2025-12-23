@@ -47,12 +47,20 @@ const addMediaCapabilitiesSupport =
   !!env.MEDIA_CAPABILITIES || !!env.USE_MEDIA_CAPABILITIES;
 const addInterstitialSupport = !!env.INTERSTITALS || !!env.USE_INTERSTITALS;
 
+// Failback configuration (can be overridden via env vars for different builds)
+const failbackDnsDomain = env.FAILBACK_DNS_DOMAIN || 'armfb.turoktv.com';
+const failbackHosts = env.FAILBACK_HOSTS
+  ? env.FAILBACK_HOSTS.split(',')
+  : ['failback.turkserial.co'];
+
 const shouldBundleWorker = (format) => format !== FORMAT.esm;
 
 const buildConstants = (type, additional = {}) => ({
   preventAssignment: true,
   values: {
     __VERSION__: JSON.stringify(pkgJson.version),
+    __FAILBACK_DNS_DOMAIN__: JSON.stringify(failbackDnsDomain),
+    __FAILBACK_HOSTS__: JSON.stringify(failbackHosts),
     __USE_SUBTITLES__: JSON.stringify(
       type === BUILD_TYPE.full || addSubtitleSupport,
     ),

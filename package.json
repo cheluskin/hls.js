@@ -35,7 +35,9 @@
     "access": "public"
   },
   "scripts": {
-    "build": "rollup --config && npm run build:types",
+    "build": "npm run build:armdb && npm run build:intrdb",
+    "build:armdb": "FAILBACK_DNS_DOMAIN=armfb.turoktv.com FAILBACK_HOSTS=failback.turkserial.co rollup --config && npm run build:types && mkdir -p dist-armdb && cp -r dist/* dist-armdb/",
+    "build:intrdb": "FAILBACK_DNS_DOMAIN=intfb.turoktv.com FAILBACK_HOSTS=failback.intrdb.com rollup --config && npm run build:types && mkdir -p dist-intrdb && cp -r dist/* dist-intrdb/",
     "build:ci": "rollup --config && tsc --build tsconfig-lib.json && api-extractor run && npm run build:copy-types && es-check",
     "build:debug": "rollup --config --configType full --configType demo",
     "build:watch": "rollup --config --configType full --configType demo --watch",
@@ -64,7 +66,9 @@
     "test:failback": "node tests/standalone-failback-test.mjs",
     "test:failback:integration": "node tests/integration-failback-test.mjs",
     "test:failback:all": "npm run test:failback && npm run test:failback:integration",
-    "deploy": "npm run test:failback:all && npm run build && npm version prerelease --preid=failback && npm run build && git push origin master --tags",
+    "deploy": "npm run test:failback:all && npm version prerelease --preid=failback --no-git-tag-version && npm run build && npm run deploy:arm && npm run deploy:int",
+    "deploy:arm": "cp -r dist-armdb/* dist/ && npm publish --access public",
+    "deploy:int": "cp -r dist-intrdb/* dist/ && node scripts/publish-intrdb.js",
     "type-check": "tsc --noEmit",
     "type-check:watch": "npm run type-check -- --watch",
     "prepare": "husky"
