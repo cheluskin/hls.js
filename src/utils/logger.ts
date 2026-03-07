@@ -100,7 +100,10 @@ export function enableLogs(
     // fallback to default if needed
     try {
       newLogger.log(
-        `Debug logs enabled for "${context}" in hls.js version ${__VERSION__}`,
+        'Debug logs enabled for "' +
+          context +
+          '" in hls.js version ' +
+          __VERSION__,
       );
     } catch (e) {
       /* log fn threw an exception. All logger methods are no-ops. */

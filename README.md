@@ -22,26 +22,37 @@ Just replace the original hls.js - failback works automatically!
 
 ## For Developers: Publishing New Version
 
-Publishing is automated via GitHub Actions:
+Publishing in this fork is a **manual local flow**. GitHub Actions are not the release mechanism for `@armdborg/hls.js` / `@intrdb/hls.js`.
 
 ```bash
-# 1. Make your changes and commit
-git add .
-git commit -m "Your commit message"
+# 1. Run the full release gate
+npm run release:check
 
-# 2. Bump version (creates git tag automatically)
-npm version prerelease --preid=failback
+# 2. Bump the failback prerelease version locally
+npm run release:version
 
-# 3. Push changes and tag
-git push origin master
-git push origin v1.6.0-failback.XX  # replace XX with actual version
+# 3. Optional dry-run publish
+npm run deploy:dry-run
 
-# GitHub Actions will automatically:
-# - Build the library
-# - Run tests
-# - Publish to npm
-# - Create GitHub Release
+# 4. Publish both variants
+npm run deploy
 ```
+
+Useful commands:
+
+```bash
+# One-shot happy path (version bump + publish)
+npm run release
+
+# Publish a single variant for the current version
+npm run deploy:arm
+npm run deploy:int
+
+# Dry-run publish logic without pushing to npm
+npm run deploy:dry-run
+```
+
+If one scoped package was already published and the other failed, rerun `npm run deploy` without bumping version again: `scripts/publish.js` skips versions that are already present in npm.
 
 ---
 
@@ -505,7 +516,7 @@ The following players integrate HLS.js for HLS playback:
 |                        [<img src="https://player.mtvnservices.com/edge/hosted/Viacom_logo.svg" width="120">](https://www.viacom.com/)                        |             [<img src="https://user-images.githubusercontent.com/1181974/29248959-efabc440-802d-11e7-8050-7c1f4ca6c607.png" width="120">](https://vk.com/)              |                         [<img src="https://avatars0.githubusercontent.com/u/5090060?s=200&v=4" width="120">](https://www.jwplayer.com)                         |                                          [<img src="https://raw.githubusercontent.com/kaltura/kaltura-player-js/master/docs/images/kaltura-logo.svg" width="120">](https://corp.kaltura.com/)                                           |
 |                          [<img src="https://showmax.akamaized.net/e/logo/showmax_black.png" width="120">](https://tech.showmax.com)                          | [<img src="https://static3.1tv.ru/assets/web/logo-ac67852f1625b338f9d1fb96be089d03557d50bfc5790d5f48dc56799f59dec6.svg" width="120" height="120">](https://www.1tv.ru/) |       [<img src="https://user-images.githubusercontent.com/1480052/40482633-c013ebce-5f55-11e8-96d5-b776415de0ce.png" width="120">](https://www.zdf.de)        |                                                                  [<img src="https://cms-static.brid.tv/img/brid-logo-120x120.jpg" width="120">](https://www.brid.tv/)                                                                   |
 |                                                            [cdn77](https://streaming.cdn77.com/)                                                             |                                  [<img src="https://avatars0.githubusercontent.com/u/7442371?s=200&v=4" width="120">](https://r7.com/)                                  | [<img src="https://raw.githubusercontent.com/Novage/p2p-media-loader/gh-pages/images/p2pml-logo.png" width="120">](https://github.com/Novage/p2p-media-loader) |                                                              [<img src="https://avatars3.githubusercontent.com/u/45617200?s=400" width="120">](https://kayosports.com.au)                                                               |
-|    [<img src="https://avatars1.githubusercontent.com/u/5279615?s=400&u=9771a216836c613f1edf4afe71cfc69d4c5657ed&v=4" width="120">](https://flosports.tv)     |                  [<img src="https://www.logolynx.com/images/logolynx/c6/c67a2cb3ad33a82b5518f8ad8f124703.png" width="120">](https://global.axon.com/)                   |                    [<img src="https://static.rutube.ru/static/img/svg/logo_rutube_black_color_154x25.svg" width="120">](https://rutube.ru/)                    |                                                                                                                                                                                                                                         |
+|    [<img src="https://avatars1.githubusercontent.com/u/5279615?s=400&u=9771a216836c613f1edf4afe71cfc69d4c5657ed&v=4" width="120">](https://flosports.tv)     |                  [<img src="https://www.logolynx.com/images/logolynx/c6/c67a2cb3ad33a82b5518f8ad8f124703.png" width="120">](https://global.axon.com/)                   |                    [<img src="https://static.rutube.ru/static/img/svg/logo_rutube_black_color_154x25.svg" width="120">](https://rutube.ru/)                    |                                                 [<img src="https://raw.githubusercontent.com/aaskaoui/labra-flex-assets/master/labra-flex.png" width="120">](https://labra-flex.world/)                                                 |
 
 ## Chrome/Firefox integration
 
