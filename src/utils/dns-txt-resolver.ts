@@ -21,6 +21,7 @@ interface DohResponse {
 
 // Permanent cache for DNS results (resolved once, stored forever)
 const dnsCache: Map<string, string[]> = new Map();
+const dnsCacheClearListeners = new Set<() => void>();
 
 // Timeout for DNS requests (3 seconds per provider)
 const DNS_TIMEOUT_MS = 3000;
@@ -142,9 +143,20 @@ export function fetchFailbackHosts(
   );
 }
 
+export function registerDnsCacheClearListener(
+  listener: () => void,
+): () => void {
+  dnsCacheClearListeners.add(listener);
+
+  return () => {
+    dnsCacheClearListeners.delete(listener);
+  };
+}
+
 /**
  * Clear DNS cache
  */
 export function clearDnsCache(): void {
   dnsCache.clear();
+  dnsCacheClearListeners.forEach((listener) => listener());
 }

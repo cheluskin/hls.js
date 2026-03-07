@@ -20,6 +20,8 @@ globalThis.fetch = async (...args) => {
 let clearDnsCache,
   fetchDnsTxt,
   fetchFailbackHosts,
+  preloadFailbackHosts,
+  applyHostToUrl,
   getFailbackState,
   resetFailbackState,
   destroyFailbackState;
@@ -30,9 +32,13 @@ try {
   fetchFailbackHosts = dnsModule.fetchFailbackHosts;
 
   const loaderModule = await import('../src/utils/failback-loader.ts');
+  preloadFailbackHosts = loaderModule.preloadFailbackHosts;
   getFailbackState = loaderModule.getFailbackState;
   resetFailbackState = loaderModule.resetFailbackState;
   destroyFailbackState = loaderModule.destroyFailbackState;
+
+  const hostUtilsModule = await import('../src/utils/failback-host-utils.ts');
+  applyHostToUrl = hostUtilsModule.applyHostToUrl;
 } catch {
   // If direct TS import fails, the project needs to be built first
   console.log(
@@ -42,9 +48,12 @@ try {
   clearDnsCache = module.clearDnsCache;
   fetchDnsTxt = module.fetchDnsTxt;
   fetchFailbackHosts = module.fetchFailbackHosts;
+  preloadFailbackHosts = module.preloadFailbackHosts;
   getFailbackState = module.getFailbackState;
   resetFailbackState = module.resetFailbackState;
   destroyFailbackState = module.destroyFailbackState;
+
+  ({ applyHostToUrl } = await import('../src/utils/failback-host-utils.ts'));
 }
 
 let passed = 0;
@@ -217,26 +226,69 @@ await testAsync('fetchDnsTxt returns empty on DNS error status', async () => {
   assert.deepEqual(result, []);
 });
 
+// Test 9: clearDnsCache should also reset preloadFailbackHosts cache
+await testAsync(
+  'clearDnsCache also resets preloadFailbackHosts cache',
+  async () => {
+    clearDnsCache();
+    fetchMock = async () => ({
+      ok: true,
+      json: async () => ({
+        Status: 0,
+        Answer: [{ type: 16, data: '"first.example.com"' }],
+      }),
+    });
+
+    const hosts1 = await preloadFailbackHosts('preload-reset.example.com');
+    assert.deepEqual(hosts1, ['first.example.com']);
+
+    clearDnsCache();
+    fetchMock = async () => ({
+      ok: true,
+      json: async () => ({
+        Status: 0,
+        Answer: [{ type: 16, data: '"second.example.com"' }],
+      }),
+    });
+
+    const hosts2 = await preloadFailbackHosts('preload-reset.example.com');
+    assert.deepEqual(hosts2, ['second.example.com']);
+  },
+);
+
+await testAsync(
+  'preloadFailbackHosts caches domains independently',
+  async () => {
+    clearDnsCache();
+
+    fetchMock = async (url) => {
+      const domain = new URL(url).searchParams.get('name');
+      return {
+        ok: true,
+        json: async () => ({
+          Status: 0,
+          Answer: [{ type: 16, data: `"${domain}-host"` }],
+        }),
+      };
+    };
+
+    const hostsA1 = await preloadFailbackHosts('a.example.com');
+    const hostsB1 = await preloadFailbackHosts('b.example.com');
+    const hostsA2 = await preloadFailbackHosts('a.example.com');
+
+    assert.deepEqual(hostsA1, ['a.example.com-host']);
+    assert.deepEqual(hostsB1, ['b.example.com-host']);
+    assert.equal(hostsA1, hostsA2);
+  },
+);
+
 console.log('===== FailbackLoader Tests =====\n');
 
-// Helper function for URL transformation
 function getFailbackUrl(originalUrl, hosts, attempt) {
   if (attempt >= hosts.length) return null;
   try {
     const url = new URL(originalUrl);
-    const failbackHost = hosts[attempt];
-
-    // Parse failback host (may include port like "cdn.example.com:8080")
-    if (failbackHost.includes(':')) {
-      const [hostname, port] = failbackHost.split(':');
-      url.hostname = hostname;
-      url.port = port;
-    } else {
-      url.hostname = failbackHost;
-      url.port = ''; // Reset port to default
-    }
-
-    // Always use HTTPS for failback hosts (CDNs require it)
+    applyHostToUrl(url, hosts[attempt]);
     url.protocol = 'https:';
     return url.toString();
   } catch {
@@ -301,6 +353,29 @@ test('URL preserves port number', () => {
   const parsed = new URL(failbackUrl);
 
   assert.equal(parsed.host, 'cdn.example.com:8080');
+});
+
+test('URL extracts host and port from full failback URL', () => {
+  const hosts = ['https://cdn.example.com:8443/ignored/path'];
+  const originalUrl = 'https://origin.example.com/video.ts?token=abc';
+
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  assert.equal(parsed.host, 'cdn.example.com:8443');
+  assert.equal(parsed.pathname, '/video.ts');
+  assert.equal(parsed.searchParams.get('token'), 'abc');
+});
+
+test('URL transformation supports bracketed IPv6 failback host', () => {
+  const hosts = ['[2001:db8::1]:9443'];
+  const originalUrl = 'https://origin.example.com/video.ts';
+
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  assert.equal(parsed.hostname, '[2001:db8::1]');
+  assert.equal(parsed.port, '9443');
 });
 
 test('Invalid URL returns null', () => {

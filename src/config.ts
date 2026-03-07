@@ -16,10 +16,16 @@ import Cues from './utils/cues';
 import FailbackLoader from './utils/failback-loader';
 import FetchLoader, { fetchSupported } from './utils/fetch-loader';
 import { requestMediaKeySystemAccess } from './utils/mediakeys-helper';
+import { clamp } from './utils/number';
 import { stringify } from './utils/safe-json-stringify';
 import XhrLoader from './utils/xhr-loader';
-import type { MediaKeySessionContext } from './controller/eme-controller';
+import type {
+  GenerateRequestFilterResult,
+  LicenseRequestReason,
+  MediaKeySessionContext,
+} from './controller/eme-controller';
 import type Hls from './hls';
+import type { LevelKey } from './loader/level-key';
 import type {
   FragmentLoaderContext,
   Loader,
@@ -95,11 +101,11 @@ export type DRMSystemConfiguration = {
     this: Hls,
     initDataType: string,
     initData: ArrayBuffer | null,
-    keyContext: MediaKeySessionContext,
-  ) =>
-    | { initDataType: string; initData: ArrayBuffer | null }
-    | undefined
-    | never;
+    keyContext: MediaKeySessionContext & {
+      decryptdata: LevelKey;
+      reason: LicenseRequestReason;
+    },
+  ) => GenerateRequestFilterResult;
 };
 
 export type DRMSystemsConfiguration = Partial<
@@ -111,14 +117,14 @@ export type EMEControllerConfig = {
     this: Hls,
     xhr: XMLHttpRequest,
     url: string,
-    keyContext: MediaKeySessionContext,
+    keyContext: MediaKeySessionContext & { decryptdata: LevelKey },
     licenseChallenge: Uint8Array,
   ) => void | Uint8Array | Promise<Uint8Array | void>;
   licenseResponseCallback?: (
     this: Hls,
     xhr: XMLHttpRequest,
     url: string,
-    keyContext: MediaKeySessionContext,
+    keyContext: MediaKeySessionContext & { decryptdata: LevelKey },
   ) => ArrayBuffer;
   emeEnabled: boolean;
   widevineLicenseUrl?: string;
@@ -225,6 +231,7 @@ export type StreamControllerConfig = {
   testBandwidth: boolean;
   liveSyncMode?: 'edge' | 'buffered';
   startOnSegmentBoundary: boolean;
+  nextAudioTrackBufferFlushForwardOffset: number;
 };
 
 export type GapControllerConfig = {
@@ -249,6 +256,10 @@ export type LatencyControllerConfig = {
   liveMaxLatencyDuration?: number;
   maxLiveSyncPlaybackRate: number;
   liveSyncOnStallIncrease: number;
+};
+
+export type PlaylistControllerConfig = {
+  liveMaxUnchangedPlaylistRefresh: number;
 };
 
 export type MetadataControllerConfig = {
@@ -277,6 +288,7 @@ export type TimelineControllerConfig = {
 
 export type TSDemuxerConfig = {
   forceKeyFrameOnDiscontinuity: boolean;
+  handleMpegTsVideoIntegrityErrors: 'process' | 'skip';
 };
 
 export type HlsConfig = {
@@ -350,6 +362,7 @@ export type HlsConfig = {
   TimelineControllerConfig &
   TSDemuxerConfig &
   HlsLoadPolicies &
+  PlaylistControllerConfig &
   FragmentLoaderConfig &
   PlaylistLoaderConfig;
 
@@ -381,6 +394,7 @@ export const hlsDefaultConfig: HlsConfig = {
   backBufferLength: Infinity, // used by buffer-controller
   frontBufferFlushThreshold: Infinity,
   startOnSegmentBoundary: false, // used by stream-controller
+  nextAudioTrackBufferFlushForwardOffset: 0.25, // used by stream-controller
   maxBufferSize: 60 * 1000 * 1000, // used by stream-controller
   maxFragLookUpTolerance: 0.25, // used by stream-controller
   maxBufferHole: 0.1, // used by stream-controller and gap-controller
@@ -394,6 +408,7 @@ export const hlsDefaultConfig: HlsConfig = {
   liveSyncDurationCount: 3, // used by latency-controller
   liveSyncOnStallIncrease: 1, // used by latency-controller
   liveMaxLatencyDurationCount: Infinity, // used by latency-controller
+  liveMaxUnchangedPlaylistRefresh: Infinity, // used by base-playlist-controller
   liveSyncDuration: undefined, // used by latency-controller
   liveMaxLatencyDuration: undefined, // used by latency-controller
   maxLiveSyncPlaybackRate: 1, // used by latency-controller
@@ -428,6 +443,7 @@ export const hlsDefaultConfig: HlsConfig = {
   stretchShortVideoTrack: false, // used by mp4-remuxer
   maxAudioFramesDrift: 1, // used by mp4-remuxer
   forceKeyFrameOnDiscontinuity: true, // used by ts-demuxer
+  handleMpegTsVideoIntegrityErrors: 'process', // used by ts-demuxer
   abrEwmaFastLive: 3, // used by abr-controller
   abrEwmaSlowLive: 9, // used by abr-controller
   abrEwmaFastVoD: 3, // used by abr-controller
@@ -661,6 +677,19 @@ export function mergeConfig(
     throw new Error(
       'Illegal hls.js config: "liveMaxLatencyDuration" must be greater than "liveSyncDuration"',
     );
+  }
+
+  if (userConfig.liveMaxUnchangedPlaylistRefresh !== undefined) {
+    const liveMaxUnchangedPlaylistRefresh =
+      userConfig.liveMaxUnchangedPlaylistRefresh;
+    const clampedValue = clamp(liveMaxUnchangedPlaylistRefresh, 2, Infinity);
+
+    if (clampedValue !== liveMaxUnchangedPlaylistRefresh) {
+      logger.warn(
+        `hls.js config: "liveMaxUnchangedPlaylistRefresh" clamped from ${liveMaxUnchangedPlaylistRefresh} to ${clampedValue}.`,
+      );
+    }
+    userConfig.liveMaxUnchangedPlaylistRefresh = clampedValue;
   }
 
   const defaultsCopy = deepCpy(defaultConfig);

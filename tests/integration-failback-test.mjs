@@ -1318,6 +1318,515 @@ await test('206 detection counts toward permanent failback mode', async () => {
 });
 
 // ----------------------------------------
+// Test 22: Failback preserves host:port values from staticHosts
+// ----------------------------------------
+await test('Failback preserves host:port from staticHosts', async () => {
+  class MockPortXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader() {}
+
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      setTimeout(() => {
+        if (this._url.includes('origin.example.com')) {
+          this.status = 500;
+          this.statusText = 'Server Error';
+          this.response = null;
+        } else {
+          this.status = 200;
+          this.statusText = 'OK';
+          this.response = new ArrayBuffer(256);
+        }
+
+        this.readyState = 2;
+        this.onreadystatechange?.();
+        this.readyState = 4;
+        this.onreadystatechange?.();
+      }, 10);
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState } = await import(
+    '../dist/hls.mjs'
+  );
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = MockPortXHR;
+
+  let failbackUrl = null;
+  const config = {
+    failbackConfig: {
+      staticHosts: ['failback.example.com:8443'],
+      onFailback: (_, url) => {
+        failbackUrl = url;
+      },
+    },
+  };
+
+  const loader = new FailbackLoader(config);
+
+  await new Promise((resolve, reject) => {
+    loader.load(
+      {
+        url: 'https://origin.example.com/video/segment.ts?token=abc',
+        frag: null,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      },
+      {
+        loadPolicy: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 60000 },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      },
+      {
+        onSuccess: (response) => {
+          try {
+            assert.ok(
+              response.url.includes('https://failback.example.com:8443/'),
+              `Expected failback URL with port, got: ${response.url}`,
+            );
+            assert.equal(
+              failbackUrl,
+              'https://failback.example.com:8443/video/segment.ts?token=abc',
+            );
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        },
+        onError: (error) => reject(new Error(error.text || String(error.code))),
+        onTimeout: () => reject(new Error('Timeout')),
+        onAbort: () => {},
+        onProgress: () => {},
+      },
+    );
+  });
+
+  globalThis.XMLHttpRequest = originalXHR;
+  destroyFailbackState(config);
+  loader.destroy();
+});
+
+// ----------------------------------------
+// Test 23: Recovery probe should respect xhrSetup
+// ----------------------------------------
+await test('Recovery probe uses xhrSetup when probing original CDN', async () => {
+  let originalRequestCount = 0;
+  let probeAuthSeen = false;
+
+  class MockProbeXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+      this._requestHeaders = {};
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader(name, value) {
+      if (!this.readyState) {
+        throw new Error('open() must be called first');
+      }
+      this._requestHeaders[name] = value;
+    }
+
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      setTimeout(() => {
+        if (this._url.includes('cdn.original.com')) {
+          originalRequestCount++;
+
+          if (originalRequestCount === 3) {
+            probeAuthSeen = this._requestHeaders['X-Test-Auth'] === 'token';
+            this.status = 200;
+            this.statusText = 'OK';
+            this.response = new ArrayBuffer(1024);
+          } else {
+            this.status = 500;
+            this.statusText = 'Server Error';
+            this.response = null;
+          }
+        } else {
+          this.status = 200;
+          this.statusText = 'OK';
+          this.response = new ArrayBuffer(1024);
+        }
+
+        this.readyState = 2;
+        this.onreadystatechange?.();
+        this.readyState = 4;
+        this.onreadystatechange?.();
+      }, 5);
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, getFailbackState, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = MockProbeXHR;
+
+  const config = {
+    xhrSetup: (xhr) => {
+      xhr.setRequestHeader('X-Test-Auth', 'token');
+    },
+    failbackConfig: {
+      staticHosts: ['failback.example.com'],
+    },
+  };
+
+  const loaderConfig = {
+    loadPolicy: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 60000 },
+    maxRetry: 0,
+    retryDelay: 0,
+    maxRetryDelay: 0,
+  };
+
+  const loadSegment = (url) =>
+    new Promise((resolve, reject) => {
+      const loader = new FailbackLoader(config);
+      loader.load(
+        {
+          url,
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        loaderConfig,
+        {
+          onSuccess: (response) => {
+            loader.destroy();
+            resolve(response);
+          },
+          onError: (error) => {
+            loader.destroy();
+            reject(new Error(error.text || String(error.code)));
+          },
+          onTimeout: () => {
+            loader.destroy();
+            reject(new Error('Timeout'));
+          },
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+  await loadSegment('https://cdn.original.com/seg1.ts');
+  await loadSegment('https://cdn.original.com/seg2.ts');
+
+  let state = getFailbackState(config);
+  assert.equal(state.permanentMode, true, 'Should be in permanent mode');
+
+  for (let i = 0; i < 6; i++) {
+    await loadSegment(`https://cdn.original.com/steady-${i}.ts`);
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  state = getFailbackState(config);
+  assert.equal(
+    originalRequestCount,
+    3,
+    'Probe should use XHR against original CDN',
+  );
+  assert.equal(
+    probeAuthSeen,
+    true,
+    'Probe request should include xhrSetup header',
+  );
+  assert.equal(
+    state.permanentMode,
+    false,
+    'Successful probe should reset permanent mode',
+  );
+
+  globalThis.XMLHttpRequest = originalXHR;
+  destroyFailbackState(config);
+});
+
+// ----------------------------------------
+// Test 24: Failback supports bracketed IPv6 hosts
+// ----------------------------------------
+await test('Failback preserves bracketed IPv6 host and port', async () => {
+  class MockIpv6XHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader() {}
+
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      self.setTimeout(() => {
+        if (this._url.includes('origin.example.com')) {
+          this.status = 500;
+          this.statusText = 'Server Error';
+          this.response = null;
+        } else {
+          this.status = 200;
+          this.statusText = 'OK';
+          this.response = new ArrayBuffer(256);
+        }
+
+        this.readyState = 2;
+        this.onreadystatechange?.();
+        this.readyState = 4;
+        this.onreadystatechange?.();
+      }, 10);
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState } = await import(
+    '../dist/hls.mjs'
+  );
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = MockIpv6XHR;
+
+  let failbackUrl = null;
+  const config = {
+    failbackConfig: {
+      staticHosts: ['[2001:db8::1]:9443'],
+      onFailback: (_, url) => {
+        failbackUrl = url;
+      },
+    },
+  };
+
+  const loader = new FailbackLoader(config);
+
+  await new Promise((resolve, reject) => {
+    loader.load(
+      {
+        url: 'https://origin.example.com/video/segment.ts?token=ipv6',
+        frag: null,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      },
+      {
+        loadPolicy: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 60000 },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      },
+      {
+        onSuccess: (response) => {
+          try {
+            assert.ok(
+              response.url.includes('https://[2001:db8::1]:9443/'),
+              `Expected IPv6 failback URL, got: ${response.url}`,
+            );
+            assert.equal(
+              failbackUrl,
+              'https://[2001:db8::1]:9443/video/segment.ts?token=ipv6',
+            );
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        },
+        onError: (error) => reject(new Error(error.text || String(error.code))),
+        onTimeout: () => reject(new Error('Timeout')),
+        onAbort: () => {},
+        onProgress: () => {},
+      },
+    );
+  });
+
+  globalThis.XMLHttpRequest = originalXHR;
+  destroyFailbackState(config);
+  loader.destroy();
+});
+
+// ----------------------------------------
+// Test 25: Main load should support xhrSetup before open()
+// ----------------------------------------
+await test('Main load retries xhrSetup after open() when needed', async () => {
+  let requestCount = 0;
+
+  class MockSetupXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+      this._requestHeaders = {};
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader(name, value) {
+      if (!this.readyState) {
+        throw new Error('open() must be called first');
+      }
+      this._requestHeaders[name] = value;
+    }
+
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      requestCount++;
+      self.setTimeout(() => {
+        const hasSetupHeader = this._requestHeaders['X-Test-Setup'] === 'ok';
+        this.status = hasSetupHeader ? 200 : 500;
+        this.statusText = hasSetupHeader ? 'OK' : 'Missing setup header';
+        this.response = hasSetupHeader ? new ArrayBuffer(128) : null;
+
+        this.readyState = 2;
+        this.onreadystatechange?.();
+        this.readyState = 4;
+        this.onreadystatechange?.();
+      }, 5);
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState } = await import(
+    '../dist/hls.mjs'
+  );
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = MockSetupXHR;
+
+  const config = {
+    xhrSetup: (xhr) => {
+      xhr.setRequestHeader('X-Test-Setup', 'ok');
+    },
+    failbackConfig: {
+      staticHosts: ['failback.example.com'],
+    },
+  };
+
+  const loader = new FailbackLoader(config);
+
+  await new Promise((resolve, reject) => {
+    loader.load(
+      {
+        url: 'https://origin.example.com/video.ts',
+        frag: null,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      },
+      {
+        loadPolicy: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 60000 },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      },
+      {
+        onSuccess: () => {
+          try {
+            assert.equal(
+              requestCount,
+              1,
+              'Should succeed on the initial request',
+            );
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        },
+        onError: (error) => reject(new Error(error.text || String(error.code))),
+        onTimeout: () => reject(new Error('Timeout')),
+        onAbort: () => {},
+        onProgress: () => {},
+      },
+    );
+  });
+
+  globalThis.XMLHttpRequest = originalXHR;
+  destroyFailbackState(config);
+  loader.destroy();
+});
+
+// ----------------------------------------
 // Summary
 // ----------------------------------------
 

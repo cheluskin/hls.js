@@ -690,12 +690,17 @@ export default class Hls implements HlsEventEmitter {
   recoverMediaError() {
     this.logger.log('recoverMediaError');
     const media = this._media;
+    const started = this.started;
     const time = media?.currentTime;
     this.detachMedia();
     if (media) {
       this.attachMedia(media);
-      if (time) {
-        this.startLoad(time);
+      if (started) {
+        if (time) {
+          this.startLoad(time);
+        } else if (!this.config.autoStartLoad) {
+          this.startLoad();
+        }
       }
     }
   }
@@ -1094,6 +1099,28 @@ export default class Hls implements HlsEventEmitter {
   }
 
   /**
+   * Index of next audio track as scheduled by audio stream controller.
+   */
+  get nextAudioTrack(): number {
+    return this.audioStreamController?.nextAudioTrack ?? -1;
+  }
+
+  /**
+   * Set audio track index for next loaded data.
+   * This will switch the audio track asap, without interrupting playback.
+   * May abort current loading of data, and flush parts of buffer(outside
+   * currently played fragment region). Audio Track Switched event will be
+   * delayed until the currently playing fragment is of the next audio track.
+   * @param audioTrackId - Pass -1 for automatic level selection
+   */
+  set nextAudioTrack(audioTrackId: number) {
+    const { audioTrackController } = this;
+    if (audioTrackController) {
+      audioTrackController.nextAudioTrack = audioTrackId;
+    }
+  }
+
+  /**
    * get the complete list of subtitle tracks across all media groups
    */
   get allSubtitleTracks(): MediaPlaylist[] {
@@ -1320,6 +1347,7 @@ export type {
 };
 export type {
   ABRControllerConfig,
+  PlaylistControllerConfig,
   BufferControllerConfig,
   CapLevelControllerConfig,
   CMCDControllerConfig,
@@ -1346,7 +1374,15 @@ export type {
   TimelineControllerConfig,
   TSDemuxerConfig,
 } from './config';
-export type { MediaKeySessionContext } from './controller/eme-controller';
+export type {
+  GenerateRequestFilterResult,
+  KeyRequests,
+  KeyStatuses,
+  KeyTimeouts,
+  LicenseAndKeysRequest,
+  LicenseRequestReason,
+  MediaKeySessionContext,
+} from './controller/eme-controller';
 export type {
   FragmentState,
   FragmentTracker,
@@ -1380,6 +1416,7 @@ export type { LoadStats } from './loader/load-stats';
 export type { LevelKey } from './loader/level-key';
 export type {
   BaseSegment,
+  EncryptedFragment,
   Fragment,
   MediaFragment,
   Part,

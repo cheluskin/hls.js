@@ -51,6 +51,7 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`liveSyncDuration`](#livesyncduration)
   - [`liveMaxLatencyDuration`](#livemaxlatencyduration)
   - [`maxLiveSyncPlaybackRate`](#maxlivesyncplaybackrate)
+  - [`liveMaxUnchangedPlaylistRefresh`](#livemaxunchangedplaylistrefresh)
   - [`timelineOffset`](#timelineoffset)
   - [`liveDurationInfinity`](#livedurationinfinity)
   - [`liveBackBufferLength` (deprecated)](#livebackbufferlength-deprecated)
@@ -118,6 +119,7 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`stretchShortVideoTrack`](#stretchshortvideotrack)
   - [`maxAudioFramesDrift`](#maxaudioframesdrift)
   - [`forceKeyFrameOnDiscontinuity`](#forcekeyframeondiscontinuity)
+  - [`handleMpegTsVideoIntegrityErrors`](#handlempegtsvideointegrityerrors)
   - [`abrEwmaFastLive`](#abrewmafastlive)
   - [`abrEwmaSlowLive`](#abrewmaslowlive)
   - [`abrEwmaFastVoD`](#abrewmafastvod)
@@ -182,6 +184,7 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`hls.allAudioTracks`](#hlsallaudiotracks)
   - [`hls.audioTracks`](#hlsaudiotracks)
   - [`hls.audioTrack`](#hlsaudiotrack)
+  - [`hls.nextAudioTrack`](#hlsnextaudiotrack)
 - [Subtitle Tracks Control API](#subtitle-tracks-control-api)
   - [`hls.setSubtitleOption(subtitleOption)`](#hlssetsubtitleoptionsubtitleoption)
   - [`hls.allSubtitleTracks`](#hlsallsubtitletracks)
@@ -513,6 +516,7 @@ var config = {
   stretchShortVideoTrack: false,
   maxAudioFramesDrift: 1,
   forceKeyFrameOnDiscontinuity: true,
+  handleMpegTsVideoIntegrityErrors: 'process',
   abrEwmaFastLive: 3.0,
   abrEwmaSlowLive: 9.0,
   abrEwmaFastVoD: 3.0,
@@ -824,6 +828,22 @@ A value too close from `liveSyncDuration` is likely to cause playback stalls.
 When set to a value greater than `1`, the latency-controller will adjust `video.playbackRate` up to `maxLiveSyncPlaybackRate` to catch up to target latency in a live stream. `hls.targetLatency` is based on `liveSyncDuration|Count` or manifest PART-|HOLD-BACK.
 
 The default value is `1`, which disables playback rate adjustment. Set `maxLiveSyncPlaybackRate` to a value greater than `1` to enable playback rate adjustment at the live edge.
+
+### `liveMaxUnchangedPlaylistRefresh`
+
+(default: `Infinity`)
+
+Maximum number of consecutive unchanged playlist reloads before triggering a `PLAYLIST_UNCHANGED_ERROR`.
+
+**Valid value must be in range:** `[2, Infinity]`
+
+Values less than 2 will be automatically clamped to 2 with a warning message. Setting the value to `Infinity` disables this feature (default behavior).
+
+When a live playlist (main level, audio track, or subtitle track) fails to update for this many consecutive reloads, a non-fatal error is triggered and hls.js attempts to switch to an alternate level. If no alternate level is available, the error becomes fatal.
+
+For audio and subtitle track errors, hls.js will attempt to switch to a level with a different audio/subtitle group to find a working alternative.
+
+**Note:** The minimum value of 2 ensures at least one retry within 1/2 target duration before triggering the error, providing reasonable tolerance for temporary playlist update delays.
 
 ### `timelineOffset`
 
@@ -1601,6 +1621,17 @@ Setting this parameter to false can also generate decoding weirdness when switch
 
 parameter should be a boolean
 
+### `handleMpegTsVideoIntegrityErrors`
+
+(default: `'process'`)
+
+Controls how corrupted video data is handled based on MPEG-TS integrity checks.
+
+- `'process'` (default): Continues processing corrupted data, which may lead to decoding errors.
+- `'skip'`: Discards corrupted video data to prevent potential playback issues.
+
+This parameter accepts a string with possible values: `'process'` | `'skip'`.
+
 ### `abrEwmaFastLive`
 
 (default: `3.0`)
@@ -2101,6 +2132,10 @@ get : array of supported audio tracks in the active audio group ID
 
 get/set : index of selected audio track in `hls.audioTracks`
 
+### `hls.nextAudioTrack`
+
+get/set : index of the next audio track that will be selected, allowing for seamless audio track switching
+
 ## Subtitle Tracks Control API
 
 ### `hls.setSubtitleOption(subtitleOption)`
@@ -2437,7 +2472,7 @@ Full list of Events is available below:
 - `Hls.Events.AUDIO_TRACKS_UPDATED` - fired to notify that audio track lists has been updated
   - data: { audioTracks : audioTracks }
 - `Hls.Events.AUDIO_TRACK_SWITCHING` - fired when an audio track switching is requested
-  - data: { id : audio track id, type : playlist type ('AUDIO' | 'main'), url : audio track URL }
+  - data: { id : audio track id, type : playlist type ('AUDIO' | 'main'), url : audio track URL, flushImmediate: boolean indicating whether audio buffer should be flushed immediately when switching }
 - `Hls.Events.AUDIO_TRACK_SWITCHED` - fired when an audio track switch actually occurs
   - data: { id : audio track id }
 - `Hls.Events.AUDIO_TRACK_LOADING` - fired when an audio track loading starts

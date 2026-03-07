@@ -1,4 +1,4 @@
-import chai from 'chai';
+import { expect, use } from 'chai';
 import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
@@ -14,8 +14,7 @@ import type {
   LoaderConfiguration,
 } from '../../../src/types/loader';
 
-chai.use(sinonChai);
-const expect = chai.expect;
+use(sinonChai);
 
 /**
  * Mock XMLHttpRequest that simulates browser behavior

@@ -1,4 +1,10 @@
-import { fetchFailbackHosts } from './dns-txt-resolver';
+import {
+  DEFAULT_FAILBACK_DNS_DOMAIN,
+  getFailbackHostsSync,
+  preloadFailbackHosts as preloadResolvedFailbackHosts,
+} from './failback-host-resolver';
+import { applyHostToUrl, normalizeHosts } from './failback-host-utils';
+import { probeOriginalCDN } from './failback-recovery-probe';
 import { logger } from './logger';
 import { LoadStats } from '../loader/load-stats';
 import type { HlsConfig } from '../config';
@@ -9,22 +15,6 @@ import type {
   LoaderConfiguration,
   LoaderStats,
 } from '../types/loader';
-
-// ============================================
-// FAILBACK КОНФИГУРАЦИЯ
-// Значения подставляются при сборке через env vars:
-// FAILBACK_DNS_DOMAIN и FAILBACK_HOSTS
-// ============================================
-declare const __FAILBACK_DNS_DOMAIN__: string;
-declare const __FAILBACK_HOSTS__: string[];
-
-const DEFAULT_DNS_DOMAIN = __FAILBACK_DNS_DOMAIN__;
-const FALLBACK_HOSTS = __FAILBACK_HOSTS__;
-// ============================================
-
-// Global cache for DNS-resolved hosts (Shared across all instances, this is safe/desired)
-let dnsHostsPromise: Promise<string[]> | null = null;
-let dnsHostsCache: string[] | null = null;
 
 // ============================================
 // FAILBACK STATE ISOLATION
@@ -143,51 +133,6 @@ export function destroyFailbackState(config: HlsConfig): void {
 }
 
 /**
- * Probe original CDN with a Range request to check if it's back online
- * Supports headers (e.g. for Auth)
- */
-function probeOriginalCDN(
-  url: string,
-  headers?: Record<string, string>,
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    const controller = new AbortController();
-    const timeoutId = self.setTimeout(() => {
-      logger.log(`[FailbackLoader] Probe timeout after ${PROBE_TIMEOUT_MS}ms`);
-      controller.abort();
-    }, PROBE_TIMEOUT_MS);
-
-    const mergedHeaders: Record<string, string> = {
-      Range: 'bytes=0-1023',
-      ...headers,
-    };
-
-    logger.log(`[FailbackLoader] Probe fetch starting: ${url}`);
-
-    fetch(url, {
-      method: 'GET',
-      headers: mergedHeaders,
-      signal: controller.signal,
-    })
-      .then((response) => {
-        self.clearTimeout(timeoutId);
-        const isSuccess = response.status === 200 || response.status === 206;
-        logger.log(
-          `[FailbackLoader] Probe response: status=${response.status}, success=${isSuccess}`,
-        );
-        resolve(isSuccess);
-      })
-      .catch((error) => {
-        self.clearTimeout(timeoutId);
-        logger.log(
-          `[FailbackLoader] Probe fetch error: ${error?.message || error}`,
-        );
-        resolve(false);
-      });
-  });
-}
-
-/**
  * Try to recover to original CDN if conditions are met
  *
  * Note: We don't check buffer level because:
@@ -227,7 +172,7 @@ function tryRecoverToOriginalCDN(
 
   const urlToProbe = state.lastSuccessfulOriginalUrl;
 
-  probeOriginalCDN(urlToProbe, headers)
+  probeOriginalCDN(config, urlToProbe, PROBE_TIMEOUT_MS, headers)
     .then((isAlive) => {
       // Re-check conditions after async probe - state may have changed
       if (!state.permanentFailbackMode) {
@@ -254,38 +199,10 @@ function tryRecoverToOriginalCDN(
     });
 }
 
-/**
- * Preload failback hosts from DNS
- * Call this early in app initialization for best performance
- */
-export function preloadFailbackHosts(): Promise<string[]> {
-  if (dnsHostsCache) {
-    return Promise.resolve(dnsHostsCache);
-  }
-
-  if (!dnsHostsPromise) {
-    dnsHostsPromise = fetchFailbackHosts(DEFAULT_DNS_DOMAIN).then((hosts) => {
-      if (hosts.length > 0) {
-        dnsHostsCache = hosts;
-        logger.log(`[FailbackLoader] DNS hosts loaded: ${hosts.join(', ')}`);
-      } else {
-        dnsHostsCache = FALLBACK_HOSTS;
-        logger.log(
-          `[FailbackLoader] Using fallback hosts: ${FALLBACK_HOSTS.join(', ')}`,
-        );
-      }
-      return dnsHostsCache;
-    });
-  }
-
-  return dnsHostsPromise;
-}
-
-/**
- * Get current failback hosts (cached or fallback)
- */
-function getFailbackHostsSync(): string[] {
-  return dnsHostsCache || FALLBACK_HOSTS;
+export function preloadFailbackHosts(
+  dnsDomain: string = DEFAULT_FAILBACK_DNS_DOMAIN,
+): Promise<string[]> {
+  return preloadResolvedFailbackHosts(dnsDomain);
 }
 
 /**
@@ -343,10 +260,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.stats = new LoadStats();
 
     const userConfig = (config as any).failbackConfig || {};
+    const staticHosts = normalizeHosts(userConfig.staticHosts);
 
     this.failbackConfig = {
-      dnsDomain: userConfig.dnsDomain,
-      staticHosts: userConfig.staticHosts,
+      dnsDomain: userConfig.dnsDomain || DEFAULT_FAILBACK_DNS_DOMAIN,
+      staticHosts: staticHosts.length > 0 ? staticHosts : undefined,
       transformUrl: userConfig.transformUrl,
       onSuccess: userConfig.onSuccess,
       onFailback: userConfig.onFailback,
@@ -358,9 +276,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     getSessionState(config);
 
     // Start DNS preload if not already started (fire and forget)
-    preloadFailbackHosts().catch(() => {
+    preloadResolvedFailbackHosts(this.getDnsDomain()).catch(() => {
       // Ignore errors - will use fallback hosts
     });
+  }
+
+  private getDnsDomain(): string {
+    return this.failbackConfig.dnsDomain || DEFAULT_FAILBACK_DNS_DOMAIN;
   }
 
   /**
@@ -375,7 +297,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       return this.failbackConfig.staticHosts;
     }
     // Use DNS-resolved hosts (or fallback)
-    return getFailbackHostsSync();
+    return getFailbackHostsSync(this.getDnsDomain());
   }
 
   destroy() {
@@ -469,60 +391,21 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
-      state.consecutiveOriginalFailures++;
-      logger.log(
-        `[FailbackLoader] Original source stalled - no progress for ${STALL_TIMEOUT_MS}ms (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
-      );
+    this.recordOriginalSourceFailure(
+      `Original source stalled - no progress for ${STALL_TIMEOUT_MS}ms`,
+    );
 
-      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        state.permanentFailbackMode = true;
-        logger.log(
-          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+    this.tryFailbackOrComplete(
+      currentUrl,
+      () => {
+        this.abortInternal();
+        this.callbacks?.onTimeout?.(
+          this.stats,
+          this.context as FragmentLoaderContext,
+          this.loader,
         );
-      }
-    }
-
-    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
-
-    if (failbackUrl && failbackUrl !== currentUrl) {
-      this.failbackAttempt++;
-      this.abortInternal();
-      // Reset aborted flag so failback response is not ignored
-      this.stats.aborted = false;
-
-      this.failbackConfig.onFailback?.(
-        this.originalUrl,
-        failbackUrl,
-        this.failbackAttempt,
-      );
-
-      logger.log(
-        `[FailbackLoader] FAILBACK: trying host #${this.failbackAttempt}: ${failbackUrl}`,
-      );
-
-      this.loader = null;
-      this.loadUrl(failbackUrl);
-      return;
-    }
-
-    logger.log(
-      `[FailbackLoader] ALL FAILED: no more failback hosts available` +
-        `\n  original: ${this.originalUrl}` +
-        `\n  attempts: ${this.failbackAttempt + 1}`,
-    );
-
-    this.failbackConfig.onAllFailed?.(
-      this.originalUrl,
-      this.failbackAttempt + 1,
-    );
-
-    this.abortInternal();
-    this.callbacks?.onTimeout?.(
-      this.stats,
-      this.context as FragmentLoaderContext,
-      this.loader,
+      },
+      true,
     );
   }
 
@@ -618,15 +501,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       const url = new URL(this.originalUrl);
       const failbackHost = hosts[attempt];
 
-      // Parse failback host (may include port like "cdn.example.com:8080")
-      if (failbackHost.includes(':')) {
-        const [hostname, port] = failbackHost.split(':');
-        url.hostname = hostname;
-        url.port = port;
-      } else {
-        url.hostname = failbackHost;
-        url.port = ''; // Reset port to default for protocol
-      }
+      applyHostToUrl(url, failbackHost);
 
       // Always use HTTPS for failback hosts (CDNs require it)
       url.protocol = 'https:';
@@ -635,6 +510,82 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     } catch {
       return null;
     }
+  }
+
+  private switchToPermanentFailbackModeIfNeeded(state: FailbackSessionState) {
+    if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
+      state.permanentFailbackMode = true;
+      logger.log(
+        `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+      );
+    }
+  }
+
+  private recordOriginalSourceFailure(reason: string) {
+    const state = getSessionState(this.config);
+
+    if (this.failbackAttempt !== 0 || state.permanentFailbackMode) {
+      return;
+    }
+
+    state.consecutiveOriginalFailures++;
+    logger.log(
+      `[FailbackLoader] ${reason} (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+    );
+
+    this.switchToPermanentFailbackModeIfNeeded(state);
+  }
+
+  private logAllFailed() {
+    logger.log(
+      `[FailbackLoader] ALL FAILED: no more failback hosts available` +
+        `\n  original: ${this.originalUrl}` +
+        `\n  attempts: ${this.failbackAttempt + 1}`,
+    );
+
+    this.failbackConfig.onAllFailed?.(
+      this.originalUrl,
+      this.failbackAttempt + 1,
+    );
+  }
+
+  private startFailbackRequest(failbackUrl: string, abortBeforeRetry: boolean) {
+    this.failbackAttempt++;
+
+    if (abortBeforeRetry) {
+      this.abortInternal();
+    }
+
+    this.stats.aborted = false;
+
+    this.failbackConfig.onFailback?.(
+      this.originalUrl,
+      failbackUrl,
+      this.failbackAttempt,
+    );
+
+    logger.log(
+      `[FailbackLoader] FAILBACK: trying host #${this.failbackAttempt}: ${failbackUrl}`,
+    );
+
+    this.loader = null;
+    this.loadUrl(failbackUrl);
+  }
+
+  private tryFailbackOrComplete(
+    currentUrl: string,
+    onExhausted: () => void,
+    abortBeforeRetry: boolean = false,
+  ) {
+    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
+
+    if (failbackUrl && failbackUrl !== currentUrl) {
+      this.startFailbackRequest(failbackUrl, abortBeforeRetry);
+      return;
+    }
+
+    this.logAllFailed();
+    onExhausted();
   }
 
   private loadUrl(url: string) {
@@ -655,8 +606,45 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     );
 
     const xhr = (this.loader = new self.XMLHttpRequest());
+    const xhrSetup = this.config.xhrSetup;
+    if (xhrSetup) {
+      Promise.resolve()
+        .then(() => {
+          if (this.loader !== xhr || this.stats.aborted) return;
+          return xhrSetup(xhr, url);
+        })
+        .catch(() => {
+          if (this.loader !== xhr || this.stats.aborted) return;
+          xhr.open('GET', url, true);
+          return xhrSetup(xhr, url);
+        })
+        .then(() => {
+          if (this.loader !== xhr || this.stats.aborted) return;
+          this.openAndSendXhr(xhr, context, url, timeout);
+        })
+        .catch((error) => {
+          if (this.loader !== xhr || this.stats.aborted) return;
+          logger.warn(
+            `[FailbackLoader] xhrSetup failed for ${url}: ${error?.message || error}`,
+          );
+          this.onNetworkError(xhr, url);
+        });
+      return;
+    }
 
-    xhr.open('GET', url, true);
+    this.openAndSendXhr(xhr, context, url, timeout);
+  }
+
+  private openAndSendXhr(
+    xhr: XMLHttpRequest,
+    context: FragmentLoaderContext,
+    url: string,
+    timeout: number,
+  ) {
+    if (!xhr.readyState) {
+      xhr.open('GET', url, true);
+    }
+
     xhr.responseType = context.responseType as XMLHttpRequestResponseType;
 
     const headers = context.headers;
@@ -892,7 +880,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   private handleError(xhr: XMLHttpRequest, currentUrl: string, status: number) {
     this.stopStallCheck(); // Ensure stall check is stopped
-    const state = getSessionState(this.config);
     const finalUrl = xhr.responseURL || currentUrl;
     const wasRedirected = finalUrl !== currentUrl;
     const elapsed = self.performance.now() - this.stats.loading.start;
@@ -907,61 +894,16 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  loaded: ${this.stats.loaded} bytes`,
     );
 
-    // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
-      state.consecutiveOriginalFailures++;
-      logger.log(
-        `[FailbackLoader] Original source failed (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+    this.recordOriginalSourceFailure('Original source failed');
+
+    this.tryFailbackOrComplete(currentUrl, () => {
+      this.callbacks?.onError?.(
+        { code: status, text: xhr.statusText },
+        this.context as FragmentLoaderContext,
+        xhr,
+        this.stats,
       );
-
-      // Check if we should switch to permanent failback mode
-      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        state.permanentFailbackMode = true;
-        logger.log(
-          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
-        );
-      }
-    }
-
-    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
-
-    if (failbackUrl && failbackUrl !== currentUrl) {
-      this.failbackAttempt++;
-      // Reset aborted flag so failback response is not ignored
-      this.stats.aborted = false;
-
-      this.failbackConfig.onFailback?.(
-        this.originalUrl,
-        failbackUrl,
-        this.failbackAttempt,
-      );
-
-      logger.log(
-        `[FailbackLoader] FAILBACK: trying host #${this.failbackAttempt}: ${failbackUrl}`,
-      );
-
-      this.loader = null;
-      this.loadUrl(failbackUrl);
-      return;
-    }
-
-    logger.log(
-      `[FailbackLoader] ALL FAILED: no more failback hosts available` +
-        `\n  original: ${this.originalUrl}` +
-        `\n  attempts: ${this.failbackAttempt + 1}`,
-    );
-
-    this.failbackConfig.onAllFailed?.(
-      this.originalUrl,
-      this.failbackAttempt + 1,
-    );
-
-    this.callbacks?.onError?.(
-      { code: status, text: xhr.statusText },
-      this.context as FragmentLoaderContext,
-      xhr,
-      this.stats,
-    );
+    });
   }
 
   private onTimeout(currentUrl: string) {
@@ -980,60 +922,19 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
-      state.consecutiveOriginalFailures++;
-      logger.log(
-        `[FailbackLoader] Original source timeout (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
-      );
+    this.recordOriginalSourceFailure('Original source timeout');
 
-      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        state.permanentFailbackMode = true;
-        logger.log(
-          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+    this.tryFailbackOrComplete(
+      currentUrl,
+      () => {
+        this.abortInternal();
+        this.callbacks?.onTimeout?.(
+          this.stats,
+          this.context as FragmentLoaderContext,
+          this.loader,
         );
-      }
-    }
-
-    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
-
-    if (failbackUrl && failbackUrl !== currentUrl) {
-      this.failbackAttempt++;
-      this.abortInternal();
-      // Reset aborted flag so failback response is not ignored
-      this.stats.aborted = false;
-
-      this.failbackConfig.onFailback?.(
-        this.originalUrl,
-        failbackUrl,
-        this.failbackAttempt,
-      );
-
-      logger.log(
-        `[FailbackLoader] FAILBACK: trying host #${this.failbackAttempt}: ${failbackUrl}`,
-      );
-
-      this.loader = null;
-      this.loadUrl(failbackUrl);
-      return;
-    }
-
-    logger.log(
-      `[FailbackLoader] ALL FAILED: no more failback hosts available` +
-        `\n  original: ${this.originalUrl}` +
-        `\n  attempts: ${this.failbackAttempt + 1}`,
-    );
-
-    this.failbackConfig.onAllFailed?.(
-      this.originalUrl,
-      this.failbackAttempt + 1,
-    );
-
-    this.abortInternal();
-    this.callbacks?.onTimeout?.(
-      this.stats,
-      this.context as FragmentLoaderContext,
-      this.loader,
+      },
+      true,
     );
   }
 
@@ -1060,60 +961,16 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    // Track failures on original source (not already in permanent mode)
-    if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
-      state.consecutiveOriginalFailures++;
-      logger.log(
-        `[FailbackLoader] Original source network error (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+    this.recordOriginalSourceFailure('Original source network error');
+
+    this.tryFailbackOrComplete(currentUrl, () => {
+      this.callbacks?.onError?.(
+        { code: 0, text: 'Network error' },
+        this.context as FragmentLoaderContext,
+        this.loader,
+        this.stats,
       );
-
-      if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-        state.permanentFailbackMode = true;
-        logger.log(
-          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
-        );
-      }
-    }
-
-    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
-
-    if (failbackUrl && failbackUrl !== currentUrl) {
-      this.failbackAttempt++;
-      // Reset aborted flag so failback response is not ignored
-      this.stats.aborted = false;
-
-      this.failbackConfig.onFailback?.(
-        this.originalUrl,
-        failbackUrl,
-        this.failbackAttempt,
-      );
-
-      logger.log(
-        `[FailbackLoader] FAILBACK: trying host #${this.failbackAttempt}: ${failbackUrl}`,
-      );
-
-      this.loader = null;
-      this.loadUrl(failbackUrl);
-      return;
-    }
-
-    logger.log(
-      `[FailbackLoader] ALL FAILED: no more failback hosts available` +
-        `\n  original: ${this.originalUrl}` +
-        `\n  attempts: ${this.failbackAttempt + 1}`,
-    );
-
-    this.failbackConfig.onAllFailed?.(
-      this.originalUrl,
-      this.failbackAttempt + 1,
-    );
-
-    this.callbacks?.onError?.(
-      { code: 0, text: 'Network error' },
-      this.context as FragmentLoaderContext,
-      this.loader,
-      this.stats,
-    );
+    });
   }
 
   private onProgress(event: ProgressEvent) {
