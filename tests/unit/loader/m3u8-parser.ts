@@ -1,4 +1,4 @@
-import chai from 'chai';
+import { config as chaiConfig, expect, use } from 'chai';
 import sinonChai from 'sinon-chai';
 import { LoadStats } from '../../../src/loader/load-stats';
 import M3U8Parser from '../../../src/loader/m3u8-parser';
@@ -9,9 +9,8 @@ import { KeySystemFormats } from '../../../src/utils/mediakeys-helper';
 import type { Fragment, Part } from '../../../src/loader/fragment';
 import type { LevelKey } from '../../../src/loader/level-key';
 
-chai.use(sinonChai);
-chai.config.truncateThreshold = 0;
-const expect = chai.expect;
+use(sinonChai);
+chaiConfig.truncateThreshold = 0;
 
 describe('M3U8Parser', function () {
   it('parses empty manifest returns empty array', function () {
@@ -864,6 +863,7 @@ lo008ts`;
     expect(result.fragments[9].url).to.equal('http://dummy.com/lo008ts');
     expect(result.fragments[9].byteRangeStartOffset).to.equal(684508);
     expect(result.fragments[9].byteRangeEndOffset).to.equal(817988);
+    expect(result.fragments[9].byteRange).to.deep.equal([684508, 817988]);
   });
 
   it('parse level with #EXT-X-BYTERANGE after #EXTINF', function () {
@@ -921,6 +921,7 @@ lo008ts`;
     expect(result.fragments[9].url).to.equal('http://dummy.com/lo008ts');
     expect(result.fragments[9].byteRangeStartOffset).to.equal(684508);
     expect(result.fragments[9].byteRangeEndOffset).to.equal(817988);
+    expect(result.fragments[9].byteRange).to.deep.equal([684508, 817988]);
   });
 
   it('parse level with #EXT-X-BYTERANGE before #EXT-X-MAP tag', function () {
@@ -968,6 +969,7 @@ lo007.m4v
     expect(result.fragments[2].url).to.equal('http://dummy.com/lo007.m4v');
     expect(result.fragments[2].byteRangeStartOffset).to.equal(64000, '3 start');
     expect(result.fragments[2].byteRangeEndOffset).to.equal(104000, '3 end');
+    expect(result.fragments[2].byteRange).to.deep.equal([64000, 104000]);
   });
 
   it('parse level with #EXT-X-BYTERANGE without offset', function () {
@@ -1003,6 +1005,7 @@ lo007ts`;
     expect(result.fragments[1].byteRangeEndOffset).to.equal(1039452);
     expect(result.fragments[2].byteRangeStartOffset).to.equal(1039452);
     expect(result.fragments[2].byteRangeEndOffset).to.equal(1182520);
+    expect(result.fragments[2].byteRange).to.deep.equal([1039452, 1182520]);
   });
 
   it('parses discontinuity and maintains continuity counter', function () {
@@ -1311,6 +1314,7 @@ main.mp4`;
     );
     expect(initSegment?.byteRangeStartOffset).to.equal(0);
     expect(initSegment?.byteRangeEndOffset).to.equal(718);
+    expect(initSegment?.byteRange).to.deep.equal([0, 718]);
     expect(initSegment?.sn).to.equal('initSegment');
   });
 
@@ -2416,7 +2420,7 @@ media_1638278.m4s`;
       .which.has.members([result.fragments[2], result.fragments[6]]);
   });
 
-  it('parse KEYID other keys when available', function () {
+  it('parses FairPlay KEYID from Widevine or PlayReady EXT-X-KEY tags when available', function () {
     const level = `#EXTM3U
 #EXT-X-VERSION:6
 #EXT-X-TARGETDURATION:6

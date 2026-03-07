@@ -1,4 +1,4 @@
-import chai from 'chai';
+import { expect, use } from 'chai';
 import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import AudioTrackController from '../../../src/controller/audio-track-controller';
@@ -21,8 +21,7 @@ import type {
   MediaPlaylist,
 } from '../../../src/types/media-playlist';
 
-chai.use(sinonChai);
-const expect = chai.expect;
+use(sinonChai);
 
 type HlsTestable = Omit<
   Hls,
@@ -485,6 +484,72 @@ describe('AudioTrackController', function () {
         'track index/id is not changed as there is no redundant track to choose from',
       ).to.equal(4);
       expect(checkRetry).to.have.been.calledOnce;
+    });
+  });
+
+  describe('nextAudioTrack', function () {
+    beforeEach(function () {
+      hls.levelController = {
+        levels: [
+          {
+            audioGroups: ['1'],
+          },
+        ],
+      };
+      audioTrackController.tracks = tracks;
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+    });
+
+    it('should set next audio track with flushImmediate=false', function () {
+      const triggerSpy = sinon.spy(hls, 'trigger');
+      audioTrackController.nextAudioTrack = 1;
+
+      expect(audioTrackController.trackId).to.equal(1);
+      expect(triggerSpy).to.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHING,
+        sinon.match({
+          id: 1,
+          flushImmediate: false,
+        }),
+      );
+    });
+
+    it('should set selectDefaultTrack to false when nextAudioTrack is set from API', function () {
+      (audioTrackController as any).selectDefaultTrack = true;
+      audioTrackController.nextAudioTrack = 1;
+      expect((audioTrackController as any).selectDefaultTrack).to.be.false;
+    });
+  });
+
+  describe('audioTrack with flushImmediate', function () {
+    beforeEach(function () {
+      hls.levelController = {
+        levels: [
+          {
+            audioGroups: ['1'],
+          },
+        ],
+      };
+      audioTrackController.tracks = tracks;
+      audioTrackController.onLevelLoading(Events.LEVEL_LOADING, {
+        level: 0,
+      });
+    });
+
+    it('should set audio track with flushImmediate=true by default', function () {
+      const triggerSpy = sinon.spy(hls, 'trigger');
+      audioTrackController.audioTrack = 1;
+
+      expect(audioTrackController.trackId).to.equal(1);
+      expect(triggerSpy).to.have.been.calledWith(
+        Events.AUDIO_TRACK_SWITCHING,
+        sinon.match({
+          id: 1,
+          flushImmediate: true,
+        }),
+      );
     });
   });
 });

@@ -1,11 +1,12 @@
-import chai from 'chai';
+import { expect, use } from 'chai';
 import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import BufferController from '../../../src/controller/buffer-controller';
 import { FragmentTracker } from '../../../src/controller/fragment-tracker';
+import { ErrorDetails, ErrorTypes } from '../../../src/errors';
 import { Events } from '../../../src/events';
 import Hls from '../../../src/hls';
-import { MockMediaElement, MockMediaSource } from '../utils/mock-media';
+import { MockMediaElement, MockMediaSource } from '../../mocks/mock-media';
 import type BufferOperationQueue from '../../../src/controller/buffer-operation-queue';
 import type {
   ExtendedSourceBuffer,
@@ -18,8 +19,7 @@ import type {
   NetworkComponentAPI,
 } from '../../../src/types/component-api';
 
-chai.use(sinonChai);
-const expect = chai.expect;
+use(sinonChai);
 
 type HlsTestable = Omit<Hls, 'networkControllers' | 'coreComponents'> & {
   coreComponents: ComponentAPI[];
@@ -57,6 +57,7 @@ type BufferControllerTestable = Omit<
   sourceBuffers: SourceBuffersTuple;
   tracks: SourceBufferTrackSet;
   tracksReady: boolean;
+  _onMediaSourceClose: () => void;
 };
 
 describe('BufferController', function () {
@@ -555,6 +556,34 @@ describe('BufferController', function () {
       expect(bufferController.pendingTrackCount).to.equal(0);
       expect(bufferController.sourceBufferCount).to.equal(1);
       expect(bufferController.bufferedToEnd).to.be.true;
+    });
+  });
+
+  describe('MediaSource requires reset', function () {
+    it('emits error when sourceclose fires with media attached', function () {
+      const media = new MockMediaElement() as unknown as HTMLMediaElement;
+      const mediaSource = new MockMediaSource() as unknown as MediaSource;
+      const triggerSpy = sandbox.spy(hls, 'trigger');
+      bufferController.media = media;
+      bufferController.mediaSource = mediaSource;
+      bufferController._onMediaSourceClose();
+      expect(triggerSpy).to.have.been.calledWith(
+        Events.ERROR,
+        sinon.match({
+          type: ErrorTypes.MEDIA_ERROR,
+          details: ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET,
+          fatal: false,
+        }),
+      );
+    });
+
+    it('does not emit error when media is not attached', function () {
+      const mediaSource = new MockMediaSource() as unknown as MediaSource;
+      const triggerSpy = sandbox.spy(hls, 'trigger');
+      bufferController.media = null;
+      bufferController.mediaSource = mediaSource;
+      bufferController._onMediaSourceClose();
+      expect(triggerSpy).to.not.have.been.calledWith(Events.ERROR);
     });
   });
 });

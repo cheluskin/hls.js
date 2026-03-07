@@ -250,8 +250,7 @@ class PlaylistLoader implements NetworkComponentAPI {
       const logger = this.hls.logger;
       const loaderContext = loader.context as PlaylistLoaderContext;
       if (
-        loaderContext &&
-        loaderContext.levelOrTrack === context.levelOrTrack &&
+        loaderContext?.levelOrTrack === context.levelOrTrack &&
         (loaderContext.url === context.url ||
           (loaderContext.deliveryDirectives && !context.deliveryDirectives))
       ) {
@@ -800,6 +799,7 @@ class PlaylistLoader implements NetworkComponentAPI {
           networkDetails,
           deliveryDirectives,
           withoutMultiVariant: type === PlaylistContextType.MANIFEST,
+          context,
         });
         break;
       case PlaylistContextType.AUDIO_TRACK:
@@ -811,6 +811,7 @@ class PlaylistLoader implements NetworkComponentAPI {
           stats,
           networkDetails,
           deliveryDirectives,
+          context,
         });
         break;
       case PlaylistContextType.SUBTITLE_TRACK:
@@ -822,6 +823,7 @@ class PlaylistLoader implements NetworkComponentAPI {
           stats,
           networkDetails,
           deliveryDirectives,
+          context,
         });
         break;
     }

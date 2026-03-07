@@ -13,11 +13,13 @@ function setupConsoleLogRedirection() {
   function append(methodName, msg) {
     var a =
       new Date().toISOString().replace('T', ' ').replace('Z', '') + ': ' + msg;
-    var text = document.createTextNode(a);
-    var line = document.createElement('pre');
-    line.className = 'line line-' + methodName;
-    line.appendChild(text);
-    inner.appendChild(line);
+    if ((msg || '').slice(1, 7) === '[test]') {
+      var text = document.createTextNode(a);
+      var line = document.createElement('pre');
+      line.className = 'line line-' + methodName;
+      line.appendChild(text);
+      inner.appendChild(line);
+    }
 
     // The empty log line at the beginning comes from a test in `enableLogs`.
     self.logString = logString += a + '\n';
@@ -96,42 +98,81 @@ function startStream(streamUrl, config, callback, autoplay) {
   self.video = video = document.getElementById('video');
   try {
     self.hls = hls = new Hls(
-      objectAssign({}, config, {
-        // debug: true
-        debug: {
-          debug: function () {},
-          log: console.log.bind(console),
-          info: console.info.bind(console, '[info]'),
-          warn: console.warn.bind(console, '[warn]'),
-          error: console.error.bind(console, '[error]'),
+      objectAssign(
+        {
+          // Override `debug` with process.env.DEBUG string -> boolean
+          debug: {
+            debug: function () {},
+            log: console.log.bind(console),
+            info: console.info.bind(console, '[info]'),
+            warn: console.warn.bind(console, '[warn]'),
+            error: console.error.bind(console, '[error]'),
+          },
+          // Increase TTFB timeout for functional test runs
+          fragLoadPolicy: {
+            default: {
+              maxTimeToFirstByteMs: 20000,
+              maxLoadTimeMs: 90000,
+              timeoutRetry: {
+                maxNumRetry: 2,
+                retryDelayMs: 0,
+                maxRetryDelayMs: 0,
+              },
+              errorRetry: {
+                maxNumRetry: 1,
+                retryDelayMs: 1000,
+                maxRetryDelayMs: 8000,
+              },
+            },
+          },
         },
-      })
+        config
+      )
     );
     console.log('[test] > userAgent:', navigator.userAgent);
     if (autoplay !== false) {
-      hls.on(Hls.Events.MANIFEST_PARSED, function () {
-        console.log('[test] > Manifest parsed. Calling video.play()');
+      // attempt to ready playback in case test start is treated as a user interaction
+      video.src = null;
+      video.load();
+
+      hls.on(Hls.Events.MEDIA_ATTACHED, function () {
+        console.log('[test] > Media attached. Calling video.play()');
         var playPromise = video.play();
         if (playPromise) {
-          playPromise.catch(function (error) {
-            console.log(
-              '[test] > video.play() failed with error: ' +
-                error.name +
-                ' ' +
-                error.message
-            );
-            if (error.name === 'NotAllowedError') {
-              console.log('[test] > Attempting to play with video muted');
-              video.muted = true;
-              return video.play();
-            }
-          });
+          playPromise
+            .catch(function (error) {
+              if (error.name === 'NotAllowedError') {
+                console.log('[test] > Attempting to play with video muted');
+                video.muted = true;
+                return video.play();
+              }
+              throw error;
+            })
+            .then(function () {
+              video.controls = true;
+              console.log(
+                '[test] > video.play() resolved' +
+                  (video.muted ? ' (muted)' : '') +
+                  ' currentTime: ' +
+                  video.currentTime
+              );
+            })
+            .catch(function (error) {
+              console.log(
+                '[test] > video.play()' +
+                  (video.muted ? ' (muted)' : '') +
+                  ' failed with error: ' +
+                  error.name +
+                  ' ' +
+                  error.message
+              );
+            });
         }
       });
     }
     hls.on(Hls.Events.ERROR, function (event, data) {
       if (data.fatal) {
-        console.log('[test] > hlsjs fatal error :' + data.details);
+        console.log('[test] > FAIL: hlsjs fatal error :' + data.details);
         if (data.details === Hls.ErrorDetails.INTERNAL_EXCEPTION) {
           console.log('[test] > exception in :' + data.event);
           console.log(
@@ -144,13 +185,31 @@ function startStream(streamUrl, config, callback, autoplay) {
       }
     });
     video.onerror = function () {
-      console.log('[test] > video error, code :' + video.error.code);
+      console.log('[test] > FAIL: video error, code :' + video.error.code);
       callback({ code: 'video_error_' + video.error.code, logs: logString });
     };
     hls.loadSource(streamUrl);
     hls.attachMedia(video);
   } catch (err) {
     callback({ code: 'exception', logs: logString });
+  }
+
+  if (self === self.window) {
+    self.onerror = function (message, source, lineno, colno, error) {
+      console.error(
+        '[test] > ERROR: ' +
+          message +
+          '\n' +
+          source +
+          '\n ln:' +
+          lineno +
+          ' cn: ' +
+          colno +
+          '\n' +
+          error
+      );
+      callback({ code: 'global exception', logs: logString });
+    };
   }
 }
 

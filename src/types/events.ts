@@ -213,6 +213,7 @@ export interface TrackLoadedData {
   stats: LoaderStats;
   deliveryDirectives: HlsUrlParameters | null;
   track: MediaPlaylist;
+  context?: PlaylistLoaderContext;
 }
 
 export interface LevelLoadedData {
@@ -224,6 +225,7 @@ export interface LevelLoadedData {
   stats: LoaderStats;
   deliveryDirectives: HlsUrlParameters | null;
   withoutMultiVariant?: boolean;
+  context?: PlaylistLoaderContext;
 }
 
 export interface LevelUpdatedData {
@@ -253,7 +255,9 @@ export interface LevelPTSUpdatedData {
   end: number;
 }
 
-export interface AudioTrackSwitchingData extends MediaPlaylist {}
+export interface AudioTrackSwitchingData extends MediaPlaylist {
+  flushImmediate?: boolean;
+}
 
 export interface AudioTrackSwitchedData extends MediaPlaylist {}
 
@@ -284,6 +288,7 @@ export interface TrackSwitchedData {
 export interface SubtitleFragProcessed {
   success: boolean;
   frag: Fragment;
+  part: Part | null;
 }
 
 export interface FragChangedData {
@@ -349,6 +354,7 @@ export interface ErrorData {
 export interface SubtitleFragProcessedData {
   success: boolean;
   frag: Fragment;
+  part: Part | null;
   error?: Error;
 }
 

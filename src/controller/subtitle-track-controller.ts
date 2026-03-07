@@ -3,7 +3,11 @@ import { Events } from '../events';
 import { PlaylistContextType } from '../types/loader';
 import { IMSC1_CODEC } from '../utils/imsc1-ttml-parser';
 import { mediaAttributesIdentical } from '../utils/media-option-attributes';
-import { findMatchingOption, matchesOption } from '../utils/rendition-helper';
+import {
+  findMatchingOption,
+  inGroupOrNone,
+  matchesOption,
+} from '../utils/rendition-helper';
 import { createTrackNode, getTrackKind } from '../utils/texttrack-utils';
 import type Hls from '../hls';
 import type {
@@ -383,7 +387,7 @@ class SubtitleTrackController extends BasePlaylistController {
     if (
       data.context.type === PlaylistContextType.SUBTITLE_TRACK &&
       data.context.id === this.trackId &&
-      (!this.groupIds || this.groupIds.indexOf(data.context.groupId) !== -1)
+      inGroupOrNone(data.context.groupId, this.groupIds)
     ) {
       this.checkRetry(data);
     }
@@ -526,7 +530,6 @@ class SubtitleTrackController extends BasePlaylistController {
     // and we'll set subtitleTrack when onMediaAttached is triggered
     if (!this.media) {
       this.queuedDefaultTrack = newId;
-      return;
     }
 
     // exit if track id as already set or invalid

@@ -1,4 +1,4 @@
-import chai from 'chai';
+import { expect, use } from 'chai';
 import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig } from '../../src/config';
@@ -6,8 +6,7 @@ import { ErrorDetails, ErrorTypes } from '../../src/errors';
 import { Events } from '../../src/events';
 import Hls from '../../src/hls';
 
-chai.use(sinonChai);
-const expect = chai.expect;
+use(sinonChai);
 
 describe('Hls', function () {
   describe('bandwidthEstimate', function () {
@@ -156,6 +155,46 @@ describe('Hls', function () {
       const hls = new Hls();
       hls.destroy();
       expect(() => JSON.stringify(hls)).to.not.throw();
+    });
+  });
+
+  describe('nextAudioTrack', function () {
+    it('should return -1 when audioStreamController is not available', function () {
+      const hls = new Hls();
+      (hls as any).audioStreamController = null;
+      expect(hls.nextAudioTrack).to.equal(-1);
+      hls.destroy();
+    });
+
+    it('should not crash when audioTrackController is not available', function () {
+      const hls = new Hls();
+      (hls as any).audioTrackController = null;
+
+      expect(() => {
+        hls.nextAudioTrack = 2;
+      }).to.not.throw();
+
+      hls.destroy();
+    });
+
+    it('should set nextAudioTrack on audioTrackController', function () {
+      const hls = new Hls();
+      const mockAudioTrackController = {
+        nextAudioTrack: 0,
+      };
+      (hls as any).audioTrackController = mockAudioTrackController;
+
+      hls.nextAudioTrack = 2;
+
+      expect(mockAudioTrackController.nextAudioTrack).to.equal(2);
+      hls.destroy();
+    });
+
+    it('should return -1 when audioStreamController is undefined', function () {
+      const hls = new Hls();
+      (hls as any).audioStreamController = undefined;
+      expect(hls.nextAudioTrack).to.equal(-1);
+      hls.destroy();
     });
   });
 });

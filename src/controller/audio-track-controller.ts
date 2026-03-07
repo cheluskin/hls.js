@@ -7,6 +7,7 @@ import {
   audioMatchPredicate,
   findClosestLevelWithAudioGroup,
   findMatchingOption,
+  inGroupOrNone,
   matchesOption,
   useAlternateAudio,
 } from '../utils/rendition-helper';
@@ -141,9 +142,8 @@ class AudioTrackController extends BasePlaylistController {
       this.trackId = -1;
       this.currentTrack = null;
 
-      const audioTracks = this.tracks.filter(
-        (track): boolean =>
-          !audioGroups || audioGroups.indexOf(track.groupId) !== -1,
+      const audioTracks = this.tracks.filter((track): boolean =>
+        inGroupOrNone(track.groupId, audioGroups),
       );
       if (audioTracks.length) {
         // Disable selectDefaultTrack if there are no default tracks
@@ -223,7 +223,7 @@ class AudioTrackController extends BasePlaylistController {
     if (
       data.context.type === PlaylistContextType.AUDIO_TRACK &&
       data.context.id === this.trackId &&
-      (!this.groupIds || this.groupIds.indexOf(data.context.groupId) !== -1)
+      inGroupOrNone(data.context.groupId, this.groupIds)
     ) {
       this.checkRetry(data);
     }
@@ -245,6 +245,16 @@ class AudioTrackController extends BasePlaylistController {
     // If audio track is selected from API then don't choose from the manifest default track
     this.selectDefaultTrack = false;
     this.setAudioTrack(newId);
+  }
+
+  get nextAudioTrack(): number {
+    return this.trackId;
+  }
+
+  set nextAudioTrack(newId: number) {
+    // If audio track is selected from API then don't choose from the manifest default track
+    this.selectDefaultTrack = false;
+    this.setAudioTrack(newId, false);
   }
 
   public setAudioOption(
@@ -310,7 +320,7 @@ class AudioTrackController extends BasePlaylistController {
     return null;
   }
 
-  private setAudioTrack(newId: number): void {
+  private setAudioTrack(newId: number, flushImmediate: boolean = true): void {
     const tracks = this.tracksInGroup;
 
     // check if level idx is valid
@@ -331,7 +341,10 @@ class AudioTrackController extends BasePlaylistController {
     );
     this.trackId = newId;
     this.currentTrack = track;
-    this.hls.trigger(Events.AUDIO_TRACK_SWITCHING, { ...track });
+    this.hls.trigger(Events.AUDIO_TRACK_SWITCHING, {
+      ...track,
+      flushImmediate,
+    });
     // Do not reload track unless live
     if (trackLoaded) {
       return;

@@ -194,7 +194,7 @@ export default class ContentSteeringController
     const { errorAction } = data;
     if (
       errorAction?.action === NetworkErrorAction.SendAlternateToPenaltyBox &&
-      errorAction.flags === ErrorActionFlags.MoveAllAlternatesMatchingHost
+      errorAction.flags & ErrorActionFlags.MoveAllAlternatesMatchingHost
     ) {
       const levels = this.levels;
       let pathwayPriority = this._pathwayPriority;
@@ -217,21 +217,21 @@ export default class ContentSteeringController
       if (pathwayPriority && pathwayPriority.length > 1) {
         this.updatePathwayPriority(pathwayPriority);
         errorAction.resolved = this.pathwayId !== errorPathway;
-      }
-      if (data.details === ErrorDetails.BUFFER_APPEND_ERROR && !data.fatal) {
-        // Error will become fatal in buffer-controller when reaching `appendErrorMaxRetry`
-        // Stream-controllers are expected to reduce buffer length even if this is not deemed a QuotaExceededError
-        errorAction.resolved = true;
-      } else if (!errorAction.resolved) {
-        this.warn(
-          `Could not resolve ${data.details} ("${
-            data.error.message
-          }") with content-steering for Pathway: ${errorPathway} levels: ${
-            levels ? levels.length : levels
-          } priorities: ${stringify(
-            pathwayPriority,
-          )} penalized: ${stringify(this.penalizedPathways)}`,
-        );
+
+        if (
+          !errorAction.resolved &&
+          (data.details !== ErrorDetails.BUFFER_APPEND_ERROR || data.fatal)
+        ) {
+          this.warn(
+            `Could not resolve ${data.details} ("${
+              data.error.message
+            }") with content-steering for Pathway: ${errorPathway} levels: ${
+              levels ? levels.length : levels
+            } priorities: ${stringify(
+              pathwayPriority,
+            )} penalized: ${stringify(this.penalizedPathways)}`,
+          );
+        }
       }
     }
   }
@@ -593,20 +593,18 @@ function performUriReplacement(
   perOptionKey: 'PER-VARIANT-URIS' | 'PER-RENDITION-URIS',
   uriReplacement: UriReplacement,
 ): string {
-  const {
-    HOST: host,
-    PARAMS: params,
-    [perOptionKey]: perOptionUris,
-  } = uriReplacement;
-  let perVariantUri;
   if (stableId) {
-    perVariantUri = perOptionUris?.[stableId];
-    if (perVariantUri) {
-      uri = perVariantUri;
+    const { [perOptionKey]: perOptionUris } = uriReplacement;
+    if (perOptionUris) {
+      const perVariantUri = perOptionUris[stableId];
+      if (perVariantUri) {
+        return perVariantUri;
+      }
     }
   }
+  const { HOST: host, PARAMS: params } = uriReplacement;
   const url = new self.URL(uri);
-  if (host && !perVariantUri) {
+  if (host) {
     url.hostname = host;
   }
   if (params) {
