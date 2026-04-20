@@ -232,7 +232,16 @@ export interface FailbackConfig {
    * Default: false (rely on 206 detection instead)
    */
   enableCacheControlHeader?: boolean;
+  /**
+   * Emit detailed per-fragment logs (load start, response headers, success).
+   * Critical events (failback switch, permanent mode, probe, errors) are
+   * always logged regardless. Default: false.
+   */
+  verbose?: boolean;
 }
+
+// Safety cap to prevent infinite loops if transformUrl never returns null
+const MAX_FAILBACK_ATTEMPTS = 32;
 
 class FailbackLoader implements Loader<FragmentLoaderContext> {
   private config: HlsConfig;
@@ -250,16 +259,20 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private lastProgressTime: number = 0;
   private stallCheckInterval?: number;
   private currentUrl: string = '';
+  private lastStallCheckTime: number = 0;
 
   // Throughput detection
   private lastTotalBytes: number = 0;
   private lowSpeedDuration: number = 0;
 
+  // Track URLs already attempted so we don't retry them
+  private triedUrls: Set<string> = new Set();
+
   constructor(config: HlsConfig) {
     this.config = config;
     this.stats = new LoadStats();
 
-    const userConfig = (config as any).failbackConfig || {};
+    const userConfig: FailbackConfig = config.failbackConfig || {};
     const staticHosts = normalizeHosts(userConfig.staticHosts);
 
     this.failbackConfig = {
@@ -270,6 +283,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       onFailback: userConfig.onFailback,
       onAllFailed: userConfig.onAllFailed,
       enableCacheControlHeader: userConfig.enableCacheControlHeader,
+      verbose: userConfig.verbose,
     };
 
     // Ensure state exists for this config
@@ -286,7 +300,23 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   /**
-   * Get failback hosts (static config or DNS-resolved)
+   * Emit a verbose-only log. Critical events should use logger.log directly.
+   */
+  private logVerbose(message: string): void {
+    if (this.failbackConfig.verbose) {
+      logger.log(message);
+    }
+  }
+
+  /**
+   * Get failback hosts (static config or DNS-resolved).
+   *
+   * Resolved dynamically on every call — DO NOT cache per-loader. The DNS
+   * preload is asynchronous, so the first few load() invocations may see the
+   * built-in fallback list; if DNS resolves mid-session we want subsequent
+   * retries to pick up the fresh GeoDNS-ordered list. The underlying
+   * getFailbackHostsSync() is a Map lookup and staticHosts is pre-normalized
+   * in the constructor, so there is no meaningful cost to re-reading.
    */
   private getHosts(): string[] {
     // Static hosts take precedence
@@ -321,17 +351,19 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   private startStallCheck(url: string) {
     this.stopStallCheck();
+    const now = self.performance.now();
     this.currentUrl = url;
-    this.lastProgressTime = self.performance.now();
+    this.lastProgressTime = now;
+    this.lastStallCheckTime = now;
     this.lastTotalBytes = this.stats.loaded || 0;
     this.lowSpeedDuration = 0;
 
     this.stallCheckInterval = self.setInterval(() => {
-      const now = self.performance.now();
+      const tickNow = self.performance.now();
 
-      // 1. Strict Silence Check (original logic)
+      // 1. Strict Silence Check
       // If we haven't received ANY event for STALL_TIMEOUT_MS
-      const timeSinceProgress = now - this.lastProgressTime;
+      const timeSinceProgress = tickNow - this.lastProgressTime;
       if (timeSinceProgress > STALL_TIMEOUT_MS) {
         logger.log(
           `[FailbackLoader] Strict stall detected (no events for ${timeSinceProgress}ms)`,
@@ -341,30 +373,32 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       }
 
       // 2. Minimum Throughput Check (trickle detection)
-      // Check how many bytes we received since last interval check
+      // Use actual elapsed time, not a fixed interval assumption — setInterval
+      // can drift under CPU pressure or tab throttling.
+      const dt = tickNow - this.lastStallCheckTime;
+      this.lastStallCheckTime = tickNow;
+
       const currentLoaded = this.stats.loaded;
       const bytesDiff = currentLoaded - this.lastTotalBytes;
 
-      // Calculate minimum bytes required per this interval (assuming 1s interval)
-      // If interval changes, this math needs adjustment
-      const minBytesRequired =
-        MIN_SPEED_BYTES_PER_SEC * (STALL_CHECK_INTERVAL_MS / 1000);
+      // Only check for stalls once we've started receiving data
+      if (currentLoaded > 0 && dt > 0) {
+        const bytesPerSec = bytesDiff / (dt / 1000);
 
-      // Only check for stalls if we have started loading (loaded > 0)
-      if (currentLoaded > 0 && bytesDiff < minBytesRequired) {
-        this.lowSpeedDuration += STALL_CHECK_INTERVAL_MS;
-        // logger.log(`[FailbackLoader] Low speed detected: ${bytesDiff} bytes in last interval. Duration: ${this.lowSpeedDuration}ms`);
+        if (bytesPerSec < MIN_SPEED_BYTES_PER_SEC) {
+          this.lowSpeedDuration += dt;
 
-        if (this.lowSpeedDuration >= STALL_TIMEOUT_MS) {
-          logger.log(
-            `[FailbackLoader] Throughput stall detected (speed < ${MIN_SPEED_BYTES_PER_SEC} B/s for ${this.lowSpeedDuration}ms)`,
-          );
-          this.onStall();
-          return;
+          if (this.lowSpeedDuration >= STALL_TIMEOUT_MS) {
+            logger.log(
+              `[FailbackLoader] Throughput stall detected (speed ${bytesPerSec.toFixed(0)} B/s < ${MIN_SPEED_BYTES_PER_SEC} B/s for ${this.lowSpeedDuration.toFixed(0)}ms)`,
+            );
+            this.onStall();
+            return;
+          }
+        } else {
+          // Speed is good, reset counter
+          this.lowSpeedDuration = 0;
         }
-      } else {
-        // Speed is good, reset counter
-        this.lowSpeedDuration = 0;
       }
 
       this.lastTotalBytes = currentLoaded;
@@ -421,6 +455,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         this.stats.aborted = true;
         loader.abort();
       }
+      // Drop the reference so any stale async callbacks from this xhr
+      // bail out via `this.loader !== xhr` check.
+      this.loader = null;
     }
   }
 
@@ -450,12 +487,14 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.loaderConfig = config;
     this.failbackAttempt = 0;
     this.originalUrl = context.url;
+    this.triedUrls.clear();
 
     const state = getSessionState(this.config);
     const hosts = this.getHosts();
 
-    // Log load start with full state
-    logger.log(
+    // Per-fragment start log is verbose by default — only critical transitions
+    // (permanent mode switch, failback, errors) log unconditionally.
+    this.logVerbose(
       `[FailbackLoader] LOAD START: ${context.url}` +
         `\n  state: failures=${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD}, permanentMode=${state.permanentFailbackMode}` +
         `\n  hosts: [${hosts.join(', ')}]` +
@@ -577,9 +616,28 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     onExhausted: () => void,
     abortBeforeRetry: boolean = false,
   ) {
-    const failbackUrl = this.getFailbackUrl(this.failbackAttempt);
+    // Advance attempt until we find a URL that hasn't been tried yet.
+    // Prevents wasted attempts on dedup collisions in user-supplied
+    // transformUrl or host lists, and protects against infinite loops
+    // via MAX_FAILBACK_ATTEMPTS.
+    let failbackUrl: string | null = null;
+    let guard = 0;
 
-    if (failbackUrl && failbackUrl !== currentUrl) {
+    while (guard < MAX_FAILBACK_ATTEMPTS) {
+      const candidate = this.getFailbackUrl(this.failbackAttempt);
+      if (!candidate) {
+        break;
+      }
+      if (candidate !== currentUrl && !this.triedUrls.has(candidate)) {
+        failbackUrl = candidate;
+        break;
+      }
+      // Duplicate or already-tried — advance and try the next host.
+      this.failbackAttempt++;
+      guard++;
+    }
+
+    if (failbackUrl) {
       this.startFailbackRequest(failbackUrl, abortBeforeRetry);
       return;
     }
@@ -593,13 +651,15 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     const config = this.loaderConfig;
     if (!context || !config) return;
 
+    this.triedUrls.add(url);
+
     const { maxTimeToFirstByteMs, maxLoadTimeMs } = config.loadPolicy;
     const timeout =
       maxTimeToFirstByteMs && Number.isFinite(maxTimeToFirstByteMs)
         ? maxTimeToFirstByteMs
         : maxLoadTimeMs;
 
-    logger.log(
+    this.logVerbose(
       `[FailbackLoader] LOADING: ${url}` +
         `\n  attempt: ${this.failbackAttempt}` +
         `\n  timeout: ${timeout}ms (ttfb=${maxTimeToFirstByteMs}ms, maxLoad=${maxLoadTimeMs}ms)`,
@@ -703,7 +763,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         const finalUrl = xhr.responseURL || currentUrl;
         const wasRedirected = finalUrl !== currentUrl;
 
-        logger.log(
+        this.logVerbose(
           `[FailbackLoader] RESPONSE HEADERS RECEIVED:` +
             `\n  status: ${xhr.status}` +
             `\n  ttfb: ${ttfb.toFixed(0)}ms` +
@@ -713,11 +773,20 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
         if (config.loadPolicy.maxLoadTimeMs) {
           self.clearTimeout(this.requestTimeout);
-          this.requestTimeout = self.setTimeout(
-            () => this.onTimeout(currentUrl),
-            config.loadPolicy.maxLoadTimeMs -
-              (stats.loading.first - stats.loading.start),
-          );
+          const remaining = config.loadPolicy.maxLoadTimeMs - ttfb;
+          if (remaining <= 0) {
+            // Already over budget by first-byte time — fire timeout
+            // asynchronously to unwind the current onreadystatechange cleanly.
+            this.requestTimeout = self.setTimeout(
+              () => this.onTimeout(currentUrl),
+              0,
+            );
+          } else {
+            this.requestTimeout = self.setTimeout(
+              () => this.onTimeout(currentUrl),
+              remaining,
+            );
+          }
         }
       }
 
@@ -732,18 +801,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         if (status >= 200 && status < 300) {
           const data = xhr.response;
           if (data != null) {
-            stats.loading.end = Math.max(
-              self.performance.now(),
-              stats.loading.first,
-            );
-            const len =
-              xhr.responseType === 'arraybuffer'
-                ? data.byteLength
-                : data.length;
-
-            // Detect browser-initiated Range requests (from cache)
+            // Detect browser-initiated Range requests (from cache) BEFORE
+            // touching stats.loading.end so failback timing stays clean.
             // If we got HTTP 206 but didn't request a range ourselves,
-            // the browser auto-added Range header from stale cache
+            // the browser auto-added Range header from stale cache.
             const weRequestedRange = !!(context.rangeStart || context.rangeEnd);
             if (status === 206 && !weRequestedRange) {
               // Parse Content-Range header to check if we got partial data
@@ -777,6 +838,15 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
                 }
               }
             }
+
+            stats.loading.end = Math.max(
+              self.performance.now(),
+              stats.loading.first,
+            );
+            const len =
+              xhr.responseType === 'arraybuffer'
+                ? data.byteLength
+                : data.length;
 
             stats.loaded = stats.total = len;
             stats.bwEstimate =
@@ -826,7 +896,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
             // CDN Recovery: count fragments and probe when in permanent failback mode
             if (state.permanentFailbackMode) {
               state.fragmentsSinceLastProbe++;
-              logger.log(
+              this.logVerbose(
                 `[FailbackLoader] SUCCESS (permanent failback):` +
                   `\n  url: ${xhr.responseURL}` +
                   `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms` +
@@ -848,6 +918,8 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
                 tryRecoverToOriginalCDN(this.config, context.headers);
               }
             } else if (this.failbackAttempt > 0) {
+              // Keep failback-success at default log level — it's a significant
+              // event (we recovered via backup) that operators want to see.
               logger.log(
                 `[FailbackLoader] SUCCESS via failback #${this.failbackAttempt}:` +
                   `\n  url: ${xhr.responseURL}` +
@@ -855,7 +927,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
                   `\n  speed: ${speedKBps.toFixed(1)}KB/s (${speedMbps.toFixed(2)}Mbps)`,
               );
             } else {
-              logger.log(
+              this.logVerbose(
                 `[FailbackLoader] SUCCESS (direct):` +
                   `\n  url: ${xhr.responseURL}` +
                   `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms` +
@@ -988,7 +1060,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   getResponseHeader(name: string): string | null {
-    return this.loader?.getResponseHeader(name) || null;
+    // Some browsers throw InvalidStateError when called before headers arrive
+    // or after the xhr is in an unusable state.
+    try {
+      return this.loader?.getResponseHeader(name) || null;
+    } catch {
+      return null;
+    }
   }
 }
 

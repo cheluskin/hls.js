@@ -1705,6 +1705,20 @@ export type ExtendedSourceBuffer = SourceBuffer & {
     onbufferedchange?: ((this: SourceBuffer, ev: Event) => any) | null;
 };
 
+// Warning: (ae-missing-release-tag) "FailbackConfig" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface FailbackConfig {
+    dnsDomain?: string;
+    enableCacheControlHeader?: boolean;
+    onAllFailed?: (originalUrl: string, attempts: number) => void;
+    onFailback?: (originalUrl: string, failbackUrl: string, attempt: number) => void;
+    onSuccess?: (url: string, wasFailback: boolean, attempt: number) => void;
+    staticHosts?: string[];
+    transformUrl?: (url: string, attempt: number) => string | null;
+    verbose?: boolean;
+}
+
 // Warning: (ae-missing-release-tag) "FetchLoader" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -2434,6 +2448,7 @@ export type HlsConfig = {
     pLoader?: PlaylistLoaderConstructor;
     fetchSetup?: (context: LoaderContext, initParams: any) => Promise<Request> | Request;
     xhrSetup?: (xhr: XMLHttpRequest, url: string) => Promise<void> | void;
+    failbackConfig?: FailbackConfig;
     audioStreamController?: typeof AudioStreamController;
     audioTrackController?: typeof AudioTrackController;
     subtitleStreamController?: typeof SubtitleStreamController;

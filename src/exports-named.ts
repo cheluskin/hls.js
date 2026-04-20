@@ -84,6 +84,7 @@ export {
   preloadFailbackHosts,
   resetFailbackState,
 };
+export type { FailbackConfig } from './utils/failback-loader';
 export {
   fetchDnsTxt,
   fetchFailbackHosts,

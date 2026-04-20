@@ -143,8 +143,7 @@ describe('FailbackLoader tests', function () {
 
     // Create config with failback settings
     config = mergeConfig(hlsDefaultConfig, {}, logger);
-    // Add failbackConfig (not part of official HlsConfig type)
-    (config as any).failbackConfig = {
+    config.failbackConfig = {
       staticHosts: ['failback.example.com'],
     };
   });
@@ -158,6 +157,13 @@ describe('FailbackLoader tests', function () {
 
   describe('206 Partial Content Detection', function () {
     it('should detect browser-initiated Range request and failback', function (done) {
+      const onSuccess = sinon.spy();
+      const onError = sinon.spy();
+      const onFailback = sinon.spy();
+
+      // Configure failback callback before loader construction.
+      config.failbackConfig!.onFailback = onFailback;
+
       const loader = new FailbackLoader(config);
       const context: FragmentLoaderContext = {
         url: 'https://cdn.example.com/video/segment.ts',
@@ -178,13 +184,6 @@ describe('FailbackLoader tests', function () {
         retryDelay: 0,
         maxRetryDelay: 0,
       } as unknown as LoaderConfiguration;
-
-      const onSuccess = sinon.spy();
-      const onError = sinon.spy();
-      const onFailback = sinon.spy();
-
-      // Configure failback callback
-      (config as any).failbackConfig.onFailback = onFailback;
 
       const callbacks: LoaderCallbacks<FragmentLoaderContext> = {
         onSuccess: (response, stats, ctx, xhr) => {
@@ -262,6 +261,11 @@ describe('FailbackLoader tests', function () {
     });
 
     it('should NOT trigger failback for legitimate 206 (we requested range)', function (done) {
+      const onSuccess = sinon.spy();
+      const onFailback = sinon.spy();
+
+      config.failbackConfig!.onFailback = onFailback;
+
       const loader = new FailbackLoader(config);
       const context: FragmentLoaderContext = {
         url: 'https://cdn.example.com/video/segment.ts',
@@ -282,11 +286,6 @@ describe('FailbackLoader tests', function () {
         retryDelay: 0,
         maxRetryDelay: 0,
       } as unknown as LoaderConfiguration;
-
-      const onSuccess = sinon.spy();
-      const onFailback = sinon.spy();
-
-      (config as any).failbackConfig.onFailback = onFailback;
 
       const callbacks: LoaderCallbacks<FragmentLoaderContext> = {
         onSuccess: (response) => {
@@ -539,6 +538,115 @@ describe('FailbackLoader tests', function () {
 
       // Advance to let failback complete
       clock.tick(100);
+    });
+  });
+
+  describe('Failback Candidate Selection', function () {
+    it('should skip duplicate failback URLs and continue to the next candidate', function (done) {
+      config.failbackConfig = {
+        transformUrl: (_url, attempt) => {
+          if (attempt < 2) {
+            return 'https://cdn.example.com/video/segment.ts';
+          }
+
+          if (attempt === 2) {
+            return 'https://failback.example.com/video/segment.ts';
+          }
+
+          return null;
+        },
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const requestedUrls: string[] = [];
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestedUrls.push(xhr.url);
+
+        if (requestedUrls.length === 1) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(500, null);
+          }, 10);
+          return;
+        }
+
+        if (requestedUrls.length === 2) {
+          expect(xhr.url).to.equal(
+            'https://failback.example.com/video/segment.ts',
+          );
+          self.setTimeout(() => {
+            xhr.simulateResponse(200, new ArrayBuffer(256));
+          }, 10);
+          return;
+        }
+
+        done(new Error(`Unexpected extra request: ${xhr.url}`));
+      };
+
+      const callbacks: LoaderCallbacks<FragmentLoaderContext> = {
+        onSuccess: (response) => {
+          expect(response.url).to.equal(
+            'https://failback.example.com/video/segment.ts',
+          );
+          expect(requestedUrls).to.deep.equal([
+            'https://cdn.example.com/video/segment.ts',
+            'https://failback.example.com/video/segment.ts',
+          ]);
+
+          loader.destroy();
+          done();
+        },
+        onError: (error) => {
+          loader.destroy();
+          done(new Error(`Unexpected error: ${error.text}`));
+        },
+        onTimeout: () => {
+          loader.destroy();
+          done(new Error('Should not have timed out'));
+        },
+        onAbort: () => {},
+        onProgress: () => {},
+      };
+
+      loader.load(context, loaderConfig, callbacks);
+      clock.tick(100);
+    });
+  });
+
+  describe('Response Header Safety', function () {
+    it('should return null when getResponseHeader throws', function () {
+      const loader = new FailbackLoader(config);
+      (loader as any).loader = {
+        abort() {},
+        getResponseHeader() {
+          throw new Error('InvalidStateError');
+        },
+        readyState: 4,
+      } as unknown as XMLHttpRequest;
+
+      expect(loader.getResponseHeader('X-Test')).to.equal(null);
+
+      loader.destroy();
     });
   });
 });

@@ -103,7 +103,7 @@ describe('CMCDController', function () {
 
         const { config } = cmcdController.hls;
         expect(config.pLoader).to.equal(undefined);
-        expect(config.fLoader).to.equal(undefined);
+        expect(config.fLoader).to.equal(Hls.DefaultConfig.fLoader);
       });
 
       it('uses the session id if provided', function () {

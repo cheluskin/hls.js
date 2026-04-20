@@ -1095,9 +1095,8 @@ await test('Legitimate 206 (we requested range) should NOT failback', async () =
     abort() {}
   }
 
-  const { FailbackLoader, destroyFailbackState } = await import(
-    '../dist/hls.mjs'
-  );
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
 
   const originalXHR = globalThis.XMLHttpRequest;
   globalThis.XMLHttpRequest = Mock206XHR;
@@ -1370,9 +1369,8 @@ await test('Failback preserves host:port from staticHosts', async () => {
     }
   }
 
-  const { FailbackLoader, destroyFailbackState } = await import(
-    '../dist/hls.mjs'
-  );
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
   const originalXHR = globalThis.XMLHttpRequest;
   globalThis.XMLHttpRequest = MockPortXHR;
 
@@ -1645,9 +1643,8 @@ await test('Failback preserves bracketed IPv6 host and port', async () => {
     }
   }
 
-  const { FailbackLoader, destroyFailbackState } = await import(
-    '../dist/hls.mjs'
-  );
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
   const originalXHR = globalThis.XMLHttpRequest;
   globalThis.XMLHttpRequest = MockIpv6XHR;
 
@@ -1766,9 +1763,8 @@ await test('Main load retries xhrSetup after open() when needed', async () => {
     }
   }
 
-  const { FailbackLoader, destroyFailbackState } = await import(
-    '../dist/hls.mjs'
-  );
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
   const originalXHR = globalThis.XMLHttpRequest;
   globalThis.XMLHttpRequest = MockSetupXHR;
 
@@ -1824,6 +1820,167 @@ await test('Main load retries xhrSetup after open() when needed', async () => {
   globalThis.XMLHttpRequest = originalXHR;
   destroyFailbackState(config);
   loader.destroy();
+});
+
+// ----------------------------------------
+// Test 26: Failback retry picks up DNS hosts that resolved after load() started
+// Regression guard: a previous per-loader hostsCache froze the fallback list
+// if load() ran before DNS preload finished.
+// ----------------------------------------
+await test('Failback uses DNS-resolved hosts that arrive after load() started', async () => {
+  const DNS_RESOLVED_HOST = 'dns-late.example.com';
+  const UNIQUE_DOMAIN = 'regression-race.example.com';
+
+  // Controlled DNS gate: providers hang until we let them resolve.
+  let resolveDns;
+  const dnsGate = new Promise((resolve) => {
+    resolveDns = resolve;
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const href = typeof url === 'string' ? url : url?.url || '';
+    if (href.includes('dns.google') || href.includes('cloudflare-dns')) {
+      await dnsGate;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          Status: 0,
+          Answer: [{ type: 16, data: `"${DNS_RESOLVED_HOST}"` }],
+        }),
+      };
+    }
+    throw new Error(`Unexpected fetch: ${href}`);
+  };
+
+  class SequencedXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader() {}
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      if (this._url.includes('origin.regression.com')) {
+        // Let DNS resolve and schedule origin failure AFTER the promise
+        // chain in failback-host-resolver has a chance to populate the cache.
+        resolveDns();
+        self.setTimeout(() => {
+          this.status = 500;
+          this.statusText = 'Server Error';
+          this.response = null;
+          this.readyState = 2;
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 20);
+      } else if (this._url.includes(DNS_RESOLVED_HOST)) {
+        self.setTimeout(() => {
+          this.status = 200;
+          this.statusText = 'OK';
+          this.response = new ArrayBuffer(64);
+          this.readyState = 2;
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 5);
+      } else {
+        // Any other host means the stale fallback was used — fail loudly so
+        // the test surfaces it instead of passing silently.
+        self.setTimeout(() => {
+          this.status = 599;
+          this.statusText = `Stale fallback host used: ${this._url}`;
+          this.response = null;
+          this.readyState = 2;
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 5);
+      }
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState, clearDnsCache } =
+    await import('../dist/hls.mjs');
+  clearDnsCache();
+
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = SequencedXHR;
+
+  const config = {
+    failbackConfig: {
+      dnsDomain: UNIQUE_DOMAIN,
+    },
+  };
+
+  let succeededOn = null;
+  const loader = new FailbackLoader(config);
+
+  try {
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.regression.com/seg.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            succeededOn = response.url;
+            resolve();
+          },
+          onError: (error) =>
+            reject(new Error(error.text || String(error.code))),
+          onTimeout: () => reject(new Error('Timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(
+      succeededOn && succeededOn.includes(DNS_RESOLVED_HOST),
+      `Expected failback to use DNS-resolved host '${DNS_RESOLVED_HOST}', got: ${succeededOn}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.XMLHttpRequest = originalXHR;
+    clearDnsCache();
+    destroyFailbackState(config);
+    loader.destroy();
+  }
 });
 
 // ----------------------------------------

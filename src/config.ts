@@ -18,7 +18,7 @@ import { SubtitleStreamController } from './controller/subtitle-stream-controlle
 import SubtitleTrackController from './controller/subtitle-track-controller';
 import { TimelineController } from './controller/timeline-controller';
 import Cues from './utils/cues';
-import FailbackLoader from './utils/failback-loader';
+import FailbackLoader, { type FailbackConfig } from './utils/failback-loader';
 import FetchLoader, { fetchSupported } from './utils/fetch-loader';
 import { requestMediaKeySystemAccess } from './utils/mediakeys-helper';
 import { clamp } from './utils/number';
@@ -324,6 +324,9 @@ export type HlsConfig = {
     initParams: any,
   ) => Promise<Request> | Request;
   xhrSetup?: (xhr: XMLHttpRequest, url: string) => Promise<void> | void;
+
+  // Failback loader configuration
+  failbackConfig?: FailbackConfig;
 
   // Alt Audio
   audioStreamController?: typeof AudioStreamController;

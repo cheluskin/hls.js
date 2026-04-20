@@ -1662,6 +1662,7 @@ export type {
   KeySystems,
   KeySystemFormats,
 } from './utils/mediakeys-helper';
+export type { FailbackConfig } from './utils/failback-loader';
 export type {
   RationalTimestamp,
   TimestampOffset,

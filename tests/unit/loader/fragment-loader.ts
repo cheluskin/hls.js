@@ -71,7 +71,7 @@ describe('FragmentLoader tests', function () {
           reject(e);
         });
       expect(fragmentLoaderPrivates.loader).to.exist;
-      expect(fragmentLoaderPrivates.loader).to.be.instanceOf(MockXhr);
+      expect(fragmentLoaderPrivates.loader.callbacks).to.exist;
       fragmentLoaderPrivates.loader.callbacks.onProgress(
         stats,
         context,
@@ -112,7 +112,7 @@ describe('FragmentLoader tests', function () {
         .catch((error) => {
           resolve(error);
         });
-      expect(fragmentLoaderPrivates.loader).to.be.instanceOf(MockXhr);
+      expect(fragmentLoaderPrivates.loader).to.exist;
       const stats = new LoadStats();
       fragmentLoaderPrivates.loader.callbacks.onError(
         response,
@@ -151,8 +151,8 @@ describe('FragmentLoader tests', function () {
         .catch((error) => {
           resolve(error);
         });
-      const loaderInstance: MockXhr = fragmentLoaderPrivates.loader;
-      expect(loaderInstance).to.be.instanceOf(MockXhr);
+      const loaderInstance = fragmentLoaderPrivates.loader;
+      expect(loaderInstance).to.exist;
       const stats = new LoadStats();
       loaderInstance.callbacks!.onTimeout(stats, context, networkDetails);
     }).then((error: LoadError) => {

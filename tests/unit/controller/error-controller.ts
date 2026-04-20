@@ -30,6 +30,9 @@ describe('ErrorController Integration Tests', function () {
       startFragPrefetch: true,
       enableWorker: false,
       testBandwidth: false,
+      // These tests validate error-controller retry/switch behavior, not the
+      // failback fragment loader wrapper.
+      fLoader: Hls.DefaultConfig.loader as any,
     });
     sinon.spy(hls, 'stopLoad');
     sinon.spy(hls, 'trigger');

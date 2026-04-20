@@ -93,6 +93,15 @@ const failbackHosts = env.FAILBACK_HOSTS
   : ['failback.turkserial.co'];
 
 const shouldBundleWorker = (format) => format !== FORMAT.esm;
+
+function jsStringLiteral(value) {
+  return `'${String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+function jsArrayLiteral(values) {
+  return `[${values.map((value) => jsStringLiteral(value)).join(', ')}]`;
+}
+
 const buildConstants = (
   type,
   additional = {},
@@ -100,9 +109,11 @@ const buildConstants = (
 ) => ({
   preventAssignment: true,
   values: {
-    __VERSION__: JSON.stringify(pkgJson.version),
-    __FAILBACK_DNS_DOMAIN__: JSON.stringify(failbackDnsDomain),
-    __FAILBACK_HOSTS__: JSON.stringify(failbackHosts),
+    // Use single-quoted JS literals so coverage-instrumented test bundles don't
+    // embed unescaped double quotes into sourcesContent.
+    __VERSION__: jsStringLiteral(pkgJson.version),
+    __FAILBACK_DNS_DOMAIN__: jsStringLiteral(failbackDnsDomain),
+    __FAILBACK_HOSTS__: jsArrayLiteral(failbackHosts),
     __USE_SUBTITLES__: JSON.stringify(features.subtitles),
     __USE_ALT_AUDIO__: JSON.stringify(features.altAudio),
     __USE_EME_DRM__: JSON.stringify(features.emeDrm),
