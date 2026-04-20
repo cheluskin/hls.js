@@ -68,6 +68,7 @@ const flags = {
     'USE_INTERSTITALS',
     'INTERSTITALS',
   ),
+  iframes: readFeatureFlag('IFRAMES'),
 };
 
 function getFeatureSupport(type) {
@@ -81,6 +82,7 @@ function getFeatureSupport(type) {
     m2tsAdvancedCodecs: isFeatureEnabled(type, flags.m2tsAdvancedCodecs),
     mediaCapabilities: isFeatureEnabled(type, flags.mediaCapabilities),
     interstitials: isFeatureEnabled(type, flags.interstitials),
+    iframes: isFeatureEnabled(type, flags.iframes),
   };
 }
 
@@ -91,15 +93,6 @@ const failbackHosts = env.FAILBACK_HOSTS
   : ['failback.turkserial.co'];
 
 const shouldBundleWorker = (format) => format !== FORMAT.esm;
-
-function toJsStringLiteral(value) {
-  return `'${String(value).replaceAll('\\', '\\\\').replaceAll("'", "\\'")}'`;
-}
-
-function toJsArrayLiteral(values) {
-  return `[${values.map((value) => toJsStringLiteral(value)).join(', ')}]`;
-}
-
 const buildConstants = (
   type,
   additional = {},
@@ -107,9 +100,9 @@ const buildConstants = (
 ) => ({
   preventAssignment: true,
   values: {
-    __VERSION__: toJsStringLiteral(pkgJson.version),
-    __FAILBACK_DNS_DOMAIN__: toJsStringLiteral(failbackDnsDomain),
-    __FAILBACK_HOSTS__: toJsArrayLiteral(failbackHosts),
+    __VERSION__: JSON.stringify(pkgJson.version),
+    __FAILBACK_DNS_DOMAIN__: JSON.stringify(failbackDnsDomain),
+    __FAILBACK_HOSTS__: JSON.stringify(failbackHosts),
     __USE_SUBTITLES__: JSON.stringify(features.subtitles),
     __USE_ALT_AUDIO__: JSON.stringify(features.altAudio),
     __USE_EME_DRM__: JSON.stringify(features.emeDrm),
@@ -121,6 +114,7 @@ const buildConstants = (
     __USE_M2TS_ADVANCED_CODECS__: JSON.stringify(features.m2tsAdvancedCodecs),
     __USE_MEDIA_CAPABILITIES__: JSON.stringify(features.mediaCapabilities),
     __USE_INTERSTITIALS__: JSON.stringify(features.interstitials),
+    __USE_IFRAMES__: JSON.stringify(features.iframes),
 
     ...additional,
   },
@@ -332,6 +326,13 @@ function getAliasesForDist(format, features) {
       '../controller/interstitials-schedule': `../${emptyFile}`,
       '../loader/interstitial-event': `../${emptyFile}`,
       '../loader/interstitial-asset-list': `../${emptyFile}`,
+    };
+  }
+
+  if (!features.iframes) {
+    aliases = {
+      ...aliases,
+      './controller/iframe-controller': `./${emptyFile}`,
     };
   }
 

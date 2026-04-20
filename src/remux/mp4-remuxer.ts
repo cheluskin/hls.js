@@ -4,12 +4,18 @@ import { ErrorDetails, ErrorTypes } from '../errors';
 import { Events } from '../events';
 import { PlaylistLevelType } from '../types/loader';
 import { type ILogger, Logger } from '../utils/logger';
+import { types, writeUint32 } from '../utils/mp4-tools';
 import {
   timestampToString,
   toMsFromMpegTsClock,
 } from '../utils/timescale-conversion';
+import {
+  userAgentChromeVersion,
+  userAgentSafariVersion,
+} from '../utils/user-agent';
 import type { HlsConfig } from '../config';
 import type { HlsEventEmitter } from '../events';
+import type { ChunkMetadata } from '../hls';
 import type { SourceBufferName } from '../types/buffer';
 import type {
   AudioSample,
@@ -39,9 +45,7 @@ const MAX_SILENT_FRAME_DURATION = 10 * 1000; // 10 seconds
 const AAC_SAMPLES_PER_FRAME = 1024;
 const MPEG_AUDIO_SAMPLE_PER_FRAME = 1152;
 const AC3_SAMPLES_PER_FRAME = 1536;
-
-let chromeVersion: number | null = null;
-let safariWebkitVersion: number | null = null;
+const MPEG_TS_PTS_ROLLOVER = 8589934592; // 2^33
 
 function createMp4Sample(
   isKeyframe: boolean,
@@ -60,6 +64,7 @@ function createMp4Sample(
       degradPrio: 0,
       dependsOn: isKeyframe ? 2 : 1,
       isNonSync: isKeyframe ? 0 : 1,
+      paddingValue: 0,
     },
   };
 }
@@ -92,16 +97,6 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     this.config = config;
     this.typeSupported = typeSupported;
     this.ISGenerated = false;
-
-    if (chromeVersion === null) {
-      const userAgent = navigator.userAgent || '';
-      const result = userAgent.match(/Chrome\/(\d+)/i);
-      chromeVersion = result ? parseInt(result[1]) : 0;
-    }
-    if (safariWebkitVersion === null) {
-      const result = navigator.userAgent.match(/Safari\/(\d+)/i);
-      safariWebkitVersion = result ? parseInt(result[1]) : 0;
-    }
   }
 
   destroy() {
@@ -171,6 +166,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     accurateTimeOffset: boolean,
     flush: boolean,
     playlistType: PlaylistLevelType,
+    chunkMeta: ChunkMetadata,
   ): RemuxerResult {
     let video: RemuxedTrack | undefined;
     let audio: RemuxedTrack | undefined;
@@ -186,7 +182,8 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     // parameter is greater than -1. The pid is set when the PMT is parsed, which contains the tracks list.
     // However, if the initSegment has already been generated, or we've reached the end of a segment (flush),
     // then we can remux one track without waiting for the other.
-    const hasAudio = audioTrack.pid > -1;
+    const iframesOnly = chunkMeta.iframe;
+    const hasAudio = !iframesOnly && audioTrack.pid > -1;
     const hasVideo = videoTrack.pid > -1;
     const length = videoTrack.samples.length;
     const enoughAudioSamples = audioTrack.samples.length > 0;
@@ -301,6 +298,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
               videoTimeOffset,
               isVideoContiguous,
               audioTrackLength,
+              chunkMeta,
             );
           }
         } else if (enoughVideoSamples) {
@@ -309,6 +307,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
             videoTimeOffset,
             isVideoContiguous,
             0,
+            chunkMeta,
           );
         }
         if (video) {
@@ -357,12 +356,12 @@ export default class MP4Remuxer extends Logger implements Remuxer {
   ): number {
     const offset = Math.round(presentationTime * timescale);
     let timestamp = normalizePts(basetime, offset);
-    if (timestamp < offset + timescale) {
+    if (timestamp < offset) {
       this.log(
         `Adjusting PTS for rollover in timeline near ${(offset - timestamp) / timescale} ${type}`,
       );
-      while (timestamp < offset + timescale) {
-        timestamp += 8589934592;
+      while (timestamp < offset) {
+        timestamp += MPEG_TS_PTS_ROLLOVER;
       }
     }
     return timestamp - offset;
@@ -531,6 +530,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     timeOffset: number,
     contiguous: boolean,
     audioTrackLength: number,
+    chunkMeta: ChunkMetadata,
   ): RemuxedTrack | undefined {
     const timeScale: number = track.inputTimeScale;
     const inputSamples: Array<VideoSample> = track.samples;
@@ -541,8 +541,8 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     let nextVideoTs = this.nextVideoTs;
     let offset = 8;
     let mp4SampleDuration = this.videoSampleDuration;
-    let firstDTS;
-    let lastDTS;
+    let firstDTS: number;
+    let lastDTS: number;
     let minPTS: number = Number.POSITIVE_INFINITY;
     let maxPTS: number = Number.NEGATIVE_INFINITY;
     let sortSamples = false;
@@ -554,7 +554,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
         inputSamples[0].pts -
         normalizePts(inputSamples[0].dts, inputSamples[0].pts);
       if (
-        chromeVersion &&
+        userAgentChromeVersion() &&
         nextVideoTs !== null &&
         Math.abs(pts - cts - (nextVideoTs + initTime)) < 15000
       ) {
@@ -565,7 +565,6 @@ export default class MP4Remuxer extends Logger implements Remuxer {
         nextVideoTs = pts - cts - initTime;
       }
     }
-
     // PTS is coded on 33bits, and can loop from -2^32 to 2^32
     // PTSNormalize will make PTS/DTS value monotonic, we use last known DTS value as reference value
     const nextVideoPts = nextVideoTs + initTime;
@@ -627,7 +626,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
         if (
           !foundOverlap ||
           nextVideoPts >= inputSamples[0].pts ||
-          chromeVersion
+          userAgentChromeVersion()
         ) {
           firstDTS = nextVideoPts;
           const firstPTS = inputSamples[0].pts - delta;
@@ -706,7 +705,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     /* concatenate the video data and construct the mdat in place
       (need 8 more bytes to fill length and mpdat type) */
     const mdatSize = naluLen + 4 * nbNalu + 8;
-    let mdat;
+    let mdat: Uint8Array<ArrayBuffer>;
     try {
       mdat = new Uint8Array(mdatSize);
     } catch (err) {
@@ -720,9 +719,8 @@ export default class MP4Remuxer extends Logger implements Remuxer {
       });
       return;
     }
-    const view = new DataView(mdat.buffer);
-    view.setUint32(0, mdatSize);
-    mdat.set(MP4.types.mdat, 4);
+    writeUint32(mdat, 0, mdatSize);
+    writeUint32(mdat, 4, types.mdat);
 
     let stretchedLastFrame = false;
     let minDtsDelta = Number.POSITIVE_INFINITY;
@@ -738,7 +736,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
         const unit = VideoSampleUnits[j];
         const unitData = unit.data;
         const unitDataLen = unit.data.byteLength;
-        view.setUint32(offset, unitDataLen);
+        writeUint32(mdat, offset, unitDataLen);
         offset += 4;
         mdat.set(unitData, offset);
         offset += unitDataLen;
@@ -794,13 +792,25 @@ export default class MP4Remuxer extends Logger implements Remuxer {
           mp4SampleDuration = lastFrameDuration;
         }
       }
-      const compositionTimeOffset = Math.round(
-        VideoSample.pts - VideoSample.dts,
-      );
+      let compositionTimeOffset = Math.round(VideoSample.pts - VideoSample.dts);
       minDtsDelta = Math.min(minDtsDelta, mp4SampleDuration);
       maxDtsDelta = Math.max(maxDtsDelta, mp4SampleDuration);
       minPtsDelta = Math.min(minPtsDelta, ptsDelta);
       maxPtsDelta = Math.max(maxPtsDelta, ptsDelta);
+
+      // Increase composition time by one frame tick to avoid pts overlap frame eviction in Chrome
+      // Fixes https://github.com/video-dev/hls.js/issues/6374 (https://issues.chromium.org/u/1/issues/336839131)
+      if (!contiguous && i === 0 && compositionTimeOffset > mp4SampleDuration) {
+        const tickPaddedCompositionTime =
+          Math.round(compositionTimeOffset / averageSampleDuration) *
+          averageSampleDuration;
+        if (tickPaddedCompositionTime - compositionTimeOffset === 1) {
+          this.log(
+            `pad first CTS ${compositionTimeOffset} -> ${tickPaddedCompositionTime} of sn: ${chunkMeta.sn}`,
+          );
+          compositionTimeOffset = tickPaddedCompositionTime;
+        }
+      }
 
       outputSamples.push(
         createMp4Sample(
@@ -813,6 +823,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     }
 
     if (outputSamples.length) {
+      const chromeVersion = userAgentChromeVersion();
       if (chromeVersion) {
         if (chromeVersion < 70) {
           // Chrome workaround, mark first sample as being a Random Access Point (keyframe) to avoid sourcebuffer append issue
@@ -821,7 +832,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
           flags.dependsOn = 2;
           flags.isNonSync = 0;
         }
-      } else if (safariWebkitVersion) {
+      } else if (userAgentSafariVersion()) {
         // Fix for "CNN special report, with CC" in test-streams (Safari browser only)
         // Ignore DTS when frame durations are irregular. Safari MSE does not handle this leading to gaps.
         if (
@@ -859,8 +870,22 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     this.nextVideoTs = nextVideoTs = endDTS - initTime;
     this.videoSampleDuration = mp4SampleDuration;
     this.isVideoContiguous = true;
+    if (__USE_IFRAMES__) {
+      if (chunkMeta.iframe) {
+        if (outputSamples.length === 1) {
+          outputSamples[0].duration = mp4SampleDuration =
+            chunkMeta.duration * timeScale;
+          this.nextVideoTs = nextVideoTs =
+            firstDTS + mp4SampleDuration - initTime;
+        } else {
+          this.warn(
+            `Not adjusting IFrame duration (sample count ${outputSamples.length})`,
+          );
+        }
+      }
+    }
     const moof = MP4.moof(
-      track.sequenceNumber++,
+      chunkMeta.sn,
       firstDTS,
       Object.assign(track, {
         samples: outputSamples,
@@ -880,6 +905,12 @@ export default class MP4Remuxer extends Logger implements Remuxer {
       nb: outputSamples.length,
       dropped: track.dropped,
     };
+    // For troubleshooting duplicates of https://github.com/video-dev/hls.js/issues/6374
+    // console.log(
+    //   `#6374 segment ${chunkMeta.sn} timeOffset: ${timeOffset} dts: ${firstDTS}-${endDTS} pts: ${minPTS}-${maxPTS} cts[0]=${
+    //     outputSamples[0].cts
+    //   } cts[${outputSamples.length - 1}]=${outputSamples[outputSamples.length - 1].cts} sample-duration: ${mp4SampleDuration} timescale: ${timeScale}`,
+    // );
     track.samples = [];
     track.dropped = 0;
     return data;
@@ -1070,7 +1101,7 @@ export default class MP4Remuxer extends Logger implements Remuxer {
     }
     let firstPTS: number | null = null;
     let lastPTS: number | null = null;
-    let mdat: any;
+    let mdat: Uint8Array<ArrayBuffer> | undefined;
     let mdatSize: number = 0;
     let sampleLength: number = inputSamples.length;
     while (sampleLength--) {
@@ -1110,16 +1141,17 @@ export default class MP4Remuxer extends Logger implements Remuxer {
             return;
           }
           if (!rawMPEG) {
-            const view = new DataView(mdat.buffer);
-            view.setUint32(0, mdatSize);
-            mdat.set(MP4.types.mdat, 4);
+            writeUint32(mdat, 0, mdatSize);
+            writeUint32(mdat, 4, types.mdat);
           }
         } else {
           // no audio samples
           return;
         }
       }
-      mdat.set(unit, offset);
+      if (mdat) {
+        mdat.set(unit, offset);
+      }
       const unitLen = unit.byteLength;
       offset += unitLen;
       // Default the sample's duration to the computed mp4SampleDuration, which will either be 1024 for AAC or 1152 for MPEG
@@ -1180,10 +1212,10 @@ export function normalizePts(value: number, reference: number | null): number {
 
   if (reference < value) {
     // - 2^33
-    offset = -8589934592;
+    offset = -MPEG_TS_PTS_ROLLOVER;
   } else {
     // + 2^33
-    offset = 8589934592;
+    offset = MPEG_TS_PTS_ROLLOVER;
   }
   /* PTS is 33bit (from 0 to 2^33 -1)
     if diff between value and reference is bigger than half of the amplitude (2^32) then it means that

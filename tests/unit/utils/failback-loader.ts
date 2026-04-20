@@ -2,6 +2,7 @@ import { expect, use } from 'chai';
 import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
+import { LoaderContextType } from '../../../src/types/loader';
 import FailbackLoader, {
   destroyFailbackState,
   getFailbackState,
@@ -160,6 +161,7 @@ describe('FailbackLoader tests', function () {
       const loader = new FailbackLoader(config);
       const context: FragmentLoaderContext = {
         url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
         frag: null as any,
         part: null,
         responseType: 'arraybuffer',
@@ -263,6 +265,7 @@ describe('FailbackLoader tests', function () {
       const loader = new FailbackLoader(config);
       const context: FragmentLoaderContext = {
         url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
         frag: null as any,
         part: null,
         responseType: 'arraybuffer',
@@ -324,6 +327,7 @@ describe('FailbackLoader tests', function () {
       const loader1 = new FailbackLoader(config);
       const context: FragmentLoaderContext = {
         url: 'https://cdn.example.com/video/segment1.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
         frag: null as any,
         part: null,
         responseType: 'arraybuffer',
@@ -466,6 +470,7 @@ describe('FailbackLoader tests', function () {
       const loader = new FailbackLoader(config);
       const context: FragmentLoaderContext = {
         url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
         frag: null as any,
         part: null,
         responseType: 'arraybuffer',

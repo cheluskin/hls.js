@@ -13,6 +13,7 @@ import FPSController from './controller/fps-controller';
 import SubtitleTrackController from './controller/subtitle-track-controller';
 import Hls from './hls';
 import M3U8Parser from './loader/m3u8-parser';
+import BaseLoader from './utils/base-loader';
 import Cues from './utils/cues';
 import FailbackLoader, {
   destroyFailbackState,
@@ -41,6 +42,7 @@ export {
   ErrorController,
   FPSController,
   SubtitleTrackController,
+  BaseLoader,
   XhrLoader,
   FetchLoader,
   FailbackLoader,
@@ -64,7 +66,7 @@ export { LevelKey } from './loader/level-key';
 export { LevelDetails } from './loader/level-details';
 export { MetadataSchema } from './types/demuxer';
 export { HlsSkip, HlsUrlParameters } from './types/level';
-export { PlaylistLevelType } from './types/loader';
+export { LoaderContextType, PlaylistLevelType } from './types/loader';
 export { ChunkMetadata } from './types/transmuxer';
 export { BaseSegment, Fragment, Part } from './loader/fragment';
 export {
