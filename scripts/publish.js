@@ -76,30 +76,6 @@ function normalizeRepository(repository) {
   return repository;
 }
 
-function transformDistPath(value) {
-  if (typeof value === 'string') {
-    if (value.startsWith('./dist/')) {
-      return `./${value.slice('./dist/'.length)}`;
-    }
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => transformDistPath(entry));
-  }
-
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, entryValue]) => [
-        key.startsWith('./dist/') ? `./${key.slice('./dist/'.length)}` : key,
-        transformDistPath(entryValue),
-      ]),
-    );
-  }
-
-  return value;
-}
-
 function createVariantReadme(config) {
   return fs
     .readFileSync(path.join(rootDir, 'README.md'), 'utf-8')
@@ -118,11 +94,11 @@ function createPublishPkg(packageName) {
     authors: rootPkg.authors,
     repository: normalizeRepository(rootPkg.repository),
     bugs: rootPkg.bugs,
-    main: transformDistPath(rootPkg.main),
-    module: transformDistPath(rootPkg.module),
-    types: transformDistPath(rootPkg.types),
-    exports: transformDistPath(rootPkg.exports),
-    files: ['*'],
+    main: rootPkg.main,
+    module: rootPkg.module,
+    types: rootPkg.types,
+    exports: rootPkg.exports,
+    files: ['dist/**/*'],
     publishConfig: {
       ...(rootPkg.publishConfig || {}),
       access: 'public',
@@ -140,7 +116,7 @@ function createPublishPkg(packageName) {
 
   optionalFields.forEach((field) => {
     if (rootPkg[field] !== undefined) {
-      publishPkg[field] = transformDistPath(rootPkg[field]);
+      publishPkg[field] = rootPkg[field];
     }
   });
 
@@ -167,6 +143,37 @@ function assertArtifactsExist(distDir) {
   });
 }
 
+function createPublishDir(distDir) {
+  const publishDir = path.join(distDir, '.npm-package');
+  const publishDistDir = path.join(publishDir, 'dist');
+
+  fs.rmSync(publishDir, { recursive: true, force: true });
+  fs.mkdirSync(publishDistDir, { recursive: true });
+
+  fs.readdirSync(distDir, { withFileTypes: true }).forEach((entry) => {
+    if (
+      entry.name === '.npm-package' ||
+      entry.name === 'package.json' ||
+      entry.name === 'README.md' ||
+      entry.name === 'LICENSE'
+    ) {
+      return;
+    }
+
+    const sourcePath = path.join(distDir, entry.name);
+    const targetPath = path.join(publishDistDir, entry.name);
+
+    if (entry.isDirectory()) {
+      fs.cpSync(sourcePath, targetPath, { recursive: true });
+      return;
+    }
+
+    fs.copyFileSync(sourcePath, targetPath);
+  });
+
+  return publishDir;
+}
+
 async function versionPublished(packageName, version) {
   const fetch = (await import('node-fetch')).default;
   const response = await fetch(
@@ -189,7 +196,6 @@ async function versionPublished(packageName, version) {
 async function publishVariant(variantKey) {
   const config = variants[variantKey];
   const distDir = path.join(rootDir, config.distDir);
-  const distPkgPath = path.join(distDir, 'package.json');
 
   if (!fs.existsSync(distDir)) {
     throw new Error(`Build output directory does not exist: ${distDir}`);
@@ -206,16 +212,21 @@ async function publishVariant(variantKey) {
   }
 
   const publishPkg = createPublishPkg(config.name);
+  const publishDir = createPublishDir(distDir);
+  const publishPkgPath = path.join(publishDir, 'package.json');
 
   // eslint-disable-next-line no-console
   console.log(
     `Publishing ${config.name}@${rootPkg.version} from ${config.distDir} (tag=${npmTag}${dryRun ? ', dry-run' : ''})...`,
   );
 
-  fs.writeFileSync(distPkgPath, JSON.stringify(publishPkg, null, 2) + '\n');
-  fs.copyFileSync(path.join(rootDir, 'LICENSE'), path.join(distDir, 'LICENSE'));
+  fs.writeFileSync(publishPkgPath, JSON.stringify(publishPkg, null, 2) + '\n');
+  fs.copyFileSync(
+    path.join(rootDir, 'LICENSE'),
+    path.join(publishDir, 'LICENSE'),
+  );
   fs.writeFileSync(
-    path.join(distDir, 'README.md'),
+    path.join(publishDir, 'README.md'),
     createVariantReadme(config),
     'utf-8',
   );
@@ -230,10 +241,14 @@ async function publishVariant(variantKey) {
     ...(dryRun ? ['--dry-run'] : []),
   ].join(' ');
 
-  execSync(publishCommand, {
-    stdio: 'inherit',
-    cwd: distDir,
-  });
+  try {
+    execSync(publishCommand, {
+      stdio: 'inherit',
+      cwd: publishDir,
+    });
+  } finally {
+    fs.rmSync(publishDir, { recursive: true, force: true });
+  }
 
   // eslint-disable-next-line no-console
   console.log(`Successfully published ${config.name}@${rootPkg.version}`);
