@@ -56,4 +56,5 @@ import './unit/utils/vttparser';
 import './unit/utils/utf8';
 import './unit/utils/dns-txt-resolver';
 import './unit/utils/failback-loader';
+import './unit/utils/failback-recovery-probe';
 import './unit/demuxer/transmuxer';

@@ -5,6 +5,7 @@ import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
 import { LoaderContextType } from '../../../src/types/loader';
 import FailbackLoader, {
   destroyFailbackState,
+  getExtendedFailbackState,
   getFailbackState,
 } from '../../../src/utils/failback-loader';
 import { logger } from '../../../src/utils/logger';
@@ -630,6 +631,425 @@ describe('FailbackLoader tests', function () {
 
       loader.load(context, loaderConfig, callbacks);
       clock.tick(100);
+    });
+
+    it('should keep failback attempt numbers aligned with actual retry requests', function (done) {
+      const failbackAttempts: number[] = [];
+      const successAttempts: number[] = [];
+
+      config.failbackConfig = {
+        transformUrl: (_url, attempt) => {
+          if (attempt < 2) {
+            return 'https://cdn.example.com/video/segment.ts';
+          }
+
+          if (attempt === 2) {
+            return 'https://failback.example.com/video/segment.ts';
+          }
+
+          return null;
+        },
+        onFailback: (_orig, _fb, attempt) => failbackAttempts.push(attempt),
+        onSuccess: (_url, wasFailback, attempt) => {
+          if (wasFailback) {
+            successAttempts.push(attempt);
+          }
+        },
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const requestedUrls: string[] = [];
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestedUrls.push(xhr.url);
+
+        if (requestedUrls.length === 1) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(500, null);
+          }, 10);
+          return;
+        }
+
+        if (requestedUrls.length === 2) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(200, new ArrayBuffer(256));
+          }, 10);
+          return;
+        }
+
+        done(new Error(`Unexpected extra request: ${xhr.url}`));
+      };
+
+      const callbacks: LoaderCallbacks<FragmentLoaderContext> = {
+        onSuccess: (response) => {
+          expect(response.url).to.equal(
+            'https://failback.example.com/video/segment.ts',
+          );
+          expect(requestedUrls).to.deep.equal([
+            'https://cdn.example.com/video/segment.ts',
+            'https://failback.example.com/video/segment.ts',
+          ]);
+          expect(failbackAttempts).to.deep.equal([1]);
+          expect(successAttempts).to.deep.equal([1]);
+
+          loader.destroy();
+          done();
+        },
+        onError: (error) => {
+          loader.destroy();
+          done(new Error(`Unexpected error: ${error.text}`));
+        },
+        onTimeout: () => {
+          loader.destroy();
+          done(new Error('Should not have timed out'));
+        },
+        onAbort: () => {},
+        onProgress: () => {},
+      };
+
+      loader.load(context, loaderConfig, callbacks);
+      clock.tick(100);
+    });
+
+    it('should report only real network attempts when duplicate candidates exhaust', function (done) {
+      let allFailedAttempts: number | null = null;
+
+      config.failbackConfig = {
+        transformUrl: (_url, attempt) => {
+          if (attempt < 2) {
+            return 'https://cdn.example.com/video/segment.ts';
+          }
+
+          return null;
+        },
+        onAllFailed: (_orig, attempts) => {
+          allFailedAttempts = attempts;
+        },
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const requestedUrls: string[] = [];
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestedUrls.push(xhr.url);
+        self.setTimeout(() => {
+          xhr.simulateResponse(500, null);
+        }, 10);
+      };
+
+      const callbacks: LoaderCallbacks<FragmentLoaderContext> = {
+        onSuccess: () => {
+          loader.destroy();
+          done(new Error('Should not have succeeded'));
+        },
+        onError: () => {
+          expect(requestedUrls).to.deep.equal([
+            'https://cdn.example.com/video/segment.ts',
+          ]);
+          expect(allFailedAttempts).to.equal(1);
+
+          loader.destroy();
+          done();
+        },
+        onTimeout: () => {
+          loader.destroy();
+          done(new Error('Should not have timed out'));
+        },
+        onAbort: () => {},
+        onProgress: () => {},
+      };
+
+      loader.load(context, loaderConfig, callbacks);
+      clock.tick(100);
+    });
+
+    it('should advance to the next transformUrl attempt after a failed failback request', function (done) {
+      const failbackAttempts: number[] = [];
+      const transformCalls = new Map<number, number>();
+
+      config.failbackConfig = {
+        transformUrl: (_url, attempt) => {
+          const callCount = (transformCalls.get(attempt) || 0) + 1;
+          transformCalls.set(attempt, callCount);
+          return `https://failback${attempt}.example.com/video/segment.ts?sig=${callCount}`;
+        },
+        onFailback: (_orig, _fb, attempt) => failbackAttempts.push(attempt),
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const requestedUrls: string[] = [];
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestedUrls.push(xhr.url);
+
+        if (requestedUrls.length < 3) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(500, null);
+          }, 10);
+          return;
+        }
+
+        self.setTimeout(() => {
+          xhr.simulateResponse(200, new ArrayBuffer(256));
+        }, 10);
+      };
+
+      const callbacks: LoaderCallbacks<FragmentLoaderContext> = {
+        onSuccess: (response) => {
+          expect(response.url).to.include('failback1.example.com');
+          expect(requestedUrls).to.deep.equal([
+            'https://cdn.example.com/video/segment.ts',
+            'https://failback0.example.com/video/segment.ts?sig=1',
+            'https://failback1.example.com/video/segment.ts?sig=1',
+          ]);
+          expect(failbackAttempts).to.deep.equal([1, 2]);
+          expect(transformCalls.get(0)).to.equal(1);
+
+          loader.destroy();
+          done();
+        },
+        onError: (error) => {
+          loader.destroy();
+          done(new Error(`Unexpected error: ${error.text}`));
+        },
+        onTimeout: () => {
+          loader.destroy();
+          done(new Error('Should not have timed out'));
+        },
+        onAbort: () => {},
+        onProgress: () => {},
+      };
+
+      loader.load(context, loaderConfig, callbacks);
+      clock.tick(100);
+    });
+  });
+
+  describe('Recovery State Tracking', function () {
+    it('should refresh the original probe URL after each failback success', async function () {
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      let requestCount = 0;
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestCount++;
+
+        if (requestCount === 1 || requestCount === 3) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(206, new ArrayBuffer(1), {
+              'Content-Range': `bytes ${requestCount}-${requestCount}/1000`,
+            });
+          }, 10);
+          return;
+        }
+
+        self.setTimeout(() => {
+          xhr.simulateResponse(200, new ArrayBuffer(256));
+        }, 10);
+      };
+
+      const loadSegment = (url: string) =>
+        new Promise<void>((resolve, reject) => {
+          const loader = new FailbackLoader(config);
+          const context: FragmentLoaderContext = {
+            url,
+            type: LoaderContextType.MEDIA_FRAGMENT,
+            frag: null as any,
+            part: null,
+            responseType: 'arraybuffer',
+            headers: {},
+            rangeStart: 0,
+            rangeEnd: 0,
+          };
+
+          loader.load(context, loaderConfig, {
+            onSuccess: () => {
+              loader.destroy();
+              resolve();
+            },
+            onError: (error) => {
+              loader.destroy();
+              reject(new Error(`Unexpected error: ${error.text}`));
+            },
+            onTimeout: () => {
+              loader.destroy();
+              reject(new Error('Unexpected timeout'));
+            },
+            onAbort: () => {
+              loader.destroy();
+              reject(new Error('Unexpected abort'));
+            },
+            onProgress: () => {},
+          });
+
+          clock.tick(100);
+        });
+
+      const segment1 = 'https://cdn.example.com/video/segment1.ts';
+      const segment2 = 'https://cdn.example.com/video/segment2.ts';
+
+      await loadSegment(segment1);
+      expect(
+        getExtendedFailbackState(config).lastSuccessfulOriginalUrl,
+      ).to.equal(segment1);
+
+      await loadSegment(segment2);
+      expect(
+        getExtendedFailbackState(config).lastSuccessfulOriginalUrl,
+      ).to.equal(segment2);
+    });
+
+    it('should keep the newest original probe URL when overlapping failback requests finish out of order', async function () {
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        const isFailbackRequest = xhr.url.includes('failback.example.com');
+        const isOlderSegment = xhr.url.includes('segment1.ts');
+
+        if (!isFailbackRequest) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(206, new ArrayBuffer(1), {
+              'Content-Range': 'bytes 1-1/1000',
+            });
+          }, 10);
+          return;
+        }
+
+        self.setTimeout(
+          () => {
+            xhr.simulateResponse(200, new ArrayBuffer(256));
+          },
+          isOlderSegment ? 40 : 20,
+        );
+      };
+
+      const loadSegment = (url: string) =>
+        new Promise<void>((resolve, reject) => {
+          const loader = new FailbackLoader(config);
+          const context: FragmentLoaderContext = {
+            url,
+            type: LoaderContextType.MEDIA_FRAGMENT,
+            frag: null as any,
+            part: null,
+            responseType: 'arraybuffer',
+            headers: {},
+            rangeStart: 0,
+            rangeEnd: 0,
+          };
+
+          loader.load(context, loaderConfig, {
+            onSuccess: () => {
+              loader.destroy();
+              resolve();
+            },
+            onError: (error) => {
+              loader.destroy();
+              reject(new Error(`Unexpected error: ${error.text}`));
+            },
+            onTimeout: () => {
+              loader.destroy();
+              reject(new Error('Unexpected timeout'));
+            },
+            onAbort: () => {
+              loader.destroy();
+              reject(new Error('Unexpected abort'));
+            },
+            onProgress: () => {},
+          });
+        });
+
+      const olderSegment = 'https://cdn.example.com/video/segment1.ts';
+      const newerSegment = 'https://cdn.example.com/video/segment2.ts';
+
+      const olderLoad = loadSegment(olderSegment);
+      const newerLoad = loadSegment(newerSegment);
+
+      clock.tick(35);
+      expect(
+        getExtendedFailbackState(config).lastSuccessfulOriginalUrl,
+      ).to.equal(newerSegment);
+
+      clock.tick(25);
+      await Promise.all([olderLoad, newerLoad]);
+
+      expect(
+        getExtendedFailbackState(config).lastSuccessfulOriginalUrl,
+      ).to.equal(newerSegment);
     });
   });
 

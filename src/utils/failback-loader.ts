@@ -27,6 +27,8 @@ interface FailbackSessionState {
   threshold: number;
   fragmentsSinceLastProbe: number;
   lastSuccessfulOriginalUrl: string | null;
+  lastSuccessfulOriginalUrlOrder: number;
+  nextRequestOrder: number;
   isProbeInProgress: boolean;
 }
 
@@ -54,6 +56,8 @@ function getSessionState(config: HlsConfig): FailbackSessionState {
       threshold: PERMANENT_FAILBACK_THRESHOLD,
       fragmentsSinceLastProbe: 0,
       lastSuccessfulOriginalUrl: null,
+      lastSuccessfulOriginalUrlOrder: 0,
+      nextRequestOrder: 0,
       isProbeInProgress: false,
     };
     failbackStates.set(config, state);
@@ -251,7 +255,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   public context: FragmentLoaderContext | null = null;
   public stats: LoaderStats;
   private failbackAttempt: number = 0;
+  private nextFailbackIndex: number = 0;
   private originalUrl: string = '';
+  private attemptedOriginalRequest: boolean = false;
+  private requestOrder: number = 0;
   private requestTimeout?: number;
   private loaderConfig: LoaderConfiguration | null = null;
 
@@ -486,10 +493,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.callbacks = callbacks;
     this.loaderConfig = config;
     this.failbackAttempt = 0;
+    this.nextFailbackIndex = 0;
     this.originalUrl = context.url;
-    this.triedUrls.clear();
+    this.attemptedOriginalRequest = false;
 
     const state = getSessionState(this.config);
+    this.requestOrder = ++state.nextRequestOrder;
+    this.triedUrls.clear();
     const hosts = this.getHosts();
 
     // Per-fragment start log is verbose by default — only critical transitions
@@ -505,6 +515,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     if (state.permanentFailbackMode) {
       const failbackUrl = this.getFailbackUrl(0);
       if (failbackUrl) {
+        this.nextFailbackIndex = 1;
         this.failbackAttempt = 1;
         logger.log(
           `[FailbackLoader] PERMANENT FAILBACK MODE - skipping original, using: ${failbackUrl}`,
@@ -514,6 +525,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       }
     }
 
+    this.attemptedOriginalRequest = true;
     this.loadUrl(context.url);
   }
 
@@ -576,16 +588,16 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   private logAllFailed() {
+    const totalAttempts =
+      (this.attemptedOriginalRequest ? 1 : 0) + this.failbackAttempt;
+
     logger.log(
       `[FailbackLoader] ALL FAILED: no more failback hosts available` +
         `\n  original: ${this.originalUrl}` +
-        `\n  attempts: ${this.failbackAttempt + 1}`,
+        `\n  attempts: ${totalAttempts}`,
     );
 
-    this.failbackConfig.onAllFailed?.(
-      this.originalUrl,
-      this.failbackAttempt + 1,
-    );
+    this.failbackConfig.onAllFailed?.(this.originalUrl, totalAttempts);
   }
 
   private startFailbackRequest(failbackUrl: string, abortBeforeRetry: boolean) {
@@ -621,10 +633,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     // transformUrl or host lists, and protects against infinite loops
     // via MAX_FAILBACK_ATTEMPTS.
     let failbackUrl: string | null = null;
-    let guard = 0;
+    let candidateIndex = this.nextFailbackIndex;
 
-    while (guard < MAX_FAILBACK_ATTEMPTS) {
-      const candidate = this.getFailbackUrl(this.failbackAttempt);
+    while (candidateIndex < MAX_FAILBACK_ATTEMPTS) {
+      const candidate = this.getFailbackUrl(candidateIndex);
       if (!candidate) {
         break;
       }
@@ -632,12 +644,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         failbackUrl = candidate;
         break;
       }
-      // Duplicate or already-tried — advance and try the next host.
-      this.failbackAttempt++;
-      guard++;
+      candidateIndex++;
     }
 
     if (failbackUrl) {
+      this.nextFailbackIndex = candidateIndex + 1;
       this.startFailbackRequest(failbackUrl, abortBeforeRetry);
       return;
     }
@@ -873,19 +884,28 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
               state.consecutiveOriginalFailures = 0;
             }
 
-            // Store original URL for future recovery probes
-            // Always store it - even if we loaded from failback, we want to probe original later
-            if (
-              !state.lastSuccessfulOriginalUrl ||
-              this.failbackAttempt === 0
-            ) {
+            // Store the freshest original URL for future recovery probes.
+            // Overlapping loaders share one state object, so an older request
+            // finishing later must not clobber a newer fragment URL.
+            if (this.requestOrder >= state.lastSuccessfulOriginalUrlOrder) {
               const wasNull = !state.lastSuccessfulOriginalUrl;
               state.lastSuccessfulOriginalUrl = this.originalUrl;
+              state.lastSuccessfulOriginalUrlOrder = this.requestOrder;
+
               if (wasNull) {
                 logger.log(
                   `[FailbackLoader] Stored original URL for recovery probes: ${this.originalUrl}`,
                 );
               }
+            }
+
+            if (
+              this.requestOrder < state.lastSuccessfulOriginalUrlOrder &&
+              state.lastSuccessfulOriginalUrl
+            ) {
+              this.logVerbose(
+                `[FailbackLoader] Ignoring stale original URL for recovery probes: ${this.originalUrl}`,
+              );
             }
 
             // Calculate download stats for logging
