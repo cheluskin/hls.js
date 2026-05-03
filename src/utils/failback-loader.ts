@@ -681,15 +681,16 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     const xhr = (this.loader = new self.XMLHttpRequest());
     const xhrSetup = this.config.xhrSetup;
     if (xhrSetup) {
+      const xhrContext = url !== context.url ? { ...context, url } : context;
       Promise.resolve()
         .then(() => {
           if (this.loader !== xhr || this.stats.aborted) return;
-          return xhrSetup(xhr, url, context);
+          return xhrSetup(xhr, url, xhrContext);
         })
         .catch(() => {
           if (this.loader !== xhr || this.stats.aborted) return;
           xhr.open('GET', url, true);
-          return xhrSetup(xhr, url, context);
+          return xhrSetup(xhr, url, xhrContext);
         })
         .then(() => {
           if (this.loader !== xhr || this.stats.aborted) return;
