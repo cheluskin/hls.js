@@ -1016,12 +1016,12 @@ await test('206 Partial Content from browser cache triggers failback', async () 
             'Failback should be failback.example.com',
           );
 
-          // Check that failure was counted
+          // The browser cache response does not prove that origin failed.
           const state = getFailbackState(config);
           assert.equal(
             state.consecutiveFailures,
-            1,
-            'Should count as 1 failure',
+            0,
+            'Should not count as an origin failure',
           );
 
           resolve();
@@ -1166,9 +1166,9 @@ await test('Legitimate 206 (we requested range) should NOT failback', async () =
 });
 
 // ----------------------------------------
-// Test 21: 206 detection leads to permanent failback mode after threshold
+// Test 21: browser-generated 206 does not affect origin health
 // ----------------------------------------
-await test('206 detection counts toward permanent failback mode', async () => {
+await test('browser-generated 206 does not enter permanent failback mode', async () => {
   let requestCount = 0;
 
   class Mock206XHR {
@@ -1271,14 +1271,14 @@ await test('206 detection counts toward permanent failback mode', async () => {
       });
     });
 
-  // First segment - 206 detected, failback, count = 1
+  // First segment - a browser/cache 206 fails over only this request.
   requestCount = 0;
   await loadSegment('https://cdn.original.com/seg1.ts');
   let state = getFailbackState(config);
   assert.equal(
     state.consecutiveFailures,
-    1,
-    'Should have 1 failure after first 206',
+    0,
+    'Browser-generated 206 must not count as an origin failure',
   );
   assert.equal(
     state.permanentMode,
@@ -1291,25 +1291,25 @@ await test('206 detection counts toward permanent failback mode', async () => {
     'Should have 2 requests (original 206 + failback)',
   );
 
-  // Second segment - 206 detected, failback, count = 2 -> permanent mode
+  // A second cache response still must not poison origin health.
   requestCount = 0;
   await loadSegment('https://cdn.original.com/seg2.ts');
   state = getFailbackState(config);
-  assert.equal(state.consecutiveFailures, 2, 'Should have 2 failures');
-  assert.equal(state.permanentMode, true, 'Should BE in permanent mode now');
+  assert.equal(state.consecutiveFailures, 0, 'Should have no origin failures');
+  assert.equal(state.permanentMode, false, 'Should not enter permanent mode');
   assert.equal(
     requestCount,
     2,
     'Should have 2 requests (original 206 + failback)',
   );
 
-  // Third segment - should skip original entirely (permanent mode)
+  // The next segment should still probe the original CDN.
   requestCount = 0;
   await loadSegment('https://cdn.original.com/seg3.ts');
   assert.equal(
     requestCount,
-    1,
-    'Should have only 1 request (direct to failback)',
+    2,
+    'Should have original 206 plus failback, not a permanent-mode skip',
   );
 
   globalThis.XMLHttpRequest = originalXHR;

@@ -296,7 +296,7 @@ interface LoaderCallbacks<T> {
 - Динамический reread списка хостов на каждом failback-кандидате, чтобы поздно завершившийся DNS preload влиял на следующие retry
 - **Детекция зависания (stall detection)** — переключение на резервный хост если нет данных 5 секунд
 - **Детекция низкой скорости (throughput detection)** — переключение если скорость < 4KB/s в течение 5 секунд
-- **Режим постоянного failback** — после 2 последовательных ошибок на оригинальном источнике, все последующие запросы идут напрямую на резервные хосты
+- **Режим постоянного failback** — после 2 обычных ошибок либо сразу после подтверждённой неполной передачи все последующие запросы идут напрямую на резервные хосты
 - Дедупликация уже попробованных URL + защитный лимит `MAX_FAILBACK_ATTEMPTS = 32` против циклического `transformUrl`
 - Кастомная трансформация URL через callback
 - Опциональное подробное логирование через `failbackConfig.verbose`
@@ -355,6 +355,10 @@ const failbackConfig: FailbackConfig = {
 
   // Подробные per-request логи. По умолчанию false.
   verbose: true,
+
+  // Не использовать backup-хост 30 секунд после timeout/stall/error.
+  // По умолчанию 30000. Значение 0 отключает quarantine.
+  failbackHostCooldownMs: 30000,
 
   // Callback при переключении на резервный хост
   onFailback: (originalUrl, failbackUrl, attempt) => {
@@ -446,6 +450,12 @@ export interface FailbackConfig {
 
   /** Callback когда все попытки исчерпаны. attempts включает original + failback */
   onAllFailed?: (originalUrl: string, attempts: number) => void;
+
+  /**
+   * Время, на которое неуспешный backup-хост исключается из новых фрагментов.
+   * По умолчанию 30000ms. 0 отключает исключение.
+   */
+  failbackHostCooldownMs?: number;
 
   /**
    * Опционально вернуть старое поведение с `Cache-Control: no-store`.
@@ -566,25 +576,29 @@ FailbackLoader перехватывает следующие ситуации:
 1. **HTTP ошибки** (status не в диапазоне 200-299)
 2. **Таймауты** (превышение `maxTimeToFirstByteMs` или `maxLoadTimeMs`)
 3. **Сетевые ошибки** (network error)
-4. **Browser-initiated `206 Partial Content`** при stale cache, когда мы сами не запрашивали `Range`
+4. **Browser-initiated `206 Partial Content`** при stale cache, когда мы сами не запрашивали `Range` (даже если `Content-Range` скрыт CORS)
 5. **Зависание загрузки** (strict stall) — нет progress/event более 5 секунд
 6. **Низкая скорость** (throughput stall) — скорость < 4KB/s суммарно более 5 секунд
+7. **Усечённый `200/206` ответ** — фактический размер тела не совпадает с `Content-Length` или запрошенным byte range
 
 При каждой ошибке:
 
 1. Для timeout/stall активный XHR abort-ится; для HTTP error уже завершившийся XHR просто считается неуспешным
-2. Вычисляется следующий кандидат через `transformUrl()` или список `staticHosts`/DNS
-3. Кандидаты, которые уже пробовали или которые совпадают с текущим URL, пропускаются
-4. Поиск нового URL ограничен `MAX_FAILBACK_ATTEMPTS = 32`, чтобы защититься от циклического `transformUrl`
-5. При успехе — данные возвращаются в обычный HLS pipeline
-6. Если новых кандидатов больше нет — вызывается `onAllFailed`, затем наружу уходит стандартная HLS ошибка/timeout
+2. Неуспешный backup-хост помещается в session-level quarantine на 30 секунд (настраивается через `failbackHostCooldownMs`)
+3. Вычисляется следующий здоровый кандидат через `transformUrl()` или список `staticHosts`/DNS
+4. Кандидаты, которые уже пробовали, совпадают с текущим URL или находятся в quarantine, пропускаются
+5. Поиск нового URL ограничен `MAX_FAILBACK_ATTEMPTS = 32`, чтобы защититься от циклического `transformUrl`
+6. При успехе — данные возвращаются в обычный HLS pipeline
+7. Если здоровых кандидатов больше нет — вызывается `onAllFailed`, затем наружу уходит стандартная HLS ошибка/timeout
 
 ### Режим постоянного failback
 
-После **2 последовательных ошибок** на оригинальном источнике, библиотека переключается в **режим постоянного failback**:
+После **2 обычных последовательных ошибок** на оригинальном источнике библиотека переключается в **режим постоянного failback**. Подтверждённая неполная передача (обрыв после headers/progress, stall или размер тела, не совпадающий с `Content-Length`/Range) переводит в этот режим сразу — следующий фрагмент не ждёт второго таймаута.
 
 - Все новые запросы идут сразу на резервные хосты (минуя оригинальный)
 - Это ускоряет загрузку когда оригинальный источник полностью недоступен
+
+Для защиты от TSPU blackhole нужен как минимум **два независимых** backup-хоста (разные SNI/IP/CDN). Один host не даёт альтернативы: после его stall loader корректно вернёт ошибку, а не будет бесконечно повторять ту же пару origin → backup.
 
 ```typescript
 import Hls, { getFailbackState, resetFailbackState } from '@armdborg/hls.js';
@@ -661,6 +675,8 @@ DNS preload асинхронный. Если первый сегмент нач�
 - считать его ошибкой
 - переключаться на failback
 
+Такой `206` относится к конкретному ответу браузерного cache-layer, а не к health оригинального CDN: для него выполняется failback только текущего запроса, без включения permanent mode.
+
 Если нужно вернуть старое поведение для диагностики, есть `failbackConfig.enableCacheControlHeader = true`.
 
 ### 3. Почему появился `verbose`, а часть логов осталась always-on
@@ -719,12 +735,11 @@ Per-fragment логи (`LOAD START`, `LOADING`, `RESPONSE HEADERS RECEIVED`, `SU
   elapsed: 187ms
   loaded: 0 bytes
 [FailbackLoader] FAILBACK: trying host #1: https://host1.com/seg.ts
-[FailbackLoader] CACHE RANGE ISSUE DETECTED:
+[FailbackLoader] UNEXPECTED PARTIAL RESPONSE:
   url: https://cdn.example.com/seg.ts
   status: 206 Partial Content (browser-initiated)
   Content-Range: bytes 15592-15592/2624292
-  received: 1 bytes, total: 2624292 bytes
-  ACTION: Treating as error, will try failback
+  ACTION: Treating as a browser/cache error, will try failback
 [FailbackLoader] Original source stalled - no progress for 5000ms (1/2)
 [FailbackLoader] Strict stall detected (no events for 5100ms)
 [FailbackLoader] Throughput stall detected (speed 1024 B/s < 4096 B/s for 5000ms)

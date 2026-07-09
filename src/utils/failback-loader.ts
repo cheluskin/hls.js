@@ -30,19 +30,22 @@ interface FailbackSessionState {
   lastSuccessfulOriginalUrlOrder: number;
   nextRequestOrder: number;
   isProbeInProgress: boolean;
+  unhealthyFailbackHosts: Map<string, number>;
 }
 
 const failbackStates = new WeakMap<HlsConfig, FailbackSessionState>();
 
-// Number of consecutive failures on original CDN before switching to permanent failback.
-// We use 2 to avoid expensive failback traffic for temporary issues.
-// The 206 detection handles browser Range requests from cached partial data.
+// Number of ordinary consecutive failures on original CDN before switching to
+// permanent failback. A confirmed incomplete transfer switches immediately.
+// We use 2 for transient issues. The 206 detection handles browser Range
+// requests from cached partial data.
 const PERMANENT_FAILBACK_THRESHOLD = 2;
 const PROBE_EVERY_N_FRAGMENTS = 6;
 const PROBE_TIMEOUT_MS = 3000;
 const STALL_TIMEOUT_MS = 5000;
 const STALL_CHECK_INTERVAL_MS = 1000;
 const MIN_SPEED_BYTES_PER_SEC = 4096;
+const DEFAULT_FAILBACK_HOST_COOLDOWN_MS = 30000;
 
 /**
  * Get or initialize state for a specific config instance
@@ -59,6 +62,7 @@ function getSessionState(config: HlsConfig): FailbackSessionState {
       lastSuccessfulOriginalUrlOrder: 0,
       nextRequestOrder: 0,
       isProbeInProgress: false,
+      unhealthyFailbackHosts: new Map(),
     };
     failbackStates.set(config, state);
   }
@@ -230,6 +234,11 @@ export interface FailbackConfig {
   /** Callback when all attempts failed */
   onAllFailed?: (originalUrl: string, attempts: number) => void;
   /**
+   * How long a failback host is skipped after it fails (default: 30000ms).
+   * Set to 0 to retry every host on every fragment.
+   */
+  failbackHostCooldownMs?: number;
+  /**
    * Enable Cache-Control: no-store header.
    * This prevents browser from caching partial responses but triggers CORS preflight
    * (OPTIONS requests), which doubles the number of requests.
@@ -261,6 +270,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private requestOrder: number = 0;
   private requestTimeout?: number;
   private loaderConfig: LoaderConfiguration | null = null;
+  // `stats.loading.start` covers the entire logical load, including retries.
+  // Each CDN attempt needs an independent TTFB and download time budget.
+  private attemptStartTime: number = 0;
 
   // Stall detection
   private lastProgressTime: number = 0;
@@ -289,6 +301,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       onSuccess: userConfig.onSuccess,
       onFailback: userConfig.onFailback,
       onAllFailed: userConfig.onAllFailed,
+      failbackHostCooldownMs: userConfig.failbackHostCooldownMs,
       enableCacheControlHeader: userConfig.enableCacheControlHeader,
       verbose: userConfig.verbose,
     };
@@ -432,8 +445,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    this.recordOriginalSourceFailure(
-      `Original source stalled - no progress for ${STALL_TIMEOUT_MS}ms`,
+    this.recordSourceFailure(
+      currentUrl,
+      `Source stalled - no progress for ${STALL_TIMEOUT_MS}ms`,
+      true,
     );
 
     this.tryFailbackOrComplete(
@@ -513,9 +528,8 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     // In permanent failback mode, skip original source entirely
     if (state.permanentFailbackMode) {
-      const failbackUrl = this.getFailbackUrl(0);
+      const failbackUrl = this.getNextFailbackUrl(null);
       if (failbackUrl) {
-        this.nextFailbackIndex = 1;
         this.failbackAttempt = 1;
         logger.log(
           `[FailbackLoader] PERMANENT FAILBACK MODE - skipping original, using: ${failbackUrl}`,
@@ -523,6 +537,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         this.loadUrl(failbackUrl);
         return;
       }
+
+      this.completeNoHealthyFailbackHosts();
+      return;
     }
 
     this.attemptedOriginalRequest = true;
@@ -563,6 +580,88 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
   }
 
+  private hasByteRange(context: FragmentLoaderContext): boolean {
+    const { rangeStart, rangeEnd } = context;
+    return (
+      typeof rangeStart === 'number' &&
+      typeof rangeEnd === 'number' &&
+      Number.isFinite(rangeStart) &&
+      Number.isFinite(rangeEnd) &&
+      rangeEnd > rangeStart
+    );
+  }
+
+  private getFailbackHostCooldownMs(): number {
+    const cooldownMs = this.failbackConfig.failbackHostCooldownMs;
+    return Number.isFinite(cooldownMs) && cooldownMs! >= 0
+      ? cooldownMs!
+      : DEFAULT_FAILBACK_HOST_COOLDOWN_MS;
+  }
+
+  private getFailbackHostKey(url: string): string {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return url;
+    }
+  }
+
+  private isFailbackHostAvailable(url: string): boolean {
+    const state = getSessionState(this.config);
+    const hostKey = this.getFailbackHostKey(url);
+    const unavailableUntil = state.unhealthyFailbackHosts.get(hostKey);
+    if (!unavailableUntil) {
+      return true;
+    }
+
+    if (unavailableUntil <= self.performance.now()) {
+      state.unhealthyFailbackHosts.delete(hostKey);
+      return true;
+    }
+
+    this.logVerbose(
+      `[FailbackLoader] Skipping quarantined failback host: ${hostKey}`,
+    );
+    return false;
+  }
+
+  private quarantineFailbackHost(url: string, reason: string): void {
+    if (this.failbackAttempt === 0) {
+      return;
+    }
+
+    const cooldownMs = this.getFailbackHostCooldownMs();
+    if (cooldownMs === 0) {
+      return;
+    }
+
+    const hostKey = this.getFailbackHostKey(url);
+    const unavailableUntil = self.performance.now() + cooldownMs;
+    getSessionState(this.config).unhealthyFailbackHosts.set(
+      hostKey,
+      unavailableUntil,
+    );
+    logger.log(
+      `[FailbackLoader] QUARANTINING FAILBACK HOST:` +
+        `\n  host: ${hostKey}` +
+        `\n  reason: ${reason}` +
+        `\n  cooldown: ${cooldownMs}ms`,
+    );
+  }
+
+  private recordSourceFailure(
+    currentUrl: string,
+    reason: string,
+    confirmedUnusable: boolean = false,
+  ): void {
+    if (this.failbackAttempt === 0) {
+      this.recordOriginalSourceFailure(reason, confirmedUnusable);
+      return;
+    }
+
+    this.quarantineFailbackHost(currentUrl, reason);
+  }
+
   private switchToPermanentFailbackModeIfNeeded(state: FailbackSessionState) {
     if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
       state.permanentFailbackMode = true;
@@ -572,16 +671,24 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
   }
 
-  private recordOriginalSourceFailure(reason: string) {
+  private recordOriginalSourceFailure(
+    reason: string,
+    confirmedUnusable: boolean = false,
+  ) {
     const state = getSessionState(this.config);
 
     if (this.failbackAttempt !== 0 || state.permanentFailbackMode) {
       return;
     }
 
-    state.consecutiveOriginalFailures++;
+    // A response that starts and then stalls or truncates is conclusively
+    // unusable for playback. Do not spend another fragment on the same CDN.
+    // Ordinary transport failures retain the two-failure threshold.
+    state.consecutiveOriginalFailures = confirmedUnusable
+      ? state.threshold
+      : state.consecutiveOriginalFailures + 1;
     logger.log(
-      `[FailbackLoader] ${reason} (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})`,
+      `[FailbackLoader] ${reason} (${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD})${confirmedUnusable ? ' - switching immediately' : ''}`,
     );
 
     this.switchToPermanentFailbackModeIfNeeded(state);
@@ -609,7 +716,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     this.stats.aborted = false;
     this.stats.loading.first = 0;
+    this.stats.loading.end = 0;
     this.stats.loaded = 0;
+    this.stats.total = 0;
+    this.stats.bwEstimate = 0;
 
     this.failbackConfig.onFailback?.(
       this.originalUrl,
@@ -625,16 +735,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.loadUrl(failbackUrl);
   }
 
-  private tryFailbackOrComplete(
-    currentUrl: string,
-    onExhausted: () => void,
-    abortBeforeRetry: boolean = false,
-  ) {
-    // Advance attempt until we find a URL that hasn't been tried yet.
-    // Prevents wasted attempts on dedup collisions in user-supplied
-    // transformUrl or host lists, and protects against infinite loops
-    // via MAX_FAILBACK_ATTEMPTS.
-    let failbackUrl: string | null = null;
+  private getNextFailbackUrl(currentUrl: string | null): string | null {
     let candidateIndex = this.nextFailbackIndex;
 
     while (candidateIndex < MAX_FAILBACK_ATTEMPTS) {
@@ -642,15 +743,40 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       if (!candidate) {
         break;
       }
-      if (candidate !== currentUrl && !this.triedUrls.has(candidate)) {
-        failbackUrl = candidate;
-        break;
-      }
       candidateIndex++;
+
+      if (candidate === currentUrl || this.triedUrls.has(candidate)) {
+        continue;
+      }
+      if (!this.isFailbackHostAvailable(candidate)) {
+        continue;
+      }
+
+      this.nextFailbackIndex = candidateIndex;
+      return candidate;
     }
 
+    this.nextFailbackIndex = candidateIndex;
+    return null;
+  }
+
+  private completeNoHealthyFailbackHosts() {
+    this.logAllFailed();
+    this.callbacks?.onError?.(
+      { code: 0, text: 'No healthy failback hosts available' },
+      this.context as FragmentLoaderContext,
+      this.loader,
+      this.stats,
+    );
+  }
+
+  private tryFailbackOrComplete(
+    currentUrl: string,
+    onExhausted: () => void,
+    abortBeforeRetry: boolean = false,
+  ) {
+    const failbackUrl = this.getNextFailbackUrl(currentUrl);
     if (failbackUrl) {
-      this.nextFailbackIndex = candidateIndex + 1;
       this.startFailbackRequest(failbackUrl, abortBeforeRetry);
       return;
     }
@@ -743,10 +869,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       xhr.setRequestHeader('Cache-Control', 'no-store');
     }
 
-    if (context.rangeEnd) {
+    if (this.hasByteRange(context)) {
       xhr.setRequestHeader(
         'Range',
-        'bytes=' + context.rangeStart + '-' + (context.rangeEnd - 1),
+        'bytes=' + context.rangeStart + '-' + (context.rangeEnd! - 1),
       );
     }
 
@@ -754,8 +880,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     xhr.onprogress = this.onProgress.bind(this);
     xhr.onerror = () => this.onNetworkError(xhr, url);
 
+    this.attemptStartTime = self.performance.now();
     self.clearTimeout(this.requestTimeout);
-    this.requestTimeout = self.setTimeout(() => this.onTimeout(url), timeout);
+    this.requestTimeout = self.setTimeout(
+      () => this.onTimeout(url, xhr),
+      timeout,
+    );
 
     xhr.send();
 
@@ -771,9 +901,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       if (stats.loading.first === 0) {
         stats.loading.first = Math.max(
           self.performance.now(),
-          stats.loading.start,
+          this.attemptStartTime,
         );
-        const ttfb = stats.loading.first - stats.loading.start;
+        const ttfb = stats.loading.first - this.attemptStartTime;
         const finalUrl = xhr.responseURL || currentUrl;
         const wasRedirected = finalUrl !== currentUrl;
 
@@ -792,12 +922,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
             // Already over budget by first-byte time — fire timeout
             // asynchronously to unwind the current onreadystatechange cleanly.
             this.requestTimeout = self.setTimeout(
-              () => this.onTimeout(currentUrl),
+              () => this.onTimeout(currentUrl, xhr),
               0,
             );
           } else {
             this.requestTimeout = self.setTimeout(
-              () => this.onTimeout(currentUrl),
+              () => this.onTimeout(currentUrl, xhr),
               remaining,
             );
           }
@@ -815,52 +945,42 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         if (status >= 200 && status < 300) {
           const data = xhr.response;
           if (data != null) {
-            // Detect browser-initiated Range requests (from cache) BEFORE
-            // touching stats.loading.end so failback timing stays clean.
-            // If we got HTTP 206 but didn't request a range ourselves,
-            // the browser auto-added Range header from stale cache.
-            const weRequestedRange = !!(context.rangeStart || context.rangeEnd);
+            // An application request without Range must never accept 206.
+            // Browsers can synthesize it while serving a stale partial cache;
+            // Content-Range is often hidden by CORS, so its visibility cannot
+            // be part of the detection. This is a per-request browser/cache
+            // anomaly, not evidence that the original CDN is unavailable.
+            const weRequestedRange = this.hasByteRange(context);
             if (status === 206 && !weRequestedRange) {
-              // Parse Content-Range header to check if we got partial data
-              // Format: "bytes 15592-15592/2624292" or "bytes 0-1023/2624292"
-              const contentRange = xhr.getResponseHeader('Content-Range');
-              if (contentRange) {
-                const match = contentRange.match(
-                  /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i,
-                );
-                if (match) {
-                  const rangeStart = parseInt(match[1], 10);
-                  const rangeEnd = parseInt(match[2], 10);
-                  const totalSize =
-                    match[3] === '*' ? -1 : parseInt(match[3], 10);
-                  const receivedBytes = rangeEnd - rangeStart + 1;
+              this.handleUnexpectedRangeResponse(xhr, currentUrl);
+              return;
+            }
 
-                  // If total size is known and we didn't get the full file, it's a cache issue
-                  if (totalSize > 0 && receivedBytes < totalSize) {
-                    logger.log(
-                      `[FailbackLoader] CACHE RANGE ISSUE DETECTED:` +
-                        `\n  url: ${currentUrl}` +
-                        `\n  status: 206 Partial Content (browser-initiated)` +
-                        `\n  Content-Range: ${contentRange}` +
-                        `\n  received: ${receivedBytes} bytes, total: ${totalSize} bytes` +
-                        `\n  ACTION: Treating as error, will try failback`,
-                    );
-                    // Treat this as an error - trigger failback
-                    this.handleError(xhr, currentUrl, 206);
-                    return;
-                  }
-                }
-              }
+            const len =
+              xhr.responseType === 'arraybuffer'
+                ? data.byteLength
+                : data.length;
+
+            const responseIntegrityError = this.getResponseIntegrityError(
+              xhr,
+              context,
+              status,
+              len,
+            );
+            if (responseIntegrityError) {
+              this.handleInvalidResponse(
+                xhr,
+                currentUrl,
+                status,
+                responseIntegrityError,
+              );
+              return;
             }
 
             stats.loading.end = Math.max(
               self.performance.now(),
               stats.loading.first,
             );
-            const len =
-              xhr.responseType === 'arraybuffer'
-                ? data.byteLength
-                : data.length;
 
             stats.loaded = stats.total = len;
             stats.bwEstimate =
@@ -989,7 +1109,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  loaded: ${this.stats.loaded} bytes`,
     );
 
-    this.recordOriginalSourceFailure('Original source failed');
+    this.recordSourceFailure(currentUrl, 'Source failed');
 
     this.tryFailbackOrComplete(currentUrl, () => {
       this.callbacks?.onError?.(
@@ -1001,7 +1121,136 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     });
   }
 
-  private onTimeout(currentUrl: string) {
+  /**
+   * Validate that a terminal XHR contains the byte range it claims to contain.
+   * A middlebox can close a 200 response after a small prefix while XHR still
+   * exposes the resulting ArrayBuffer as a successful response.
+   */
+  private getResponseIntegrityError(
+    xhr: XMLHttpRequest,
+    context: FragmentLoaderContext,
+    status: number,
+    responseLength: number,
+  ): string | null {
+    const contentEncoding = xhr.getResponseHeader('Content-Encoding');
+    const contentLength = xhr.getResponseHeader('Content-Length');
+
+    // Content-Length describes encoded bytes. XHR decodes content, so only
+    // compare lengths when the response is unencoded (as media normally is).
+    if (
+      contentLength &&
+      (!contentEncoding || contentEncoding.toLowerCase() === 'identity')
+    ) {
+      const expectedLength = Number(contentLength);
+      if (
+        Number.isSafeInteger(expectedLength) &&
+        expectedLength >= 0 &&
+        responseLength !== expectedLength
+      ) {
+        return `response body is ${responseLength} bytes but Content-Length is ${expectedLength}`;
+      }
+    }
+
+    if (!this.hasByteRange(context)) {
+      return null;
+    }
+
+    const expectedLength = context.rangeEnd! - context.rangeStart!;
+    if (expectedLength >= 0 && responseLength !== expectedLength) {
+      return `range body is ${responseLength} bytes but requested range requires ${expectedLength}`;
+    }
+
+    if (status !== 206) {
+      return null;
+    }
+
+    const contentRange = xhr.getResponseHeader('Content-Range');
+    // Content-Range is not CORS-safelisted. Correct range responses from a
+    // CDN which does not expose it remain valid if their body length matches.
+    if (!contentRange) {
+      return null;
+    }
+
+    const match = contentRange.match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+    if (!match) {
+      return '206 response has an invalid Content-Range header';
+    }
+
+    const responseStart = Number(match[1]);
+    const responseEnd = Number(match[2]);
+    if (
+      responseStart !== context.rangeStart ||
+      responseEnd !== context.rangeEnd! - 1
+    ) {
+      return `response range ${responseStart}-${responseEnd} does not match requested range ${context.rangeStart}-${context.rangeEnd! - 1}`;
+    }
+
+    return null;
+  }
+
+  private handleUnexpectedRangeResponse(
+    xhr: XMLHttpRequest,
+    currentUrl: string,
+  ) {
+    const contentRange = xhr.getResponseHeader('Content-Range');
+    logger.log(
+      `[FailbackLoader] UNEXPECTED PARTIAL RESPONSE:` +
+        `\n  status: 206 Partial Content` +
+        `\n  url: ${currentUrl}` +
+        `\n  Content-Range: ${contentRange || '(not exposed to JavaScript)'}` +
+        `\n  ACTION: Treating as a browser/cache error, will try failback`,
+    );
+
+    // Do not update origin health here. The browser may have generated this
+    // response from a poisoned cache without the network request reaching the
+    // CDN, so permanent failback would be a false attribution.
+    this.tryFailbackOrComplete(currentUrl, () => {
+      this.callbacks?.onError?.(
+        { code: 206, text: 'Unexpected Partial Content response' },
+        this.context as FragmentLoaderContext,
+        xhr,
+        this.stats,
+      );
+    });
+  }
+
+  private handleInvalidResponse(
+    xhr: XMLHttpRequest,
+    currentUrl: string,
+    status: number,
+    reason: string,
+  ) {
+    this.stopStallCheck();
+    logger.log(
+      `[FailbackLoader] INCOMPLETE RESPONSE:` +
+        `\n  status: ${status} ${xhr.statusText}` +
+        `\n  url: ${currentUrl}` +
+        `\n  attempt: ${this.failbackAttempt}` +
+        `\n  reason: ${reason}` +
+        `\n  ACTION: Treating as an error, will try failback`,
+    );
+
+    this.recordSourceFailure(
+      currentUrl,
+      'Source returned an incomplete response',
+      true,
+    );
+
+    this.tryFailbackOrComplete(currentUrl, () => {
+      this.callbacks?.onError?.(
+        { code: status, text: reason },
+        this.context as FragmentLoaderContext,
+        xhr,
+        this.stats,
+      );
+    });
+  }
+
+  private onTimeout(currentUrl: string, xhr?: XMLHttpRequest) {
+    if (xhr && this.loader !== xhr) {
+      return;
+    }
+
     const state = getSessionState(this.config);
     const elapsed = self.performance.now() - this.stats.loading.start;
     const loaded = this.stats.loaded || 0;
@@ -1017,7 +1266,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    this.recordOriginalSourceFailure('Original source timeout');
+    this.recordSourceFailure(
+      currentUrl,
+      'Source timeout',
+      this.stats.loading.first !== 0 || this.stats.loaded > 0,
+    );
 
     this.tryFailbackOrComplete(
       currentUrl,
@@ -1056,7 +1309,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    this.recordOriginalSourceFailure('Original source network error');
+    this.recordSourceFailure(
+      currentUrl,
+      'Source network error',
+      this.stats.loading.first !== 0 || this.stats.loaded > 0,
+    );
 
     this.tryFailbackOrComplete(currentUrl, () => {
       this.callbacks?.onError?.(
