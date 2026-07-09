@@ -1,10 +1,14 @@
 # MacOS
 .DS_Store
 
+# Chrome net-export logs
+chrome-net-export-log*.json
+
 # npm
 node_modules/*
 npm-debug.log
 bower_components/*
+
 
 # NYC
 .nyc_output/
