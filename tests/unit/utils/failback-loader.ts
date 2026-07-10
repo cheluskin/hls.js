@@ -7,6 +7,7 @@ import FailbackLoader, {
   destroyFailbackState,
   getExtendedFailbackState,
   getFailbackState,
+  resetFailbackState,
 } from '../../../src/utils/failback-loader';
 import { logger } from '../../../src/utils/logger';
 import type { HlsConfig } from '../../../src/config';
@@ -782,6 +783,103 @@ describe('FailbackLoader tests', function () {
       });
 
       clock.tick(12000);
+    });
+
+    it('should make quarantined backups available after failback state resets', function (done) {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        failbackHostCooldownMs: 30000,
+      };
+
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const requestedUrls: string[] = [];
+      let firstLoad = true;
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestedUrls.push(xhr.url);
+        if (firstLoad) {
+          self.setTimeout(() => {
+            xhr.readyState = 2;
+            xhr.status = 200;
+            xhr.onreadystatechange?.();
+            xhr.onprogress?.(
+              new ProgressEvent('progress', { loaded: 1360, total: 1000000 }),
+            );
+          }, 10);
+          return;
+        }
+
+        self.setTimeout(() => {
+          if (xhr.url.includes('cdn.example.com')) {
+            xhr.simulateResponse(500, null);
+          } else {
+            xhr.simulateResponse(200, new ArrayBuffer(1000), {
+              'Content-Length': '1000',
+            });
+          }
+        }, 10);
+      };
+
+      const loader1 = new FailbackLoader(config);
+      loader1.load(context, loaderConfig, {
+        onSuccess: () => done(new Error('Unexpected success')),
+        onError: () => done(new Error('Unexpected error')),
+        onTimeout: () => {
+          expect(requestedUrls).to.deep.equal([
+            'https://cdn.example.com/video/segment.ts',
+            'https://failback.example.com/video/segment.ts',
+          ]);
+          loader1.destroy();
+          resetFailbackState(config);
+          firstLoad = false;
+
+          const loader2 = new FailbackLoader(config);
+          loader2.load(
+            { ...context, url: 'https://cdn.example.com/video/segment2.ts' },
+            loaderConfig,
+            {
+              onSuccess: (response) => {
+                expect(response.url).to.include('failback.example.com');
+                expect(requestedUrls).to.deep.equal([
+                  'https://cdn.example.com/video/segment.ts',
+                  'https://failback.example.com/video/segment.ts',
+                  'https://cdn.example.com/video/segment2.ts',
+                  'https://failback.example.com/video/segment2.ts',
+                ]);
+                loader2.destroy();
+                done();
+              },
+              onError: (error) => done(new Error(error.text)),
+              onTimeout: () => done(new Error('Unexpected timeout')),
+              onAbort: () => {},
+              onProgress: () => {},
+            },
+          );
+        },
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+
+      clock.tick(12000);
+      clock.tick(100);
     });
   });
 

@@ -610,7 +610,7 @@ const state = getFailbackState(hls.config);
 console.log(state);
 // { consecutiveFailures: 2, permanentMode: true, threshold: 2 }
 
-// Сброс состояния (вернуться к оригинальному источнику)
+// Сброс состояния (вернуться к оригинальному источнику и очистить quarantine backup-хостов)
 resetFailbackState(hls.config);
 ```
 

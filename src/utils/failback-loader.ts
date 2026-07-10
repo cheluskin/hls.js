@@ -126,6 +126,10 @@ export function resetFailbackState(config: HlsConfig): void {
 
   state.permanentFailbackMode = false;
   state.fragmentsSinceLastProbe = 0;
+  // A verified recovery starts a new failback cycle. Keep no cooldown from the
+  // previous outage: otherwise every backup that failed before recovery stays
+  // unavailable when the original fails again immediately afterwards.
+  state.unhealthyFailbackHosts.clear();
 
   if (wasInPermanentMode) {
     state.consecutiveOriginalFailures = PERMANENT_FAILBACK_THRESHOLD - 1;
