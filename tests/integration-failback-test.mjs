@@ -1477,9 +1477,9 @@ await test('Recovery probe uses xhrSetup when probing original CDN', async () =>
 
           if (originalRequestCount === 3) {
             probeAuthSeen = this._requestHeaders['X-Test-Auth'] === 'token';
-            this.status = 200;
+            this.status = 206;
             this.statusText = 'OK';
-            this.response = new ArrayBuffer(1024);
+            this.response = new ArrayBuffer(16 * 1024);
           } else {
             this.status = 500;
             this.statusText = 'Server Error';

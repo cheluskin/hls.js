@@ -4,7 +4,10 @@ import {
   preloadFailbackHosts as preloadResolvedFailbackHosts,
 } from './failback-host-resolver';
 import { applyHostToUrl, normalizeHosts } from './failback-host-utils';
-import { probeOriginalCDN } from './failback-recovery-probe';
+import {
+  probeOriginalCDN,
+  RECOVERY_PROBE_MAX_BYTES,
+} from './failback-recovery-probe';
 import { logger } from './logger';
 import { LoadStats } from '../loader/load-stats';
 import type { HlsConfig } from '../config';
@@ -27,6 +30,7 @@ interface FailbackSessionState {
   threshold: number;
   fragmentsSinceLastProbe: number;
   lastSuccessfulOriginalUrl: string | null;
+  lastSuccessfulOriginalLength: number | null;
   lastSuccessfulOriginalUrlOrder: number;
   nextRequestOrder: number;
   isProbeInProgress: boolean;
@@ -59,6 +63,7 @@ function getSessionState(config: HlsConfig): FailbackSessionState {
       threshold: PERMANENT_FAILBACK_THRESHOLD,
       fragmentsSinceLastProbe: 0,
       lastSuccessfulOriginalUrl: null,
+      lastSuccessfulOriginalLength: null,
       lastSuccessfulOriginalUrlOrder: 0,
       nextRequestOrder: 0,
       isProbeInProgress: false,
@@ -96,6 +101,7 @@ export function getExtendedFailbackState(config: HlsConfig): {
   fragmentsSinceLastProbe: number;
   probeEveryNFragments: number;
   lastSuccessfulOriginalUrl: string | null;
+  lastSuccessfulOriginalLength: number | null;
   isProbeInProgress: boolean;
 } {
   const state = getSessionState(config);
@@ -106,6 +112,7 @@ export function getExtendedFailbackState(config: HlsConfig): {
     fragmentsSinceLastProbe: state.fragmentsSinceLastProbe,
     probeEveryNFragments: PROBE_EVERY_N_FRAGMENTS,
     lastSuccessfulOriginalUrl: state.lastSuccessfulOriginalUrl,
+    lastSuccessfulOriginalLength: state.lastSuccessfulOriginalLength,
     isProbeInProgress: state.isProbeInProgress,
   };
 }
@@ -179,8 +186,29 @@ function tryRecoverToOriginalCDN(
   );
 
   const urlToProbe = state.lastSuccessfulOriginalUrl;
+  const knownLength = state.lastSuccessfulOriginalLength;
+  // The probe must exceed the short prefix that a TSPU can leak before
+  // blackholing a response. A smaller previous segment is not enough evidence
+  // to recover, so it deliberately keeps the full validation length.
+  const probeLength = RECOVERY_PROBE_MAX_BYTES;
+  const probeStart =
+    typeof knownLength === 'number' && knownLength > probeLength
+      ? knownLength - probeLength
+      : 0;
+  const probeEnd = probeStart + probeLength;
 
-  probeOriginalCDN(config, urlToProbe, PROBE_TIMEOUT_MS, headers)
+  logger.log(
+    `[FailbackLoader] Validating original CDN range: bytes=${probeStart}-${probeEnd - 1}`,
+  );
+
+  probeOriginalCDN(
+    config,
+    urlToProbe,
+    PROBE_TIMEOUT_MS,
+    headers,
+    probeStart,
+    probeEnd,
+  )
     .then((isAlive) => {
       // Re-check conditions after async probe - state may have changed
       if (!state.permanentFailbackMode) {
@@ -1013,6 +1041,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
             if (this.requestOrder >= state.lastSuccessfulOriginalUrlOrder) {
               const wasNull = !state.lastSuccessfulOriginalUrl;
               state.lastSuccessfulOriginalUrl = this.originalUrl;
+              state.lastSuccessfulOriginalLength = len;
               state.lastSuccessfulOriginalUrlOrder = this.requestOrder;
 
               if (wasNull) {

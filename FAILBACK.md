@@ -621,8 +621,8 @@ resetFailbackState(hls.config);
 **Как это работает:**
 
 1. Каждые **6 фрагментов** в режиме permanent failback запускается probe основного CDN
-2. Выполняется Range-запрос первых 1KB с основного CDN (таймаут 3 сек)
-3. Если запрос успешен — переключаемся обратно на основной CDN
+2. Выполняется Range-запрос 16KiB с основного CDN (предпочтительно хвост последнего успешно загруженного сегмента), таймаут 3 сек
+3. Возврат происходит только после `206 Partial Content` и получения **всего** запрошенного диапазона; если CORS открывает `Content-Range`, он также обязан совпадать с запросом. Одних headers или нескольких первых байт недостаточно
 4. При первой же ошибке на основном CDN — мгновенно возвращаемся в permanent failback mode
 
 **Защита от проблем:**
@@ -636,7 +636,7 @@ resetFailbackState(hls.config);
 │  Permanent Failback Mode                                    │
 │                                                             │
 │  Каждые 6 фрагментов:                                       │
-│  └── Probe 1KB с основного CDN                              │
+│  └── Проверка полного Range до 16KiB с основного CDN         │
 │      ├── Успех → выход из permanent mode                    │
 │      │           (первый фейл вернёт обратно)               │
 │      └── Провал → остаёмся в permanent mode                 │
@@ -755,7 +755,7 @@ Per-fragment логи (`LOAD START`, `LOADING`, `RESPONSE HEADERS RECEIVED`, `SU
 [FailbackLoader] Recovery skipped - probe already in progress
 [FailbackLoader] Probing original CDN: https://origin.example.com/seg.ts
 [FailbackLoader] Probe xhr starting: https://origin.example.com/seg.ts
-[FailbackLoader] Probe response: status=206, success=true
+[FailbackLoader] Probe response: status=206, bytes=16384/16384, content-range=bytes 0-16383/2624292, success=true
 [FailbackLoader] ✓ Original CDN recovered - switching back (first fail will return to permanent)
 [FailbackLoader] State reset - will try original source (failures=1, first fail returns to permanent)
 [FailbackLoader] ✗ Original CDN still unavailable

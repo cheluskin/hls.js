@@ -11,6 +11,8 @@ class ProbeMockXMLHttpRequest {
 
   public readyState: number = 0;
   public status: number = 0;
+  public response: ArrayBuffer | null = null;
+  public responseType: XMLHttpRequestResponseType = '';
   public responseURL: string = '';
   public onreadystatechange: (() => void) | null = null;
   public onerror: (() => void) | null = null;
@@ -69,9 +71,10 @@ describe('failback-recovery-probe', function () {
     clock.restore();
   });
 
-  it('should use fetch when xhrSetup is not configured and merge headers', async function () {
+  it('should validate the full fetch probe range and preserve non-Range headers', async function () {
     const fetchResponse = {
       status: 206,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(16 * 1024)),
     };
     const config = createConfig();
     const fetchStub = sinon.stub().resolves(fetchResponse as Response);
@@ -83,6 +86,7 @@ describe('failback-recovery-probe', function () {
       3000,
       {
         Authorization: 'Bearer token',
+        range: 'bytes=0-0',
       },
     );
 
@@ -91,8 +95,61 @@ describe('failback-recovery-probe', function () {
 
     const options = fetchStub.firstCall.args[1];
     expect(options.method).to.equal('GET');
-    expect(options.headers.Range).to.equal('bytes=0-1023');
+    expect(options.headers.Range).to.equal('bytes=0-16383');
+    expect(options.headers.range).to.equal(undefined);
     expect(options.headers.Authorization).to.equal('Bearer token');
+  });
+
+  it('should not recover when fetch resolves at headers but body stalls', async function () {
+    const config = createConfig();
+    const fetchResponse = {
+      status: 206,
+      arrayBuffer: () => new Promise<ArrayBuffer>(() => {}),
+    };
+    self.fetch = sinon
+      .stub()
+      .resolves(
+        fetchResponse as unknown as Response,
+      ) as unknown as typeof fetch;
+
+    const resultPromise = probeOriginalCDN(
+      config,
+      'https://origin.example.com/segment.ts',
+      3000,
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    clock.tick(3000);
+
+    expect(await resultPromise).to.equal(false);
+  });
+
+  it('should reject an exposed Content-Range for other bytes', async function () {
+    const config = createConfig();
+    const fetchResponse = {
+      status: 206,
+      headers: {
+        get: () => 'bytes 0-16383/1048576',
+      },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(16 * 1024)),
+    };
+    self.fetch = sinon
+      .stub()
+      .resolves(
+        fetchResponse as unknown as Response,
+      ) as unknown as typeof fetch;
+
+    expect(
+      await probeOriginalCDN(
+        config,
+        'https://origin.example.com/segment.ts',
+        3000,
+        undefined,
+        16384,
+        32768,
+      ),
+    ).to.equal(false);
   });
 
   it('should return false when fetch probe rejects', async function () {
@@ -121,7 +178,8 @@ describe('failback-recovery-probe', function () {
     config.xhrSetup = xhrSetup;
 
     ProbeMockXMLHttpRequest.onSend = (xhr) => {
-      xhr.status = 200;
+      xhr.status = 206;
+      xhr.response = new ArrayBuffer(16 * 1024);
       xhr.readyState = 4;
       xhr.onreadystatechange?.();
     };
@@ -143,8 +201,31 @@ describe('failback-recovery-probe', function () {
 
     const xhr = ProbeMockXMLHttpRequest.instances[0];
     expect(xhr.url).to.equal('https://origin.example.com/segment.ts');
-    expect(xhr.requestHeaders.get('range')).to.equal('bytes=0-1023');
+    expect(xhr.requestHeaders.get('range')).to.equal('bytes=0-16383');
     expect(xhr.requestHeaders.get('x-test')).to.equal('1');
+    expect(xhr.responseType).to.equal('arraybuffer');
+  });
+
+  it('should reject an XHR probe with a truncated body', async function () {
+    self.XMLHttpRequest =
+      ProbeMockXMLHttpRequest as unknown as typeof XMLHttpRequest;
+    const config = createConfig();
+    config.xhrSetup = () => undefined;
+
+    ProbeMockXMLHttpRequest.onSend = (xhr) => {
+      xhr.status = 206;
+      xhr.response = new ArrayBuffer(1360);
+      xhr.readyState = 4;
+      xhr.onreadystatechange?.();
+    };
+
+    expect(
+      await probeOriginalCDN(
+        config,
+        'https://origin.example.com/segment.ts',
+        3000,
+      ),
+    ).to.equal(false);
   });
 
   it('should return false on xhr probe timeout and abort the request', async function () {
