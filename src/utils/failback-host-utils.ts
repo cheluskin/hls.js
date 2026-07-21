@@ -4,7 +4,7 @@ export function normalizeHost(host: string): string | null {
     return null;
   }
 
-  if (trimmed.includes('://') || trimmed.startsWith('//')) {
+  if (trimmed.indexOf('://') !== -1 || trimmed.startsWith('//')) {
     try {
       const parsed = new URL(
         trimmed.startsWith('//') ? `https:${trimmed}` : trimmed,

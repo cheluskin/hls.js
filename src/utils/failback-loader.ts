@@ -238,6 +238,7 @@ function tryRecoverToOriginalCDN(
     probeEnd,
   )
     .then((isAlive) => {
+      state.isProbeInProgress = false;
       // Re-check conditions after async probe - state may have changed
       if (!state.permanentFailbackMode) {
         logger.log(
@@ -256,10 +257,8 @@ function tryRecoverToOriginalCDN(
       }
     })
     .catch(() => {
-      logger.log('[FailbackLoader] ✗ Original CDN probe failed');
-    })
-    .finally(() => {
       state.isProbeInProgress = false;
+      logger.log('[FailbackLoader] ✗ Original CDN probe failed');
     });
 }
 
