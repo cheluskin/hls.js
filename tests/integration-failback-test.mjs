@@ -2361,8 +2361,494 @@ await test('Exhaustion error callback receives XHR of the retained failure', asy
 });
 
 // ----------------------------------------
-// Summary
+// Test 30: TSPU Blackhole & Staggered Hedging
 // ----------------------------------------
+await test('TSPU Blackhole: leading request silent, hedged candidate succeeds', async () => {
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+
+  let originCreated = false;
+  let backupCreated = false;
+
+  class HedgingXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+      if (url.includes('origin.example.com')) {
+        originCreated = true;
+      } else if (url.includes('backup.example.com')) {
+        backupCreated = true;
+      }
+    }
+    setRequestHeader() {}
+    send() {
+      if (this.responseURL.includes('backup.example.com')) {
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 200;
+          this.response = new ArrayBuffer(2000);
+          this.onreadystatechange?.();
+        }, 20);
+      }
+      // origin stays silent (blackholed)
+    }
+    abort() {}
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = HedgingXHR;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: true,
+      hedgeDelayMs: 30,
+      firstByteTimeoutMs: 300,
+      silentRetriesPerHost: 0,
+    },
+  };
+
+  const loader = new FailbackLoader(config);
+  let loadedUrl = '';
+
+  try {
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/blackhole.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            loadedUrl = response.url;
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(originCreated, 'Origin request should be initiated');
+    assert.ok(
+      backupCreated,
+      'Hedged backup request should be initiated after delay',
+    );
+    assert.ok(
+      loadedUrl.includes('backup.example.com'),
+      'Should succeed via backup',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 31: TSPU Data Stall / Low-Speed Trickle Detection
+// ----------------------------------------
+await test('TSPU Data Stall: trickle after headers triggers stall failover', async () => {
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+
+  let originAborted = false;
+
+  class TrickleXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+    }
+    setRequestHeader() {}
+    send() {
+      if (this.responseURL.includes('origin.example.com')) {
+        // Headers arrive quickly, then progress trickles slowly
+        setTimeout(() => {
+          this.readyState = 2;
+          this.status = 200;
+          this.onreadystatechange?.();
+          this.onprogress?.({
+            loaded: 100,
+            total: 100000,
+            lengthComputable: true,
+          });
+        }, 10);
+        // No further progress (stall)
+      } else {
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 200;
+          this.response = new ArrayBuffer(5000);
+          this.onreadystatechange?.();
+        }, 10);
+      }
+    }
+    abort() {
+      if (this.responseURL.includes('origin.example.com')) {
+        originAborted = true;
+      }
+    }
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = TrickleXHR;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: false,
+      firstByteTimeoutMs: 500,
+      dataStallTimeoutMs: 100,
+      silentRetriesPerHost: 0,
+    },
+  };
+
+  const loader = new FailbackLoader(config);
+  let successUrl = '';
+
+  try {
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/trickle.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            successUrl = response.url;
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(originAborted, 'Stalled origin request should be aborted');
+    assert.ok(
+      successUrl.includes('backup.example.com'),
+      'Should failover to backup after stall',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 32: Probabilistic Blackhole Fresh-Connection Retry
+// ----------------------------------------
+await test('Probabilistic Blackhole: requeues silent host for fresh-connection retry', async () => {
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+
+  let backupAttempts = 0;
+
+  class RetryXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+      if (url.includes('backup.example.com')) {
+        backupAttempts++;
+      }
+    }
+    setRequestHeader() {}
+    send() {
+      if (this.responseURL.includes('origin.example.com')) {
+        // Origin fails with 500 immediately
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 500;
+          this.onreadystatechange?.();
+        }, 5);
+      } else if (backupAttempts === 1) {
+        // Backup 1st attempt: silent (blackholed)
+      } else {
+        // Backup 2nd attempt: succeeds!
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 200;
+          this.response = new ArrayBuffer(1000);
+          this.onreadystatechange?.();
+        }, 10);
+      }
+    }
+    abort() {}
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = RetryXHR;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: false,
+      firstByteTimeoutMs: 50,
+      silentRetriesPerHost: 1,
+    },
+  };
+
+  const loader = new FailbackLoader(config);
+  let successUrl = '';
+
+  try {
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/segment.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            successUrl = response.url;
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.equal(
+      backupAttempts,
+      2,
+      'Backup host should be retried on fresh connection after silent failure',
+    );
+    assert.ok(
+      successUrl.includes('backup.example.com'),
+      'Should succeed on second backup attempt',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 33: Host Quarantine Rules (HTTP 503 vs Silent)
+// ----------------------------------------
+await test('Host Quarantine Rules: HTTP 503 quarantines host, silent blackhole does not', async () => {
+  const { FailbackLoader, getFailbackState, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+
+  let triedHosts = [];
+
+  class QuarantineRuleXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+      triedHosts.push(url);
+    }
+    setRequestHeader() {}
+    send() {
+      if (this.responseURL.includes('origin.example.com')) {
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 500;
+          this.onreadystatechange?.();
+        }, 5);
+      } else if (this.responseURL.includes('backup1.example.com')) {
+        // HTTP 503 error -> triggers quarantine
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 503;
+          this.statusText = 'Service Unavailable';
+          this.onreadystatechange?.();
+        }, 5);
+      } else {
+        // backup2 succeeds
+        setTimeout(() => {
+          this.readyState = 4;
+          this.status = 200;
+          this.response = new ArrayBuffer(1000);
+          this.onreadystatechange?.();
+        }, 5);
+      }
+    }
+    abort() {}
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = QuarantineRuleXHR;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup1.example.com', 'backup2.example.com'],
+      hedge: false,
+      failbackHostCooldownMs: 60000,
+      silentRetriesPerHost: 0,
+    },
+  };
+
+  const loader1 = new FailbackLoader(config);
+
+  try {
+    // Load 1: origin fails, backup1 returns 503 (quarantined), backup2 succeeds
+    await new Promise((resolve) => {
+      loader1.load(
+        {
+          url: 'https://origin.example.com/seg1.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: () => resolve(),
+          onError: () => resolve(),
+          onTimeout: () => resolve(),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    triedHosts = [];
+    const loader2 = new FailbackLoader(config);
+
+    // Load 2: backup1 should be skipped due to active quarantine
+    await new Promise((resolve) => {
+      loader2.load(
+        {
+          url: 'https://origin.example.com/seg2.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: () => resolve(),
+          onError: () => resolve(),
+          onTimeout: () => resolve(),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    const hitBackup1InLoad2 = triedHosts.some((h) =>
+      h.includes('backup1.example.com'),
+    );
+    assert.equal(
+      hitBackup1InLoad2,
+      false,
+      'Backup1 should be skipped in load 2 because it was quarantined by HTTP 503',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader1.destroy();
+  }
+});
 
 console.log('\n===== Test Summary =====\n');
 console.log(`Total: ${passed + failed} tests`);
