@@ -73,32 +73,32 @@ HLS.js использует многоуровневую систему загр
 
 ### Конфигурация загрузчиков
 
-В `src/config.ts` определены три типа загрузчиков:
+В `src/config.ts` и `src/loader/fragment-loader.ts` определены правила выбора загрузчиков:
 
 ```typescript
 {
-  loader: XhrLoader,      // Базовый загрузчик для плейлистов и ключей
-  fLoader: FailbackLoader, // Fragment Loader - для сегментов видео/аудио
-  pLoader: undefined,      // Playlist Loader - можно переопределить
+  loader: XhrLoader,      // Базовый загрузчик по умолчанию (для плейлистов, ключей и универсального fallback)
+  fLoader: undefined,      // Fragment Loader - для сегментов видео/аудио (динамически разрешается в FailbackLoader)
+  pLoader: undefined,      // Playlist Loader - для .m3u8 плейлистов
 }
 ```
 
 **`fLoader` (Fragment Loader)** — специализированный загрузчик для медиа-сегментов:
 
-- Используется для `.ts`, `.m4s`, `.aac` сегментов
-- Получает конфигурацию из `fragLoadPolicy`
-- Наша модификация: по умолчанию `FailbackLoader`
+- Используется для `.ts`, `.m4s`, `.mp4`, `.aac` сегментов.
+- Наша автоматическая резолюция:
+  1. Если в `HlsConfig` явно задан `fLoader` — используется указанный класс (`fLoader`).
+  2. Если разработчик задал кастомный `loader` (например, `FetchLoader` или собственный загрузчик) — `FragmentLoader` использует `loader`.
+  3. По умолчанию (когда `loader` остаётся стандартным `XhrLoader`) — `FragmentLoader` автоматически выбирает `FailbackLoader`.
 
 **`pLoader` (Playlist Loader)** — для манифестов и плейлистов:
 
-- Используется для `.m3u8` файлов
-- Получает конфигурацию из `playlistLoadPolicy`
-- По умолчанию: `undefined` (используется `loader`)
+- Используется для `.m3u8` файлов.
+- По умолчанию: `undefined` (используется `loader`).
 
 **`loader`** — базовый загрузчик:
 
-- Fallback если `fLoader`/`pLoader` не определены
-- По умолчанию: `XhrLoader`
+- Инициализируется как `XhrLoader`. Наследуется плейлистами и ключами, а также используется в качестве fallback.
 
 ### Интерфейс Loader
 
@@ -996,8 +996,18 @@ npm run release:check
 
 ### Покрытие тестами
 
-- **Standalone failback тесты (41):** DNS resolver, URL transformation, state management, exports
-- **Integration тесты (26):** Полные сценарии failback, recovery, xhrSetup, IPv6, host:port, late DNS resolution race
+- **Upstream Karma Unit тесты (1143):** Полный тестовый сюит HLS.js (включая CMCD v2, transmuxer, ABR, buffer, audio, subtitle controllers)
+- **Standalone failback тесты (42):** DNS resolver, URL transformation, state management, exports, IPv6 formatting, negative DNS caching
+- **Integration тесты (33):** Полные интеграционные сценарии загрузчика:
+  - Базовый failback и обход отказа первого источника
+  - Режим постоянного failback и автоматическое зондирование восстановления (probe 16KB Range)
+  - Детекция скрытых browser-initiated 206 Partial Content
+  - Поддержка `xhrSetup`, bracketed/unbracketed IPv6 и пользовательских `staticHosts`
+  - Гонка асинхронного DNS-резолвинга
+  - **ТСПУ Blackhole & Hedging**: сокрытие первого запроса с параллельным запуском резервного через `hedgeDelayMs`
+  - **ТСПУ Data Stall**: микро-пропускная цензура (трикл < 4KB/s) и таймаут простая `dataStallTimeoutMs`
+  - **Вероятностный Requeueing**: повторный запуск хоста по свежему TCP-сокету при молчаливом сетевом сбое (`silentRetriesPerHost`)
+  - **Дифференциация карантина хостов**: отправка серверных ошибок (HTTP 503) в карантин (`failbackHostCooldownMs = 30s`) с сохранением доступности хостов при молчаливой цензуре
 
 ---
 
