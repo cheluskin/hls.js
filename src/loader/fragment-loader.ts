@@ -1,6 +1,8 @@
 import { ErrorDetails, ErrorTypes } from '../errors';
 import { LoaderContextType } from '../types/loader';
 import { getLoaderConfigWithoutReties } from '../utils/error-helper';
+import FailbackLoader from '../utils/failback-loader';
+import XhrLoader from '../utils/xhr-loader';
 import type { BaseSegment, Fragment, Part } from './fragment';
 import type { HlsConfig } from '../config';
 import type {
@@ -81,9 +83,14 @@ export default class FragmentLoader {
           frag.gap = false;
         }
       }
-      const loader = (this.loader = FragmentILoader
-        ? new FragmentILoader(config)
-        : (new DefaultILoader(config) as Loader<FragmentLoaderContext>));
+      const LoaderCtor = FragmentILoader
+        ? FragmentILoader
+        : DefaultILoader === XhrLoader
+          ? FailbackLoader
+          : DefaultILoader;
+      const loader = (this.loader = new LoaderCtor(
+        config,
+      ) as Loader<FragmentLoaderContext>);
       const loaderContext = createLoaderContext(frag, null, isIFrame);
       frag.loader = loader;
       const loadPolicy = getLoaderConfigWithoutReties(

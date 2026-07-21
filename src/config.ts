@@ -18,7 +18,6 @@ import { SubtitleStreamController } from './controller/subtitle-stream-controlle
 import SubtitleTrackController from './controller/subtitle-track-controller';
 import { TimelineController } from './controller/timeline-controller';
 import Cues from './utils/cues';
-import FailbackLoader, { type FailbackConfig } from './utils/failback-loader';
 import FetchLoader, { fetchSupported } from './utils/fetch-loader';
 import { requestMediaKeySystemAccess } from './utils/mediakeys-helper';
 import { clamp } from './utils/number';
@@ -44,6 +43,7 @@ import type {
   VideoSelectionOption,
 } from './types/media-playlist';
 import type { CuesInterface } from './utils/cues';
+import type { FailbackConfig } from './utils/failback-loader';
 import type { ILogger } from './utils/logger';
 import type { KeySystems, MediaKeyFunc } from './utils/mediakeys-helper';
 import type {
@@ -496,9 +496,7 @@ export const hlsDefaultConfig: HlsConfig = {
   appendTimeout: Infinity, // used by buffer-controller
   ignorePlaylistParsingErrors: false,
   loader: XhrLoader,
-  // loader: FetchLoader,
-  fLoader: FailbackLoader, // used by fragment-loader - FAILBACK ENABLED BY DEFAULT
-  pLoader: undefined, // used by playlist-loader
+  fLoader: undefined, // used by fragment-loader - defaults to FailbackLoader unless custom loader specified
   xhrSetup: undefined, // used by xhr-loader
   licenseXhrSetup: undefined, // used by eme-controller
   licenseResponseCallback: undefined, // used by eme-controller
