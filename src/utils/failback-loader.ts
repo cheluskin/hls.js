@@ -46,8 +46,32 @@ const failbackStates = new WeakMap<HlsConfig, FailbackSessionState>();
 const PERMANENT_FAILBACK_THRESHOLD = 2;
 const PROBE_EVERY_N_FRAGMENTS = 6;
 const PROBE_TIMEOUT_MS = 3000;
-const STALL_TIMEOUT_MS = 5000;
-const STALL_CHECK_INTERVAL_MS = 1000;
+
+// --- Censorship-resilience tuning (defaults, overridable via FailbackConfig) ---
+//
+// TSPU/DPI blocking observed in the wild lets the TLS handshake complete, then
+// blackholes the HTTP response after 0 or a few bytes. The connection stays
+// "open" but silent. A healthy CDN returns response headers in well under a
+// second, so a much shorter budget than the transport timeout lets us abandon
+// a blackholed attempt quickly instead of waiting the full maxTimeToFirstByte.
+const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 2500;
+// After the first byte arrives, a stream that goes silent (few-bytes-then-stall)
+// is the other half of the same attack. Abandon it quickly, too.
+const DEFAULT_DATA_STALL_TIMEOUT_MS = 3000;
+// Staggered hedging: if the leading attempt has produced no first byte within
+// this window, open the next candidate in parallel (without killing the slow
+// one — it may still be a slow-but-working link). Kept above realistic healthy
+// TTFB so a working CDN is never hedged, and so fast unit-test mocks that
+// respond in milliseconds keep strictly sequential behaviour.
+const DEFAULT_HEDGE_DELAY_MS = 1200;
+// Hard cap on simultaneously in-flight requests for one fragment.
+const DEFAULT_MAX_PARALLEL_ATTEMPTS = 3;
+// A silent (blackholed) host is worth retrying on a fresh connection because
+// the block is probabilistic. This bounds how many extra fresh-connection
+// retries each URL gets within a single fragment load.
+const DEFAULT_SILENT_RETRIES_PER_HOST = 2;
+
+const STALL_CHECK_INTERVAL_MS = 500;
 const MIN_SPEED_BYTES_PER_SEC = 4096;
 const DEFAULT_FAILBACK_HOST_COOLDOWN_MS = 30000;
 
@@ -283,10 +307,70 @@ export interface FailbackConfig {
    * always logged regardless. Default: false.
    */
   verbose?: boolean;
+
+  // ---- Censorship (TSPU/DPI) resilience ----
+  /**
+   * Enable staggered parallel hedging: if the leading request produces no first
+   * byte within `hedgeDelayMs`, the next candidate is launched in parallel and
+   * the fastest valid response wins. Default: true.
+   */
+  hedge?: boolean;
+  /**
+   * Delay before hedging the next candidate in parallel while the current one
+   * is still silent (no response headers). Default: 1200ms.
+   */
+  hedgeDelayMs?: number;
+  /**
+   * Abandon a single attempt that produced no response header/byte within this
+   * budget (blackhole detection). Clamped to the transport
+   * `maxTimeToFirstByteMs`. Default: 2500ms.
+   */
+  firstByteTimeoutMs?: number;
+  /**
+   * Abandon an attempt that received the first byte but then stalled (silence
+   * or sub-`4KB/s` trickle) for this long. Default: 3000ms.
+   */
+  dataStallTimeoutMs?: number;
+  /** Maximum simultaneously in-flight requests per fragment. Default: 3. */
+  maxParallelAttempts?: number;
+  /**
+   * How many extra fresh-connection retries each host gets after a silent
+   * (blackholed) failure within a single fragment load. HTTP errors are never
+   * retried on the same host. Default: 2.
+   */
+  silentRetriesPerHost?: number;
 }
 
 // Safety cap to prevent infinite loops if transformUrl never returns null
 const MAX_FAILBACK_ATTEMPTS = 32;
+// Absolute ceiling on launched requests for one fragment (covers hedging +
+// silent retries) so a total outage still terminates deterministically.
+const MAX_TOTAL_ATTEMPTS_PER_LOAD = 24;
+
+type AttemptFailureKind =
+  | 'silent' // no first byte at all (classic blackhole)
+  | 'stall' // started then went silent / trickled (truncated transfer)
+  | 'http' // server responded with a non-2xx status
+  | 'integrity' // 2xx/206 body did not match Content-Length / range
+  | 'partial' // browser-synthesized 206 from a poisoned cache
+  | 'network'; // transport error (onerror)
+
+interface Attempt {
+  xhr: XMLHttpRequest;
+  url: string;
+  isOriginal: boolean;
+  failbackNumber: number; // 0 for original, >=1 for failback hosts
+  startTime: number;
+  firstByteAt: number; // 0 until response headers arrive
+  loaded: number;
+  lastProgressTime: number;
+  lastSpeedCheckTime: number;
+  lastSpeedCheckBytes: number;
+  lowSpeedDuration: number;
+  monitorInterval?: number;
+  loadTimeout?: number;
+  settled: boolean;
+}
 
 class FailbackLoader implements Loader<FragmentLoaderContext> {
   private config: HlsConfig;
@@ -295,29 +379,30 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private callbacks: LoaderCallbacks<FragmentLoaderContext> | null = null;
   public context: FragmentLoaderContext | null = null;
   public stats: LoaderStats;
-  private failbackAttempt: number = 0;
-  private nextFailbackIndex: number = 0;
   private originalUrl: string = '';
   private attemptedOriginalRequest: boolean = false;
   private requestOrder: number = 0;
-  private requestTimeout?: number;
   private loaderConfig: LoaderConfiguration | null = null;
-  // `stats.loading.start` covers the entire logical load, including retries.
-  // Each CDN attempt needs an independent TTFB and download time budget.
-  private attemptStartTime: number = 0;
+  private finished: boolean = false;
 
-  // Stall detection
-  private lastProgressTime: number = 0;
-  private stallCheckInterval?: number;
-  private currentUrl: string = '';
-  private lastStallCheckTime: number = 0;
+  // Candidate scheduling
+  private allowOriginal: boolean = true;
+  private nextFailbackIndex: number = 0;
+  private pendingRetryUrls: string[] = [];
+  private silentRetryBudget: Map<string, number> = new Map();
+  private launchedCount: number = 0;
+  private failbackAttempt: number = 0;
+  private triedFailbackUrls: Set<string> = new Set();
 
-  // Throughput detection
-  private lastTotalBytes: number = 0;
-  private lowSpeedDuration: number = 0;
+  // In-flight attempts (parallel hedging)
+  private attempts: Set<Attempt> = new Set();
+  private inFlightUrls: Set<string> = new Set();
+  private hedgeTimer?: number;
 
-  // Track URLs already attempted so we don't retry them
-  private triedUrls: Set<string> = new Set();
+  // Last failure classification, used to pick onError vs onTimeout on exhaustion
+  private lastFailureKind: AttemptFailureKind | null = null;
+  private lastErrorCode: number = 0;
+  private lastErrorText: string = 'Network error';
 
   constructor(config: HlsConfig) {
     this.config = config;
@@ -336,6 +421,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       failbackHostCooldownMs: userConfig.failbackHostCooldownMs,
       enableCacheControlHeader: userConfig.enableCacheControlHeader,
       verbose: userConfig.verbose,
+      hedge: userConfig.hedge,
+      hedgeDelayMs: userConfig.hedgeDelayMs,
+      firstByteTimeoutMs: userConfig.firstByteTimeoutMs,
+      dataStallTimeoutMs: userConfig.dataStallTimeoutMs,
+      maxParallelAttempts: userConfig.maxParallelAttempts,
+      silentRetriesPerHost: userConfig.silentRetriesPerHost,
     };
 
     // Ensure state exists for this config
@@ -349,6 +440,55 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   private getDnsDomain(): string {
     return this.failbackConfig.dnsDomain || DEFAULT_FAILBACK_DNS_DOMAIN;
+  }
+
+  private isHedgeEnabled(): boolean {
+    return this.failbackConfig.hedge !== false;
+  }
+
+  private getHedgeDelayMs(): number {
+    const value = this.failbackConfig.hedgeDelayMs;
+    return Number.isFinite(value) && value! >= 0
+      ? value!
+      : DEFAULT_HEDGE_DELAY_MS;
+  }
+
+  private getFirstByteTimeoutMs(): number {
+    const value = this.failbackConfig.firstByteTimeoutMs;
+    const configured =
+      Number.isFinite(value) && value! > 0
+        ? value!
+        : DEFAULT_FIRST_BYTE_TIMEOUT_MS;
+    // Never wait longer than the transport's own first-byte budget.
+    const ttfb = this.loaderConfig?.loadPolicy.maxTimeToFirstByteMs;
+    if (ttfb && Number.isFinite(ttfb)) {
+      return Math.min(configured, ttfb);
+    }
+    return configured;
+  }
+
+  private getDataStallTimeoutMs(): number {
+    const value = this.failbackConfig.dataStallTimeoutMs;
+    return Number.isFinite(value) && value! > 0
+      ? value!
+      : DEFAULT_DATA_STALL_TIMEOUT_MS;
+  }
+
+  private getMaxParallelAttempts(): number {
+    const value = this.failbackConfig.maxParallelAttempts;
+    if (!this.isHedgeEnabled()) {
+      return 1;
+    }
+    return Number.isFinite(value) && value! >= 1
+      ? Math.floor(value!)
+      : DEFAULT_MAX_PARALLEL_ATTEMPTS;
+  }
+
+  private getSilentRetriesPerHost(): number {
+    const value = this.failbackConfig.silentRetriesPerHost;
+    return Number.isFinite(value) && value! >= 0
+      ? Math.floor(value!)
+      : DEFAULT_SILENT_RETRIES_PER_HOST;
   }
 
   /**
@@ -384,7 +524,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
   destroy() {
     this.abortInternal();
-    this.stopStallCheck();
     this.loader = null;
     this.callbacks = null;
     this.context = null;
@@ -394,128 +533,49 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     // Explicit clean up should be done via Hls.destroy() which calls destroyFailbackState
   }
 
-  private stopStallCheck() {
-    if (this.stallCheckInterval) {
-      self.clearInterval(this.stallCheckInterval);
-      this.stallCheckInterval = undefined;
+  private clearAttemptTimers(attempt: Attempt) {
+    if (attempt.monitorInterval) {
+      self.clearInterval(attempt.monitorInterval);
+      attempt.monitorInterval = undefined;
+    }
+    if (attempt.loadTimeout) {
+      self.clearTimeout(attempt.loadTimeout);
+      attempt.loadTimeout = undefined;
     }
   }
 
-  private startStallCheck(url: string) {
-    this.stopStallCheck();
-    const now = self.performance.now();
-    this.currentUrl = url;
-    this.lastProgressTime = now;
-    this.lastStallCheckTime = now;
-    this.lastTotalBytes = this.stats.loaded || 0;
-    this.lowSpeedDuration = 0;
-
-    this.stallCheckInterval = self.setInterval(() => {
-      const tickNow = self.performance.now();
-
-      // 1. Strict Silence Check
-      // If we haven't received ANY event for STALL_TIMEOUT_MS
-      const timeSinceProgress = tickNow - this.lastProgressTime;
-      if (timeSinceProgress > STALL_TIMEOUT_MS) {
-        logger.log(
-          `[FailbackLoader] Strict stall detected (no events for ${timeSinceProgress}ms)`,
-        );
-        this.onStall();
-        return;
+  private teardownAttempt(attempt: Attempt, abortXhr: boolean) {
+    this.clearAttemptTimers(attempt);
+    this.attempts.delete(attempt);
+    this.inFlightUrls.delete(attempt.url);
+    const xhr = attempt.xhr;
+    xhr.onreadystatechange = null;
+    xhr.onprogress = null;
+    xhr.onerror = null;
+    if (abortXhr && xhr.readyState !== 4) {
+      try {
+        xhr.abort();
+      } catch {
+        // ignore
       }
-
-      // 2. Minimum Throughput Check (trickle detection)
-      // Use actual elapsed time, not a fixed interval assumption — setInterval
-      // can drift under CPU pressure or tab throttling.
-      const dt = tickNow - this.lastStallCheckTime;
-      this.lastStallCheckTime = tickNow;
-
-      const currentLoaded = this.stats.loaded;
-      const bytesDiff = currentLoaded - this.lastTotalBytes;
-
-      // Only check for stalls once we've started receiving data
-      if (currentLoaded > 0 && dt > 0) {
-        const bytesPerSec = bytesDiff / (dt / 1000);
-
-        if (bytesPerSec < MIN_SPEED_BYTES_PER_SEC) {
-          this.lowSpeedDuration += dt;
-
-          if (this.lowSpeedDuration >= STALL_TIMEOUT_MS) {
-            logger.log(
-              `[FailbackLoader] Throughput stall detected (speed ${bytesPerSec.toFixed(0)} B/s < ${MIN_SPEED_BYTES_PER_SEC} B/s for ${this.lowSpeedDuration.toFixed(0)}ms)`,
-            );
-            this.onStall();
-            return;
-          }
-        } else {
-          // Speed is good, reset counter
-          this.lowSpeedDuration = 0;
-        }
-      }
-
-      this.lastTotalBytes = currentLoaded;
-    }, STALL_CHECK_INTERVAL_MS);
-  }
-
-  private onStall() {
-    const currentUrl = this.currentUrl;
-    this.stopStallCheck();
-    const state = getSessionState(this.config);
-    const elapsed = self.performance.now() - this.stats.loading.start;
-    const loaded = this.stats.loaded || 0;
-    const total = this.stats.total || 0;
-    const percent = total > 0 ? ((loaded / total) * 100).toFixed(1) : '?';
-    const speedKBps = elapsed > 0 ? loaded / 1024 / (elapsed / 1000) : 0;
-
-    logger.log(
-      `[FailbackLoader] STALL DETECTED:` +
-        `\n  url: ${currentUrl}` +
-        `\n  attempt: ${this.failbackAttempt}` +
-        `\n  elapsed: ${elapsed.toFixed(0)}ms` +
-        `\n  loaded: ${(loaded / 1024).toFixed(1)}KB / ${(total / 1024).toFixed(1)}KB (${percent}%)` +
-        `\n  speed: ${speedKBps.toFixed(1)}KB/s (min required: ${(MIN_SPEED_BYTES_PER_SEC / 1024).toFixed(1)}KB/s)` +
-        `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
-    );
-
-    this.recordSourceFailure(
-      currentUrl,
-      `Source stalled - no progress for ${STALL_TIMEOUT_MS}ms`,
-      true,
-    );
-
-    this.tryFailbackOrComplete(
-      currentUrl,
-      () => {
-        this.abortInternal();
-        this.callbacks?.onTimeout?.(
-          this.stats,
-          this.context as FragmentLoaderContext,
-          this.loader,
-        );
-      },
-      true,
-    );
+    }
   }
 
   private abortInternal() {
-    const loader = this.loader;
-    self.clearTimeout(this.requestTimeout);
-    this.stopStallCheck();
-    if (loader) {
-      loader.onreadystatechange = null;
-      loader.onprogress = null;
-      loader.onerror = null; // Clear error handler to prevent stale callbacks
-      if (loader.readyState !== 4) {
-        this.stats.aborted = true;
-        loader.abort();
-      }
-      // Drop the reference so any stale async callbacks from this xhr
-      // bail out via `this.loader !== xhr` check.
-      this.loader = null;
+    if (this.hedgeTimer) {
+      self.clearTimeout(this.hedgeTimer);
+      this.hedgeTimer = undefined;
     }
+    Array.from(this.attempts).forEach((attempt) => {
+      this.teardownAttempt(attempt, true);
+    });
+    this.attempts.clear();
+    this.inFlightUrls.clear();
   }
 
   abort() {
+    this.stats.aborted = true;
+    this.finished = true;
     this.abortInternal();
     if (this.callbacks?.onAbort) {
       this.callbacks.onAbort(
@@ -539,14 +599,26 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.context = context;
     this.callbacks = callbacks;
     this.loaderConfig = config;
-    this.failbackAttempt = 0;
-    this.nextFailbackIndex = 0;
     this.originalUrl = context.url;
     this.attemptedOriginalRequest = false;
+    this.finished = false;
+
+    this.nextFailbackIndex = 0;
+    this.pendingRetryUrls = [];
+    this.silentRetryBudget.clear();
+    this.launchedCount = 0;
+    this.failbackAttempt = 0;
+    this.triedFailbackUrls.clear();
+    this.attempts.clear();
+    this.inFlightUrls.clear();
+    this.lastFailureKind = null;
+    this.lastErrorCode = 0;
+    this.lastErrorText = 'Network error';
 
     const state = getSessionState(this.config);
     this.requestOrder = ++state.nextRequestOrder;
-    this.triedUrls.clear();
+    this.allowOriginal = !state.permanentFailbackMode;
+
     const hosts = this.getHosts();
 
     // Per-fragment start log is verbose by default — only critical transitions
@@ -555,27 +627,19 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       `[FailbackLoader] LOAD START: ${context.url}` +
         `\n  state: failures=${state.consecutiveOriginalFailures}/${PERMANENT_FAILBACK_THRESHOLD}, permanentMode=${state.permanentFailbackMode}` +
         `\n  hosts: [${hosts.join(', ')}]` +
-        `\n  config: stallTimeout=${STALL_TIMEOUT_MS}ms, minSpeed=${MIN_SPEED_BYTES_PER_SEC}B/s, probeEvery=${PROBE_EVERY_N_FRAGMENTS}frags`,
+        `\n  config: hedge=${this.isHedgeEnabled()}, hedgeDelay=${this.getHedgeDelayMs()}ms, firstByte=${this.getFirstByteTimeoutMs()}ms, dataStall=${this.getDataStallTimeoutMs()}ms, maxParallel=${this.getMaxParallelAttempts()}`,
     );
 
-    // In permanent failback mode, skip original source entirely
     if (state.permanentFailbackMode) {
-      const failbackUrl = this.getNextFailbackUrl(null);
-      if (failbackUrl) {
-        this.failbackAttempt = 1;
-        logger.log(
-          `[FailbackLoader] PERMANENT FAILBACK MODE - skipping original, using: ${failbackUrl}`,
-        );
-        this.loadUrl(failbackUrl);
-        return;
-      }
-
-      this.completeNoHealthyFailbackHosts();
-      return;
+      logger.log(
+        `[FailbackLoader] PERMANENT FAILBACK MODE - skipping original`,
+      );
     }
 
-    this.attemptedOriginalRequest = true;
-    this.loadUrl(context.url);
+    // Kick off the first attempt. Hedging / retries schedule the rest.
+    if (!this.launchNextAttempt()) {
+      this.completeNoHealthyFailbackHosts();
+    }
   }
 
   /**
@@ -658,10 +722,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   private quarantineFailbackHost(url: string, reason: string): void {
-    if (this.failbackAttempt === 0) {
-      return;
-    }
-
     const cooldownMs = this.getFailbackHostCooldownMs();
     if (cooldownMs === 0) {
       return;
@@ -681,25 +741,14 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     );
   }
 
-  private recordSourceFailure(
-    currentUrl: string,
-    reason: string,
-    confirmedUnusable: boolean = false,
-  ): void {
-    if (this.failbackAttempt === 0) {
-      this.recordOriginalSourceFailure(reason, confirmedUnusable);
-      return;
-    }
-
-    this.quarantineFailbackHost(currentUrl, reason);
-  }
-
   private switchToPermanentFailbackModeIfNeeded(state: FailbackSessionState) {
     if (state.consecutiveOriginalFailures >= PERMANENT_FAILBACK_THRESHOLD) {
-      state.permanentFailbackMode = true;
-      logger.log(
-        `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
-      );
+      if (!state.permanentFailbackMode) {
+        state.permanentFailbackMode = true;
+        logger.log(
+          `[FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable`,
+        );
+      }
     }
   }
 
@@ -709,7 +758,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   ) {
     const state = getSessionState(this.config);
 
-    if (this.failbackAttempt !== 0 || state.permanentFailbackMode) {
+    if (state.permanentFailbackMode) {
       return;
     }
 
@@ -726,153 +775,293 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.switchToPermanentFailbackModeIfNeeded(state);
   }
 
-  private logAllFailed() {
-    const totalAttempts =
-      (this.attemptedOriginalRequest ? 1 : 0) + this.failbackAttempt;
-
-    logger.log(
-      `[FailbackLoader] ALL FAILED: no more failback hosts available` +
-        `\n  original: ${this.originalUrl}` +
-        `\n  attempts: ${totalAttempts}`,
-    );
-
-    this.failbackConfig.onAllFailed?.(this.originalUrl, totalAttempts);
-  }
-
-  private startFailbackRequest(failbackUrl: string, abortBeforeRetry: boolean) {
-    this.failbackAttempt++;
-
-    if (abortBeforeRetry) {
-      this.abortInternal();
+  /**
+   * Translate an attempt failure into origin health bookkeeping + quarantine.
+   * Only the original request feeds the permanent-mode threshold; failback
+   * hosts are quarantined only on definitive (non-censorship) failures.
+   */
+  private recordAttemptFailure(attempt: Attempt, kind: AttemptFailureKind) {
+    // A browser-synthesized 206 is not evidence about the CDN itself.
+    if (kind === 'partial') {
+      return;
     }
 
-    this.stats.aborted = false;
-    this.stats.loading.first = 0;
-    this.stats.loading.end = 0;
-    this.stats.loaded = 0;
-    this.stats.total = 0;
-    this.stats.bwEstimate = 0;
+    if (attempt.isOriginal) {
+      const confirmedUnusable = kind === 'stall' || kind === 'integrity';
+      this.recordOriginalSourceFailure(
+        `Original source ${this.describeFailure(kind)}`,
+        confirmedUnusable,
+      );
+      return;
+    }
 
-    this.failbackConfig.onFailback?.(
-      this.originalUrl,
-      failbackUrl,
-      this.failbackAttempt,
-    );
-
-    logger.log(
-      `[FailbackLoader] FAILBACK: trying host #${this.failbackAttempt}: ${failbackUrl}`,
-    );
-
-    this.loader = null;
-    this.loadUrl(failbackUrl);
+    // Failback hosts: only a definitive server-side failure (HTTP error)
+    // quarantines the host. Silent/stall/network failures are treated as
+    // likely-censorship and remain retryable (see reEnqueueOnSilence).
+    if (kind === 'http') {
+      this.quarantineFailbackHost(
+        attempt.url,
+        `Failback host ${this.describeFailure(kind)}`,
+      );
+    }
   }
 
-  private getNextFailbackUrl(currentUrl: string | null): string | null {
-    let candidateIndex = this.nextFailbackIndex;
+  private describeFailure(kind: AttemptFailureKind): string {
+    switch (kind) {
+      case 'silent':
+        return 'produced no response (blackholed)';
+      case 'stall':
+        return 'stalled mid-transfer';
+      case 'http':
+        return 'returned an HTTP error';
+      case 'integrity':
+        return 'returned an incomplete body';
+      case 'partial':
+        return 'returned an unexpected partial response';
+      case 'network':
+        return 'hit a network error';
+    }
+  }
 
-    while (candidateIndex < MAX_FAILBACK_ATTEMPTS) {
-      const candidate = this.getFailbackUrl(candidateIndex);
+  private isRetryableSilence(kind: AttemptFailureKind): boolean {
+    // These failure modes match the observed TSPU/DPI behaviour and are worth
+    // retrying on a fresh connection because the block is probabilistic.
+    return kind === 'silent' || kind === 'stall' || kind === 'network';
+  }
+
+  private logAllFailed() {
+    logger.log(
+      `[FailbackLoader] ALL FAILED: no more candidates available` +
+        `\n  original: ${this.originalUrl}` +
+        `\n  attempts: ${this.launchedCount}`,
+    );
+
+    this.failbackConfig.onAllFailed?.(this.originalUrl, this.launchedCount);
+  }
+
+  /**
+   * Compute the next candidate URL to launch, or null if exhausted.
+   * Order: original (once, if allowed) → each failback host → queued
+   * fresh-connection retries of silent hosts.
+   */
+  private dequeueCandidateUrl(): {
+    url: string;
+    isOriginal: boolean;
+    failbackNumber: number;
+  } | null {
+    // 1. Original source (only the very first slot, and only when allowed).
+    if (this.allowOriginal && !this.attemptedOriginalRequest) {
+      this.attemptedOriginalRequest = true;
+      if (!this.inFlightUrls.has(this.originalUrl)) {
+        return { url: this.originalUrl, isOriginal: true, failbackNumber: 0 };
+      }
+    }
+
+    // 2. Fresh failback hosts in order.
+    while (this.nextFailbackIndex < MAX_FAILBACK_ATTEMPTS) {
+      const index = this.nextFailbackIndex;
+      const candidate = this.getFailbackUrl(index);
       if (!candidate) {
+        this.nextFailbackIndex = MAX_FAILBACK_ATTEMPTS;
         break;
       }
-      candidateIndex++;
+      this.nextFailbackIndex = index + 1;
 
-      if (candidate === currentUrl || this.triedUrls.has(candidate)) {
+      if (candidate === this.originalUrl) {
+        continue;
+      }
+      if (this.triedFailbackUrls.has(candidate)) {
+        continue;
+      }
+      if (this.inFlightUrls.has(candidate)) {
         continue;
       }
       if (!this.isFailbackHostAvailable(candidate)) {
         continue;
       }
-
-      this.nextFailbackIndex = candidateIndex;
-      return candidate;
+      this.triedFailbackUrls.add(candidate);
+      this.failbackAttempt++;
+      return {
+        url: candidate,
+        isOriginal: false,
+        failbackNumber: this.failbackAttempt,
+      };
     }
 
-    this.nextFailbackIndex = candidateIndex;
+    // 3. Queued fresh-connection retries of hosts that went silent.
+    while (this.pendingRetryUrls.length > 0) {
+      const url = this.pendingRetryUrls.shift() as string;
+      if (this.inFlightUrls.has(url)) {
+        // Still trying it; requeue for later so we don't spin.
+        this.pendingRetryUrls.push(url);
+        break;
+      }
+      const isOriginal = url === this.originalUrl;
+      if (!isOriginal && !this.isFailbackHostAvailable(url)) {
+        continue;
+      }
+      const failbackNumber = isOriginal ? 0 : ++this.failbackAttempt;
+      return { url, isOriginal, failbackNumber };
+    }
+
     return null;
   }
 
-  private completeNoHealthyFailbackHosts() {
-    this.logAllFailed();
-    this.callbacks?.onError?.(
-      { code: 0, text: 'No healthy failback hosts available' },
-      this.context as FragmentLoaderContext,
-      this.loader,
-      this.stats,
+  /**
+   * Launch the next candidate attempt if one is available and we are under the
+   * concurrency cap. Returns true if an attempt was started.
+   */
+  private launchNextAttempt(): boolean {
+    if (this.finished) {
+      return false;
+    }
+    if (this.attempts.size >= this.getMaxParallelAttempts()) {
+      return false;
+    }
+    if (this.launchedCount >= MAX_TOTAL_ATTEMPTS_PER_LOAD) {
+      return false;
+    }
+
+    const candidate = this.dequeueCandidateUrl();
+    if (!candidate) {
+      return false;
+    }
+
+    this.launchedCount++;
+
+    if (!candidate.isOriginal) {
+      this.failbackConfig.onFailback?.(
+        this.originalUrl,
+        candidate.url,
+        candidate.failbackNumber,
+      );
+      logger.log(
+        `[FailbackLoader] FAILBACK: trying host #${candidate.failbackNumber}: ${candidate.url}`,
+      );
+    }
+
+    this.startAttempt(
+      candidate.url,
+      candidate.isOriginal,
+      candidate.failbackNumber,
     );
+    this.armHedgeTimer();
+    return true;
   }
 
-  private tryFailbackOrComplete(
-    currentUrl: string,
-    onExhausted: () => void,
-    abortBeforeRetry: boolean = false,
-  ) {
-    const failbackUrl = this.getNextFailbackUrl(currentUrl);
-    if (failbackUrl) {
-      this.startFailbackRequest(failbackUrl, abortBeforeRetry);
+  /**
+   * Arm the staggered-hedge timer: if no in-flight attempt has produced a first
+   * byte by `hedgeDelayMs`, open the next candidate in parallel.
+   */
+  private armHedgeTimer() {
+    if (this.hedgeTimer) {
+      self.clearTimeout(this.hedgeTimer);
+      this.hedgeTimer = undefined;
+    }
+    if (!this.isHedgeEnabled() || this.finished) {
+      return;
+    }
+    if (this.attempts.size >= this.getMaxParallelAttempts()) {
       return;
     }
 
-    this.logAllFailed();
-    onExhausted();
+    this.hedgeTimer = self.setTimeout(() => {
+      this.hedgeTimer = undefined;
+      if (this.finished) {
+        return;
+      }
+      // If any in-flight attempt is already receiving bytes, that connection is
+      // promising — let it run and rely on its stall detection instead.
+      if (this.hasProgressingAttempt()) {
+        return;
+      }
+      if (this.launchNextAttempt()) {
+        this.logVerbose(
+          `[FailbackLoader] HEDGE: leading request silent for ${this.getHedgeDelayMs()}ms, opening parallel candidate`,
+        );
+      }
+    }, this.getHedgeDelayMs());
   }
 
-  private loadUrl(url: string) {
+  private hasProgressingAttempt(): boolean {
+    return Array.from(this.attempts).some(
+      (attempt) => attempt.firstByteAt > 0 || attempt.loaded > 0,
+    );
+  }
+
+  private startAttempt(
+    url: string,
+    isOriginal: boolean,
+    failbackNumber: number,
+  ) {
     const context = this.context;
     const config = this.loaderConfig;
-    if (!context || !config) return;
+    if (!context || !config) {
+      return;
+    }
 
-    this.triedUrls.add(url);
-
-    const { maxTimeToFirstByteMs, maxLoadTimeMs } = config.loadPolicy;
-    const timeout =
-      maxTimeToFirstByteMs && Number.isFinite(maxTimeToFirstByteMs)
-        ? maxTimeToFirstByteMs
-        : maxLoadTimeMs;
+    const xhr = new self.XMLHttpRequest();
+    const now = self.performance.now();
+    const attempt: Attempt = {
+      xhr,
+      url,
+      isOriginal,
+      failbackNumber,
+      startTime: now,
+      firstByteAt: 0,
+      loaded: 0,
+      lastProgressTime: now,
+      lastSpeedCheckTime: now,
+      lastSpeedCheckBytes: 0,
+      lowSpeedDuration: 0,
+      settled: false,
+    };
+    this.attempts.add(attempt);
+    this.inFlightUrls.add(url);
+    this.loader = xhr;
 
     this.logVerbose(
       `[FailbackLoader] LOADING: ${url}` +
-        `\n  attempt: ${this.failbackAttempt}` +
-        `\n  timeout: ${timeout}ms (ttfb=${maxTimeToFirstByteMs}ms, maxLoad=${maxLoadTimeMs}ms)`,
+        `\n  isOriginal: ${isOriginal}, failback#: ${failbackNumber}` +
+        `\n  inFlight: ${this.attempts.size}`,
     );
 
-    const xhr = (this.loader = new self.XMLHttpRequest());
     const xhrSetup = this.config.xhrSetup;
     if (xhrSetup) {
       const xhrContext = url !== context.url ? { ...context, url } : context;
       Promise.resolve()
         .then(() => {
-          if (this.loader !== xhr || this.stats.aborted) return;
+          if (attempt.settled || this.finished) return;
           return xhrSetup(xhr, url, xhrContext);
         })
         .catch(() => {
-          if (this.loader !== xhr || this.stats.aborted) return;
+          if (attempt.settled || this.finished) return;
           xhr.open('GET', url, true);
           return xhrSetup(xhr, url, xhrContext);
         })
         .then(() => {
-          if (this.loader !== xhr || this.stats.aborted) return;
-          this.openAndSendXhr(xhr, context, url, timeout);
+          if (attempt.settled || this.finished) return;
+          this.openAndSendXhr(attempt, context, url);
         })
         .catch((error) => {
-          if (this.loader !== xhr || this.stats.aborted) return;
+          if (attempt.settled || this.finished) return;
           logger.warn(
             `[FailbackLoader] xhrSetup failed for ${url}: ${error?.message || error}`,
           );
-          this.onNetworkError(xhr, url);
+          this.failAttempt(attempt, 'network', 'xhrSetup failed');
         });
       return;
     }
 
-    this.openAndSendXhr(xhr, context, url, timeout);
+    this.openAndSendXhr(attempt, context, url);
   }
 
   private openAndSendXhr(
-    xhr: XMLHttpRequest,
+    attempt: Attempt,
     context: FragmentLoaderContext,
     url: string,
-    timeout: number,
   ) {
+    const xhr = attempt.xhr;
     if (!xhr.readyState) {
       xhr.open('GET', url, true);
     }
@@ -886,17 +1075,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       }
     }
 
-    // NOTE: We previously used Cache-Control: no-store to prevent browser from
-    // caching partial responses and auto-adding Range headers on retry.
-    // However, this header triggers CORS preflight (OPTIONS) requests which doubles
-    // the number of requests (expensive on CDNs).
-    //
-    // Instead, we now detect HTTP 206 responses that we didn't request (browser-initiated
-    // Range requests from stale cache) and treat them as errors, triggering failback.
-    // See the 206 detection logic in onReadyStateChange().
-    //
-    // To re-enable Cache-Control header (e.g., for debugging), set:
-    // failbackConfig.enableCacheControlHeader = true
     if (this.failbackConfig.enableCacheControlHeader) {
       xhr.setRequestHeader('Cache-Control', 'no-store');
     }
@@ -908,250 +1086,277 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       );
     }
 
-    xhr.onreadystatechange = () => this.onReadyStateChange(xhr, url);
-    xhr.onprogress = this.onProgress.bind(this);
-    xhr.onerror = () => this.onNetworkError(xhr, url);
+    xhr.onreadystatechange = () => this.onReadyStateChange(attempt);
+    xhr.onprogress = (event: ProgressEvent) => this.onProgress(attempt, event);
+    xhr.onerror = () => this.failAttempt(attempt, 'network', 'Network error');
 
-    this.attemptStartTime = self.performance.now();
-    self.clearTimeout(this.requestTimeout);
-    this.requestTimeout = self.setTimeout(
-      () => this.onTimeout(url, xhr),
-      timeout,
+    attempt.startTime = self.performance.now();
+    attempt.lastProgressTime = attempt.startTime;
+    attempt.lastSpeedCheckTime = attempt.startTime;
+
+    // Per-attempt overall load budget.
+    const maxLoadTimeMs = this.loaderConfig?.loadPolicy.maxLoadTimeMs;
+    if (maxLoadTimeMs && Number.isFinite(maxLoadTimeMs)) {
+      attempt.loadTimeout = self.setTimeout(
+        () => this.failAttempt(attempt, 'stall', 'Exceeded max load time'),
+        maxLoadTimeMs,
+      );
+    }
+
+    // Per-attempt monitor: fast blackhole + mid-transfer stall detection.
+    attempt.monitorInterval = self.setInterval(
+      () => this.monitorAttempt(attempt),
+      STALL_CHECK_INTERVAL_MS,
     );
 
     xhr.send();
-
-    // Start stall detection (separate from timeout - detects when download stalls)
-    this.startStallCheck(url);
   }
 
-  private onReadyStateChange(xhr: XMLHttpRequest, currentUrl: string) {
-    const { context, stats, loaderConfig: config } = this;
-    if (!context || !config || this.loader !== xhr || stats.aborted) return;
+  private monitorAttempt(attempt: Attempt) {
+    if (attempt.settled || this.finished) {
+      return;
+    }
+    const now = self.performance.now();
 
-    if (xhr.readyState >= 2) {
-      if (stats.loading.first === 0) {
-        stats.loading.first = Math.max(
-          self.performance.now(),
-          this.attemptStartTime,
+    // 1. Blackhole detection: no response headers/bytes at all.
+    if (attempt.firstByteAt === 0) {
+      if (now - attempt.startTime >= this.getFirstByteTimeoutMs()) {
+        this.failAttempt(
+          attempt,
+          'silent',
+          `No first byte within ${this.getFirstByteTimeoutMs()}ms`,
         );
-        const ttfb = stats.loading.first - this.attemptStartTime;
-        const finalUrl = xhr.responseURL || currentUrl;
-        const wasRedirected = finalUrl !== currentUrl;
-
-        this.logVerbose(
-          `[FailbackLoader] RESPONSE HEADERS RECEIVED:` +
-            `\n  status: ${xhr.status}` +
-            `\n  ttfb: ${ttfb.toFixed(0)}ms` +
-            `\n  requested: ${currentUrl}` +
-            (wasRedirected ? `\n  redirected: ${finalUrl}` : ''),
-        );
-
-        if (config.loadPolicy.maxLoadTimeMs) {
-          self.clearTimeout(this.requestTimeout);
-          const remaining = config.loadPolicy.maxLoadTimeMs - ttfb;
-          if (remaining <= 0) {
-            // Already over budget by first-byte time — fire timeout
-            // asynchronously to unwind the current onreadystatechange cleanly.
-            this.requestTimeout = self.setTimeout(
-              () => this.onTimeout(currentUrl, xhr),
-              0,
-            );
-          } else {
-            this.requestTimeout = self.setTimeout(
-              () => this.onTimeout(currentUrl, xhr),
-              remaining,
-            );
-          }
-        }
       }
+      return;
+    }
 
-      if (xhr.readyState === 4) {
-        self.clearTimeout(this.requestTimeout);
-        this.stopStallCheck();
-        xhr.onreadystatechange = null;
-        xhr.onprogress = null;
+    // 2. Strict silence after first byte.
+    const dataStall = this.getDataStallTimeoutMs();
+    if (now - attempt.lastProgressTime >= dataStall) {
+      this.failAttempt(
+        attempt,
+        'stall',
+        `No progress for ${(now - attempt.lastProgressTime).toFixed(0)}ms after first byte`,
+      );
+      return;
+    }
 
-        const status = xhr.status;
-
-        if (status >= 200 && status < 300) {
-          const data = xhr.response;
-          if (data != null) {
-            // An application request without Range must never accept 206.
-            // Browsers can synthesize it while serving a stale partial cache;
-            // Content-Range is often hidden by CORS, so its visibility cannot
-            // be part of the detection. This is a per-request browser/cache
-            // anomaly, not evidence that the original CDN is unavailable.
-            const weRequestedRange = this.hasByteRange(context);
-            if (status === 206 && !weRequestedRange) {
-              this.handleUnexpectedRangeResponse(xhr, currentUrl);
-              return;
-            }
-
-            const len =
-              xhr.responseType === 'arraybuffer'
-                ? data.byteLength
-                : data.length;
-
-            const responseIntegrityError = this.getResponseIntegrityError(
-              xhr,
-              context,
-              status,
-              len,
-            );
-            if (responseIntegrityError) {
-              this.handleInvalidResponse(
-                xhr,
-                currentUrl,
-                status,
-                responseIntegrityError,
-              );
-              return;
-            }
-
-            stats.loading.end = Math.max(
-              self.performance.now(),
-              stats.loading.first,
-            );
-
-            stats.loaded = stats.total = len;
-            stats.bwEstimate =
-              (stats.total * 8000) / (stats.loading.end - stats.loading.first);
-
-            this.callbacks?.onProgress?.(stats, context, data, xhr);
-
-            // Call success callback if configured
-            this.failbackConfig.onSuccess?.(
-              xhr.responseURL,
-              this.failbackAttempt > 0,
-              this.failbackAttempt,
-            );
-
-            // Track consecutive failures for permanent failback mode
-            const state = getSessionState(this.config);
-            if (this.failbackAttempt === 0 && !state.permanentFailbackMode) {
-              // Success on original source - reset failure counter
-              if (state.consecutiveOriginalFailures > 0) {
-                logger.log(
-                  `[FailbackLoader] Original source recovered, resetting failure counter`,
-                );
-              }
-              state.consecutiveOriginalFailures = 0;
-            }
-
-            // Store the freshest original URL for future recovery probes.
-            // Overlapping loaders share one state object, so an older request
-            // finishing later must not clobber a newer fragment URL.
-            if (this.requestOrder >= state.lastSuccessfulOriginalUrlOrder) {
-              const wasNull = !state.lastSuccessfulOriginalUrl;
-              state.lastSuccessfulOriginalUrl = this.originalUrl;
-              state.lastSuccessfulOriginalLength = len;
-              state.lastSuccessfulOriginalUrlOrder = this.requestOrder;
-
-              if (wasNull) {
-                logger.log(
-                  `[FailbackLoader] Stored original URL for recovery probes: ${this.originalUrl}`,
-                );
-              }
-            }
-
-            if (
-              this.requestOrder < state.lastSuccessfulOriginalUrlOrder &&
-              state.lastSuccessfulOriginalUrl
-            ) {
-              this.logVerbose(
-                `[FailbackLoader] Ignoring stale original URL for recovery probes: ${this.originalUrl}`,
-              );
-            }
-
-            // Calculate download stats for logging
-            const downloadTime = stats.loading.end - stats.loading.start;
-            const speedKBps = len / 1024 / (downloadTime / 1000);
-            const speedMbps = (len * 8) / (downloadTime * 1000);
-
-            // CDN Recovery: count fragments and probe when in permanent failback mode
-            if (state.permanentFailbackMode) {
-              state.fragmentsSinceLastProbe++;
-              this.logVerbose(
-                `[FailbackLoader] SUCCESS (permanent failback):` +
-                  `\n  url: ${xhr.responseURL}` +
-                  `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms` +
-                  `\n  speed: ${speedKBps.toFixed(1)}KB/s (${speedMbps.toFixed(2)}Mbps)` +
-                  `\n  probe: [${state.fragmentsSinceLastProbe}/${PROBE_EVERY_N_FRAGMENTS}]`,
-              );
-
-              // Time to probe original CDN?
-              if (state.fragmentsSinceLastProbe >= PROBE_EVERY_N_FRAGMENTS) {
-                state.fragmentsSinceLastProbe = 0;
-                logger.log(
-                  `[FailbackLoader] Triggering CDN probe:` +
-                    `\n  lastSuccessfulOriginalUrl: ${state.lastSuccessfulOriginalUrl}` +
-                    `\n  isProbeInProgress: ${state.isProbeInProgress}` +
-                    `\n  permanentFailbackMode: ${state.permanentFailbackMode}`,
-                );
-                // Fire and forget - don't block the current request
-                // Pass headers for authenticated probe (if any)
-                tryRecoverToOriginalCDN(this.config, context.headers);
-              }
-            } else if (this.failbackAttempt > 0) {
-              // Keep failback-success at default log level — it's a significant
-              // event (we recovered via backup) that operators want to see.
-              logger.log(
-                `[FailbackLoader] SUCCESS via failback #${this.failbackAttempt}:` +
-                  `\n  url: ${xhr.responseURL}` +
-                  `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms` +
-                  `\n  speed: ${speedKBps.toFixed(1)}KB/s (${speedMbps.toFixed(2)}Mbps)`,
-              );
-            } else {
-              this.logVerbose(
-                `[FailbackLoader] SUCCESS (direct):` +
-                  `\n  url: ${xhr.responseURL}` +
-                  `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms` +
-                  `\n  speed: ${speedKBps.toFixed(1)}KB/s (${speedMbps.toFixed(2)}Mbps)`,
-              );
-            }
-
-            this.callbacks?.onSuccess?.(
-              { url: xhr.responseURL, data, code: status },
-              stats,
-              context,
-              xhr,
-            );
-            return;
-          }
+    // 3. Throughput trickle detection (real elapsed time, not tick count).
+    const dt = now - attempt.lastSpeedCheckTime;
+    attempt.lastSpeedCheckTime = now;
+    if (attempt.loaded > 0 && dt > 0) {
+      const bytesDiff = attempt.loaded - attempt.lastSpeedCheckBytes;
+      const bytesPerSec = bytesDiff / (dt / 1000);
+      if (bytesPerSec < MIN_SPEED_BYTES_PER_SEC) {
+        attempt.lowSpeedDuration += dt;
+        if (attempt.lowSpeedDuration >= dataStall) {
+          this.failAttempt(
+            attempt,
+            'stall',
+            `Throughput ${bytesPerSec.toFixed(0)} B/s < ${MIN_SPEED_BYTES_PER_SEC} B/s for ${attempt.lowSpeedDuration.toFixed(0)}ms`,
+          );
+          return;
         }
+      } else {
+        attempt.lowSpeedDuration = 0;
+      }
+    }
+    attempt.lastSpeedCheckBytes = attempt.loaded;
+  }
 
-        this.handleError(xhr, currentUrl, status);
+  private onProgress(attempt: Attempt, event: ProgressEvent) {
+    if (attempt.settled) {
+      return;
+    }
+    attempt.loaded = event.loaded;
+    attempt.lastProgressTime = self.performance.now();
+
+    // Keep the reported stats tracking the most-advanced attempt so ABR sees
+    // meaningful progress during hedged loads.
+    if (event.loaded > this.stats.loaded) {
+      this.stats.loaded = event.loaded;
+      if (event.lengthComputable) {
+        this.stats.total = event.total;
       }
     }
   }
 
-  private handleError(xhr: XMLHttpRequest, currentUrl: string, status: number) {
-    this.stopStallCheck(); // Ensure stall check is stopped
-    const finalUrl = xhr.responseURL || currentUrl;
-    const wasRedirected = finalUrl !== currentUrl;
-    const elapsed = self.performance.now() - this.stats.loading.start;
+  private onReadyStateChange(attempt: Attempt) {
+    const { context, loaderConfig: config } = this;
+    if (!context || !config || attempt.settled || this.finished) {
+      return;
+    }
+    const xhr = attempt.xhr;
 
-    logger.log(
-      `[FailbackLoader] HTTP ERROR:` +
-        `\n  status: ${status} ${xhr.statusText}` +
-        `\n  url: ${currentUrl}` +
-        (wasRedirected ? `\n  redirected: ${finalUrl}` : '') +
-        `\n  attempt: ${this.failbackAttempt}` +
-        `\n  elapsed: ${elapsed.toFixed(0)}ms` +
-        `\n  loaded: ${this.stats.loaded} bytes`,
+    if (xhr.readyState < 2) {
+      return;
+    }
+
+    if (attempt.firstByteAt === 0) {
+      attempt.firstByteAt = Math.max(self.performance.now(), attempt.startTime);
+      attempt.lastProgressTime = attempt.firstByteAt;
+      const ttfb = attempt.firstByteAt - attempt.startTime;
+      const finalUrl = xhr.responseURL || attempt.url;
+
+      this.logVerbose(
+        `[FailbackLoader] RESPONSE HEADERS RECEIVED:` +
+          `\n  status: ${xhr.status}` +
+          `\n  ttfb: ${ttfb.toFixed(0)}ms` +
+          `\n  requested: ${attempt.url}` +
+          (finalUrl !== attempt.url ? `\n  redirected: ${finalUrl}` : ''),
+      );
+
+      // We have a promising connection — no need to keep hedging.
+      if (this.hedgeTimer) {
+        self.clearTimeout(this.hedgeTimer);
+        this.hedgeTimer = undefined;
+      }
+    }
+
+    if (xhr.readyState !== 4) {
+      return;
+    }
+
+    const status = xhr.status;
+
+    if (status >= 200 && status < 300) {
+      const data = xhr.response;
+      if (data != null) {
+        const weRequestedRange = this.hasByteRange(context);
+        // An application request without Range must never accept 206.
+        if (status === 206 && !weRequestedRange) {
+          this.handleUnexpectedRangeResponse(attempt);
+          return;
+        }
+
+        const len =
+          xhr.responseType === 'arraybuffer' ? data.byteLength : data.length;
+
+        const integrityError = this.getResponseIntegrityError(
+          xhr,
+          context,
+          status,
+          len,
+        );
+        if (integrityError) {
+          this.failAttempt(attempt, 'integrity', integrityError);
+          return;
+        }
+
+        this.completeWithSuccess(attempt, data, len, status);
+        return;
+      }
+    }
+
+    // Non-2xx / empty body.
+    this.failAttempt(attempt, 'http', `HTTP ${status} ${xhr.statusText}`, {
+      code: status,
+      text: xhr.statusText || `HTTP ${status}`,
+    });
+  }
+
+  private completeWithSuccess(
+    attempt: Attempt,
+    data: any,
+    len: number,
+    status: number,
+  ) {
+    const { context } = this;
+    if (!context) {
+      return;
+    }
+    const state = getSessionState(this.config);
+    const stats = this.stats;
+    const xhr = attempt.xhr;
+
+    // This attempt wins. Stop everything else.
+    attempt.settled = true;
+    this.finished = true;
+    this.loader = xhr;
+    // Detach the winner from the pool before aborting the losers so its own
+    // teardown does not abort the (already complete) winning xhr.
+    this.attempts.delete(attempt);
+    this.inFlightUrls.delete(attempt.url);
+    this.clearAttemptTimers(attempt);
+    xhr.onreadystatechange = null;
+    xhr.onprogress = null;
+    xhr.onerror = null;
+    this.abortInternal();
+
+    stats.loading.first = Math.max(attempt.firstByteAt, stats.loading.start);
+    stats.loading.end = Math.max(self.performance.now(), stats.loading.first);
+    stats.loaded = stats.total = len;
+    stats.bwEstimate =
+      stats.loading.end > stats.loading.first
+        ? (stats.total * 8000) / (stats.loading.end - stats.loading.first)
+        : 0;
+
+    this.callbacks?.onProgress?.(stats, context, data, xhr);
+
+    this.failbackConfig.onSuccess?.(
+      xhr.responseURL,
+      !attempt.isOriginal,
+      attempt.failbackNumber,
     );
 
-    this.recordSourceFailure(currentUrl, 'Source failed');
+    if (attempt.isOriginal && !state.permanentFailbackMode) {
+      if (state.consecutiveOriginalFailures > 0) {
+        logger.log(
+          `[FailbackLoader] Original source recovered, resetting failure counter`,
+        );
+      }
+      state.consecutiveOriginalFailures = 0;
+    }
 
-    this.tryFailbackOrComplete(currentUrl, () => {
-      this.callbacks?.onError?.(
-        { code: status, text: xhr.statusText },
-        this.context as FragmentLoaderContext,
-        xhr,
-        this.stats,
+    // Store the freshest original URL for future recovery probes.
+    if (this.requestOrder >= state.lastSuccessfulOriginalUrlOrder) {
+      const wasNull = !state.lastSuccessfulOriginalUrl;
+      state.lastSuccessfulOriginalUrl = this.originalUrl;
+      state.lastSuccessfulOriginalLength = len;
+      state.lastSuccessfulOriginalUrlOrder = this.requestOrder;
+      if (wasNull) {
+        logger.log(
+          `[FailbackLoader] Stored original URL for recovery probes: ${this.originalUrl}`,
+        );
+      }
+    }
+
+    const downloadTime = stats.loading.end - stats.loading.start;
+    const speedKBps = downloadTime > 0 ? len / 1024 / (downloadTime / 1000) : 0;
+
+    if (state.permanentFailbackMode) {
+      state.fragmentsSinceLastProbe++;
+      this.logVerbose(
+        `[FailbackLoader] SUCCESS (permanent failback): ${xhr.responseURL}` +
+          `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms, speed: ${speedKBps.toFixed(1)}KB/s` +
+          `\n  probe: [${state.fragmentsSinceLastProbe}/${PROBE_EVERY_N_FRAGMENTS}]`,
       );
-    });
+
+      if (state.fragmentsSinceLastProbe >= PROBE_EVERY_N_FRAGMENTS) {
+        state.fragmentsSinceLastProbe = 0;
+        logger.log(
+          `[FailbackLoader] Triggering CDN probe: ${state.lastSuccessfulOriginalUrl}`,
+        );
+        tryRecoverToOriginalCDN(this.config, context.headers);
+      }
+    } else if (!attempt.isOriginal) {
+      logger.log(
+        `[FailbackLoader] SUCCESS via failback #${attempt.failbackNumber}: ${xhr.responseURL}` +
+          `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms, speed: ${speedKBps.toFixed(1)}KB/s`,
+      );
+    } else {
+      this.logVerbose(
+        `[FailbackLoader] SUCCESS (direct): ${xhr.responseURL}` +
+          `\n  size: ${(len / 1024).toFixed(1)}KB, time: ${downloadTime.toFixed(0)}ms, speed: ${speedKBps.toFixed(1)}KB/s`,
+      );
+    }
+
+    this.callbacks?.onSuccess?.(
+      { url: xhr.responseURL, data, code: status },
+      stats,
+      context,
+      xhr,
+    );
   }
 
   /**
@@ -1168,8 +1373,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     const contentEncoding = xhr.getResponseHeader('Content-Encoding');
     const contentLength = xhr.getResponseHeader('Content-Length');
 
-    // Content-Length describes encoded bytes. XHR decodes content, so only
-    // compare lengths when the response is unencoded (as media normally is).
     if (
       contentLength &&
       (!contentEncoding || contentEncoding.toLowerCase() === 'identity')
@@ -1198,8 +1401,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
 
     const contentRange = xhr.getResponseHeader('Content-Range');
-    // Content-Range is not CORS-safelisted. Correct range responses from a
-    // CDN which does not expose it remain valid if their body length matches.
     if (!contentRange) {
       return null;
     }
@@ -1221,151 +1422,153 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     return null;
   }
 
-  private handleUnexpectedRangeResponse(
-    xhr: XMLHttpRequest,
-    currentUrl: string,
-  ) {
-    const contentRange = xhr.getResponseHeader('Content-Range');
+  private handleUnexpectedRangeResponse(attempt: Attempt) {
+    const contentRange = attempt.xhr.getResponseHeader('Content-Range');
     logger.log(
       `[FailbackLoader] UNEXPECTED PARTIAL RESPONSE:` +
         `\n  status: 206 Partial Content` +
-        `\n  url: ${currentUrl}` +
+        `\n  url: ${attempt.url}` +
         `\n  Content-Range: ${contentRange || '(not exposed to JavaScript)'}` +
         `\n  ACTION: Treating as a browser/cache error, will try failback`,
     );
-
-    // Do not update origin health here. The browser may have generated this
-    // response from a poisoned cache without the network request reaching the
-    // CDN, so permanent failback would be a false attribution.
-    this.tryFailbackOrComplete(currentUrl, () => {
-      this.callbacks?.onError?.(
-        { code: 206, text: 'Unexpected Partial Content response' },
-        this.context as FragmentLoaderContext,
-        xhr,
-        this.stats,
-      );
-    });
+    // Do not update origin health: the browser may have generated this from a
+    // poisoned cache without the request reaching the CDN.
+    this.failAttempt(attempt, 'partial', 'Unexpected Partial Content response');
   }
 
-  private handleInvalidResponse(
-    xhr: XMLHttpRequest,
-    currentUrl: string,
-    status: number,
+  /**
+   * A single attempt failed. Record health, optionally requeue for a fresh
+   * connection, then advance to the next candidate or finish the load.
+   */
+  private failAttempt(
+    attempt: Attempt,
+    kind: AttemptFailureKind,
     reason: string,
+    httpError?: { code: number; text: string },
   ) {
-    this.stopStallCheck();
+    if (attempt.settled || this.finished) {
+      return;
+    }
+    attempt.settled = true;
+
+    this.lastFailureKind = kind;
+    if (httpError) {
+      this.lastErrorCode = httpError.code;
+      this.lastErrorText = httpError.text;
+    } else if (kind !== 'partial') {
+      this.lastErrorCode = 0;
+      this.lastErrorText = reason;
+    }
+
+    const state = getSessionState(this.config);
+    const elapsed = (self.performance.now() - attempt.startTime).toFixed(0);
     logger.log(
-      `[FailbackLoader] INCOMPLETE RESPONSE:` +
-        `\n  status: ${status} ${xhr.statusText}` +
-        `\n  url: ${currentUrl}` +
-        `\n  attempt: ${this.failbackAttempt}` +
+      `[FailbackLoader] ATTEMPT FAILED (${kind}):` +
+        `\n  url: ${attempt.url}` +
+        `\n  isOriginal: ${attempt.isOriginal}, failback#: ${attempt.failbackNumber}` +
         `\n  reason: ${reason}` +
-        `\n  ACTION: Treating as an error, will try failback`,
-    );
-
-    this.recordSourceFailure(
-      currentUrl,
-      'Source returned an incomplete response',
-      true,
-    );
-
-    this.tryFailbackOrComplete(currentUrl, () => {
-      this.callbacks?.onError?.(
-        { code: status, text: reason },
-        this.context as FragmentLoaderContext,
-        xhr,
-        this.stats,
-      );
-    });
-  }
-
-  private onTimeout(currentUrl: string, xhr?: XMLHttpRequest) {
-    if (xhr && this.loader !== xhr) {
-      return;
-    }
-
-    const state = getSessionState(this.config);
-    const elapsed = self.performance.now() - this.stats.loading.start;
-    const loaded = this.stats.loaded || 0;
-    const total = this.stats.total || 0;
-    const percent = total > 0 ? ((loaded / total) * 100).toFixed(1) : '?';
-
-    logger.log(
-      `[FailbackLoader] TIMEOUT:` +
-        `\n  url: ${currentUrl}` +
-        `\n  attempt: ${this.failbackAttempt}` +
-        `\n  elapsed: ${elapsed.toFixed(0)}ms` +
-        `\n  loaded: ${(loaded / 1024).toFixed(1)}KB / ${(total / 1024).toFixed(1)}KB (${percent}%)` +
+        `\n  elapsed: ${elapsed}ms, loaded: ${attempt.loaded} bytes` +
         `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
     );
 
-    this.recordSourceFailure(
-      currentUrl,
-      'Source timeout',
-      this.stats.loading.first !== 0 || this.stats.loaded > 0,
-    );
+    this.teardownAttempt(attempt, true);
+    this.recordAttemptFailure(attempt, kind);
 
-    this.tryFailbackOrComplete(
-      currentUrl,
-      () => {
-        this.abortInternal();
-        this.callbacks?.onTimeout?.(
-          this.stats,
-          this.context as FragmentLoaderContext,
-          this.loader,
-        );
-      },
-      true,
+    // Retry silent/blackholed hosts on a fresh connection (probabilistic block).
+    if (this.isRetryableSilence(kind)) {
+      this.maybeRequeueForRetry(attempt.url);
+    }
+
+    // Advance: fill the freed concurrency slot immediately.
+    this.pump();
+  }
+
+  private maybeRequeueForRetry(url: string) {
+    const maxRetries = this.getSilentRetriesPerHost();
+    if (maxRetries <= 0) {
+      return;
+    }
+    const used = this.silentRetryBudget.get(url) ?? 0;
+    if (used >= maxRetries) {
+      return;
+    }
+    this.silentRetryBudget.set(url, used + 1);
+    this.pendingRetryUrls.push(url);
+    this.logVerbose(
+      `[FailbackLoader] Requeued silent host for fresh-connection retry: ${url} (${used + 1}/${maxRetries})`,
     );
   }
 
-  private onNetworkError(xhr: XMLHttpRequest, currentUrl: string) {
-    // Ignore if this is not the current loader (stale callback from previous request)
-    if (this.loader !== xhr) {
+  /**
+   * Keep launching candidates until the concurrency cap is hit or nothing is
+   * launchable. If nothing is in flight and nothing can be launched, the load
+   * has failed.
+   */
+  private pump() {
+    if (this.finished) {
       return;
     }
 
-    self.clearTimeout(this.requestTimeout);
-    this.stopStallCheck();
-    const state = getSessionState(this.config);
-    const elapsed = self.performance.now() - this.stats.loading.start;
-    const finalUrl = xhr.responseURL || currentUrl;
-    const wasRedirected = finalUrl !== currentUrl;
+    let launchedAny = false;
+    while (this.launchNextAttempt()) {
+      launchedAny = true;
+    }
 
-    logger.log(
-      `[FailbackLoader] NETWORK ERROR:` +
-        `\n  url: ${currentUrl}` +
-        (wasRedirected ? `\n  redirected: ${finalUrl}` : '') +
-        `\n  attempt: ${this.failbackAttempt}` +
-        `\n  elapsed: ${elapsed.toFixed(0)}ms` +
-        `\n  loaded: ${this.stats.loaded || 0} bytes` +
-        `\n  state: failures=${state.consecutiveOriginalFailures}, permanentMode=${state.permanentFailbackMode}`,
-    );
+    if (this.attempts.size > 0) {
+      // Still waiting on in-flight attempts. Re-arm hedge if idle.
+      if (!launchedAny && !this.hedgeTimer) {
+        this.armHedgeTimer();
+      }
+      return;
+    }
 
-    this.recordSourceFailure(
-      currentUrl,
-      'Source network error',
-      this.stats.loading.first !== 0 || this.stats.loaded > 0,
-    );
+    // Nothing in flight and nothing launchable → exhausted.
+    this.completeExhausted();
+  }
 
-    this.tryFailbackOrComplete(currentUrl, () => {
+  private completeExhausted() {
+    if (this.finished) {
+      return;
+    }
+    this.finished = true;
+    this.abortInternal();
+    this.logAllFailed();
+
+    // A definitive server-side failure (HTTP error / incomplete body) is
+    // reported as an error; a silent blackhole / stall / network outage is
+    // reported as a timeout, matching transport semantics so hls.js applies
+    // its timeout retry policy.
+    const isHttpFailure =
+      this.lastFailureKind === 'http' || this.lastFailureKind === 'integrity';
+
+    if (isHttpFailure) {
       this.callbacks?.onError?.(
-        { code: 0, text: 'Network error' },
+        { code: this.lastErrorCode, text: this.lastErrorText },
         this.context as FragmentLoaderContext,
         this.loader,
         this.stats,
       );
-    });
+    } else {
+      this.callbacks?.onTimeout?.(
+        this.stats,
+        this.context as FragmentLoaderContext,
+        this.loader,
+      );
+    }
   }
 
-  private onProgress(event: ProgressEvent) {
-    this.stats.loaded = event.loaded;
-    if (event.lengthComputable) {
-      this.stats.total = event.total;
+  private completeNoHealthyFailbackHosts() {
+    if (this.finished) {
+      return;
     }
-
-    // Update last progress time for stall detection
-    this.lastProgressTime = self.performance.now();
+    this.finished = true;
+    this.logAllFailed();
+    this.callbacks?.onError?.(
+      { code: 0, text: 'No healthy failback hosts available' },
+      this.context as FragmentLoaderContext,
+      this.loader,
+      this.stats,
+    );
   }
 
   getCacheAge(): number | null {

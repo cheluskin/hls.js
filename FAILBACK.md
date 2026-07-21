@@ -294,10 +294,12 @@ interface LoaderCallbacks<T> {
 - Автоматический перебор резервных хостов при ошибке
 - Поддержка таймаутов и HTTP-ошибок
 - Динамический reread списка хостов на каждом failback-кандидате, чтобы поздно завершившийся DNS preload влиял на следующие retry
-- **Детекция зависания (stall detection)** — переключение на резервный хост если нет данных 5 секунд
-- **Детекция низкой скорости (throughput detection)** — переключение если скорость < 4KB/s в течение 5 секунд
+- **Быстрая детекция blackhole ТСПУ (first-byte timeout)** — если за `firstByteTimeoutMs` (по умолчанию 2500 мс) не пришло ни заголовков, ни байт, попытка считается заблокированной и бросается, не дожидаясь общего транспортного таймаута
+- **Детекция обрыва после первых байт (data-stall)** — если поток замолчал или трикл < 4KB/s дольше `dataStallTimeoutMs` (по умолчанию 3000 мс), попытка бросается (классический паттерн «несколько байт и тишина»)
+- **Staggered-хеджирование (параллельная гонка)** — если ведущий запрос молчит `hedgeDelayMs` (по умолчанию 1200 мс), параллельно открывается следующий кандидат; побеждает первый валидный ответ, остальные отменяются. Здоровый CDN отвечает быстрее задержки хеджа, поэтому лишних запросов не создаётся
+- **Пере-попытки молчащих хостов по свежему соединению** — блокировка ТСПУ вероятностна, поэтому silent/stall/network-фейлы одного хоста повторяются на новом соединении до `silentRetriesPerHost` раз (по умолчанию 2). HTTP-ошибки на том же хосте не повторяются
 - **Режим постоянного failback** — после 2 обычных ошибок либо сразу после подтверждённой неполной передачи все последующие запросы идут напрямую на резервные хосты
-- Дедупликация уже попробованных URL + защитный лимит `MAX_FAILBACK_ATTEMPTS = 32` против циклического `transformUrl`
+- Дедупликация уже попробованных URL + защитные лимиты `MAX_FAILBACK_ATTEMPTS = 32` и `MAX_TOTAL_ATTEMPTS_PER_LOAD = 24` против циклического `transformUrl` и бесконечных retry при полном блэкауте
 - Кастомная трансформация URL через callback
 - Опциональное подробное логирование через `failbackConfig.verbose`
 - Сбор статистики загрузки (timing, bandwidth)
@@ -468,6 +470,40 @@ export interface FailbackConfig {
    * Критичные события (failback, permanent mode, probe, errors) логируются всегда.
    */
   verbose?: boolean;
+
+  // ---- Устойчивость к цензуре (ТСПУ/DPI) ----
+
+  /** Включить staggered-хеджирование (параллельную гонку). По умолчанию true. */
+  hedge?: boolean;
+
+  /**
+   * Задержка перед параллельным запуском следующего кандидата, пока текущий
+   * молчит (нет заголовков ответа). По умолчанию 1200 мс.
+   */
+  hedgeDelayMs?: number;
+
+  /**
+   * Бросить попытку, не получившую ни заголовков, ни байт за это время
+   * (детект blackhole). Ограничивается транспортным `maxTimeToFirstByteMs`.
+   * По умолчанию 2500 мс.
+   */
+  firstByteTimeoutMs?: number;
+
+  /**
+   * Бросить попытку, которая получила первый байт, но затем замолчала
+   * (тишина или трикл < 4KB/s) дольше этого времени. По умолчанию 3000 мс.
+   */
+  dataStallTimeoutMs?: number;
+
+  /** Максимум одновременных запросов на один фрагмент. По умолчанию 3. */
+  maxParallelAttempts?: number;
+
+  /**
+   * Сколько дополнительных пере-попыток по свежему соединению получает каждый
+   * хост после silent/blackhole-фейла в рамках одной загрузки фрагмента.
+   * HTTP-ошибки на том же хосте не повторяются. По умолчанию 2.
+   */
+  silentRetriesPerHost?: number;
 }
 ```
 
@@ -577,19 +613,24 @@ FailbackLoader перехватывает следующие ситуации:
 2. **Таймауты** (превышение `maxTimeToFirstByteMs` или `maxLoadTimeMs`)
 3. **Сетевые ошибки** (network error)
 4. **Browser-initiated `206 Partial Content`** при stale cache, когда мы сами не запрашивали `Range` (даже если `Content-Range` скрыт CORS)
-5. **Зависание загрузки** (strict stall) — нет progress/event более 5 секунд
-6. **Низкая скорость** (throughput stall) — скорость < 4KB/s суммарно более 5 секунд
+5. **Blackhole ТСПУ (`silent`)** — за `firstByteTimeoutMs` не пришло ни заголовков, ни байт
+6. **Обрыв после первых байт (`stall`)** — поток замолчал или трикл < 4KB/s дольше `dataStallTimeoutMs`
 7. **Усечённый `200/206` ответ** — фактический размер тела не совпадает с `Content-Length` или запрошенным byte range
 
-При каждой ошибке:
+Классификация ошибок определяет стратегию:
 
-1. Для timeout/stall активный XHR abort-ится; для HTTP error уже завершившийся XHR просто считается неуспешным
-2. Неуспешный backup-хост помещается в session-level quarantine на 30 секунд (настраивается через `failbackHostCooldownMs`)
-3. Вычисляется следующий здоровый кандидат через `transformUrl()` или список `staticHosts`/DNS
-4. Кандидаты, которые уже пробовали, совпадают с текущим URL или находятся в quarantine, пропускаются
-5. Поиск нового URL ограничен `MAX_FAILBACK_ATTEMPTS = 32`, чтобы защититься от циклического `transformUrl`
-6. При успехе — данные возвращаются в обычный HLS pipeline
-7. Если здоровых кандидатов больше нет — вызывается `onAllFailed`, затем наружу уходит стандартная HLS ошибка/timeout
+- `silent` / `stall` / `network` считаются **вероятной цензурой**: хост НЕ уходит в quarantine и пере-пробуется по свежему соединению (до `silentRetriesPerHost` раз), плюс параллельно хеджируются другие кандидаты
+- `http` / `integrity` считаются **детерминированным отказом сервера**: хост уходит в quarantine на `failbackHostCooldownMs` и на том же соединении/хосте не повторяется
+
+При каждой ошибке попытки:
+
+1. Активный XHR этой попытки abort-ится, её таймеры очищаются; остальные параллельные попытки продолжают гонку
+2. Ошибка классифицируется (`silent`/`stall`/`http`/`integrity`/`partial`/`network`), обновляется health оригинала и/или quarantine backup-хоста согласно правилам выше
+3. Освободившийся слот параллелизма немедленно заполняется следующим кандидатом (`transformUrl()` или `staticHosts`/DNS), затем — очередью пере-попыток молчащих хостов
+4. Кандидаты, которые уже в полёте или в quarantine, пропускаются
+5. Общее число запусков на один фрагмент ограничено `MAX_TOTAL_ATTEMPTS_PER_LOAD = 24`, а перебор хостов — `MAX_FAILBACK_ATTEMPTS = 32`
+6. При первом валидном ответе данные возвращаются в обычный HLS pipeline, остальные попытки отменяются
+7. Если кандидатов и пере-попыток больше нет — вызывается `onAllFailed`; наружу уходит `onError` для `http`/`integrity`, иначе `onTimeout`
 
 ### Режим постоянного failback
 
@@ -728,25 +769,25 @@ Per-fragment логи (`LOAD START`, `LOADING`, `RESPONSE HEADERS RECEIVED`, `SU
 
 ```
 [FailbackLoader] DNS hosts loaded for armfb.turoktv.com: host1.com, host2.com
-[FailbackLoader] HTTP ERROR:
-  status: 503 Service Unavailable
-  url: https://cdn.example.com/seg.ts
-  attempt: 0
-  elapsed: 187ms
-  loaded: 0 bytes
 [FailbackLoader] FAILBACK: trying host #1: https://host1.com/seg.ts
 [FailbackLoader] UNEXPECTED PARTIAL RESPONSE:
+  status: 206 Partial Content
   url: https://cdn.example.com/seg.ts
-  status: 206 Partial Content (browser-initiated)
   Content-Range: bytes 15592-15592/2624292
   ACTION: Treating as a browser/cache error, will try failback
-[FailbackLoader] Original source stalled - no progress for 5000ms (1/2)
-[FailbackLoader] Strict stall detected (no events for 5100ms)
-[FailbackLoader] Throughput stall detected (speed 1024 B/s < 4096 B/s for 5000ms)
+[FailbackLoader] ATTEMPT FAILED (silent):
+  url: https://cdn.example.com/seg.ts
+  isOriginal: true, failback#: 0
+  reason: No first byte within 2500ms
+  elapsed: 2500ms, loaded: 0 bytes
+  state: failures=1, permanentMode=false
+[FailbackLoader] ATTEMPT FAILED (stall):
+  url: https://cdn.example.com/seg.ts
+  reason: Throughput 1024 B/s < 4096 B/s for 3000ms
 [FailbackLoader] ⚠️ SWITCHING TO PERMANENT FAILBACK MODE - original source unreliable
-[FailbackLoader] PERMANENT FAILBACK MODE - skipping original, using: https://host1.com/seg.ts
+[FailbackLoader] PERMANENT FAILBACK MODE - skipping original
 [FailbackLoader] SUCCESS via failback #1: https://host1.com/seg.ts
-[FailbackLoader] ALL FAILED: no more failback hosts available
+[FailbackLoader] ALL FAILED: no more candidates available
 ```
 
 ### Recovery probe
