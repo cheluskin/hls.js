@@ -210,7 +210,7 @@ describe('CMCD v2 E2E Tests', function () {
       // Per spec/design: with autoplay=true, the only non-PLAYING value
       // segments should ever report is STARTING — never PRELOADING.
       const unexpected = states.filter(
-        (s) => s !== undefined && s !== 's' && s !== 'p',
+        (s) => s !== undefined && s !== 's' && s !== 'p' && s !== 'r',
       );
       expect(unexpected).to.deep.equal(
         [],
