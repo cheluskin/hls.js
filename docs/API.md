@@ -30,6 +30,7 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`maxBufferLength`](#maxbufferlength)
   - [`backBufferLength`](#backbufferlength)
   - [`frontBufferFlushThreshold`](#frontbufferflushthreshold)
+  - [`loopBackBufferFlush`](#loopbackbufferflush)
   - [`startOnSegmentBoundary`](#startonsegmentboundary)
   - [`maxBufferSize`](#maxbuffersize)
   - [`maxBufferHole`](#maxbufferhole)
@@ -146,6 +147,7 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`interstitialLiveLookAhead`](#interstitiallivelookahead)
   - [`assetPlayerId`](#assetplayerid)
   - [`primarySessionId`](#primarysessionid)
+  - [`iframeCacheLimit`](#iframecachelimit)
   - [`useMediaCapabilities`](#usemediacapabilities)
 - [Video Binding/Unbinding API](#video-bindingunbinding-api)
   - [`hls.attachMedia(HTMLMediaElement | MediaAttachingData)`](#hlsattachmediahtmlmediaelement--mediaattachingdata)
@@ -195,6 +197,9 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`hls.iframeVariants`](#hlsiframevariants)
   - [`hls.createIFramePlayer()`](#hlscreateiframeplayer)
     - [Example usage](#example-usage)
+  - [`hls.createImageIFramePlayer()`](#hlscreateimageiframeplayer)
+    - [Example usage](#example-usage-1)
+    - [Handling image data without an HTMLImageElement](#handling-image-data-without-an-htmlimageelement)
 - [Live stream API](#live-stream-api)
   - [`hls.liveSyncPosition`](#hlslivesyncposition)
   - [`hls.latency`](#hlslatency)
@@ -643,6 +648,12 @@ The maximum duration of buffered media to keep once it has been played, in secon
 (default: `Infinity`)
 
 The maximum duration of buffered media, in seconds, from the play position to keep before evicting non-contiguous forward ranges. A value of `Infinity` means no active eviction will take place; This value will always be at least the `maxBufferLength`.
+
+### `loopBackBufferFlush`
+
+(default: `undefined`)
+
+Controls back-buffer flushing on quality upgrades when the underlying `HTMLMediaElement` has `loop` set to `true`. When the player switches up to a higher-quality level during looped playback, the back buffer holds lower-quality segments that will be played again on the next loop. By default (`undefined`), HLS.js flushes those segments so the loop replays at the new, higher quality. Set this to `false` to opt out and preserve the existing back buffer across loops. Has no effect when `media.loop` is `false`.
 
 ### `startOnSegmentBoundary`
 
@@ -1884,7 +1895,83 @@ data will be passed on all media requests (manifests, playlists, a/v segments, t
 - `sessionId`: The CMCD session id. One will be automatically generated if none is provided.
 - `contentId`: The CMCD content id.
 - `useHeaders`: Send CMCD data in request headers instead of as query args. Defaults to `false`.
-- `includeKeys`: An optional array of CMCD keys. When present, only these CMCD fields will be included with each each request.
+- `includeKeys`: An optional array of CMCD keys. When present, only these CMCD fields will be included with each request. Defaults to the full set of keys for the configured `version`.
+- `version`: CMCD version to report. Accepts `1` (CMCD v1) or `2` (CMCD v2). Defaults to `1`. When set to `2`, additional v2 fields (player state `sta`, buffer starvation duration `bs`, etc.) and event-mode reporting become available.
+- `eventTargets`: An optional array of CMCD v2 event report targets. Each target configures an endpoint that receives batched event reports (player state changes, bitrate changes, errors, etc.). Requires `version: 2`. Each target has the following properties:
+  - `url`: The endpoint URL that receives CMCD event reports. Required.
+  - `events`: An optional array of [CMCD event types](https://github.com/streaming-video-technology-alliance/common-media-library/tree/main/libs/cmcd) to report to this target. If omitted, no events are sent. Values are the short codes such as `"ps"` (play state), `"bc"` (bitrate change), `"e"` (error), `"t"` (time interval).
+  - `interval`: For the time-interval event, the reporting cadence in seconds. Defaults to `30`.
+  - `batchSize`: The number of events to batch before sending a report. Defaults to `1` (send each event immediately).
+  - `includeKeys`: An optional array of CMCD keys that overrides the top-level `includeKeys` for this target.
+- `rtpSafetyFactor`: A multiplier applied to the segment bitrate to compute the `rtp` (requested throughput) field. The spec defines `rtp` as the maximum throughput the client considers sufficient, which should include headroom above the encoded bitrate to absorb network jitter and avoid rebuffering. Defaults to `5` (5× the segment bitrate). Only used when `version: 2`.
+- `loader`: An optional async function `(request) => Promise<{ status }>` used to deliver CMCD v2 event reports. When omitted, event reports are delivered via `fetch` (honoring the Hls `xhrSetup`/`fetchSetup` hooks). Only used when `eventTargets` is configured.
+- `reporterCallback`: An optional `(reporter: CmcdCustomReporter) => void` callback. Called once per `MANIFEST_LOADING`, before the reporter starts. Use it to seed custom CMCD keys or store the reference for firing custom events at runtime. Always use the most recently received reference, since a new source load yields a new instance.
+
+  The `CmcdCustomReporter` exposes two methods:
+  - `updateCustomData(data)` — sets persistent custom key/value pairs included in every subsequent report. Keys must follow the CMCD custom key convention (`<reverse-dns>-<label>`, e.g. `com.myco-chapter`). Invalid keys are silently dropped.
+  - `recordCustomEvent(eventName, data?)` — fires a one-off CMCD custom event (`ce`) with the given name and optional custom data. Requires `cmcd.eventTargets` to be configured with a target whose `events` array includes `'ce'`.
+
+```js
+let cmcdReporter = null;
+
+const hls = new Hls({
+  cmcd: {
+    version: 2,
+    contentId: 'my-content',
+    includeKeys: [
+      'sid',
+      'cid',
+      'sf',
+      'st',
+      'su',
+      'bl',
+      'br',
+      'mtp',
+      'com.myco-adBreak',
+    ],
+    eventTargets: [
+      {
+        url: 'https://analytics.example.com/cmcd',
+        events: ['ce'],
+        includeKeys: ['sid', 'cid', 'cen', 'com.myco-chapter'],
+      },
+    ],
+    reporterCallback: (reporter) => {
+      cmcdReporter = reporter;
+      // Seed persistent custom key state (included in all subsequent reports)
+      reporter.updateCustomData({
+        'com.myco-adBreak': 'false',
+        'com.myco-chapter': 'intro',
+      });
+    },
+  },
+});
+
+// Update custom key state at runtime (takes effect on the next report)
+cmcdReporter?.updateCustomData({
+  'com.myco-adBreak': adManager.isInAdBreak() ? 'true' : 'false',
+});
+
+// Fire a one-off CMCD custom event
+cmcdReporter?.recordCustomEvent('chapter-change');
+```
+
+`reporterCallback` is called on every `MANIFEST_LOADING` (new source = new reporter). Always store the latest reference.
+
+**Validating custom keys:** If you want to verify your keys follow the CMCD custom key convention before use, you can use `validateCmcdKeys` from `@svta/cml-cmcd`:
+
+```js
+import { validateCmcdKeys } from '@svta/cml-cmcd';
+
+const myKeys = { 'com.myco-chapter': 'intro' };
+const { valid, issues } = validateCmcdKeys(myKeys);
+if (!valid) {
+  console.warn(
+    'Invalid CMCD keys:',
+    issues.map((i) => i.message),
+  );
+}
+```
 
 ### `enableInterstitialPlayback`
 
@@ -1925,6 +2012,14 @@ When set, the `assetPlayerId` is included in log messages and can be used to ide
 An optional identifier string used to identify the primary HLS session when working with Interstitials. This value is passed to interstitial asset URLs via the `_HLS_primary_id` query parameter, allowing the server to associate interstitial requests with the primary session.
 
 This is primarily used internally by HLS.js when creating interstitial asset players, but can be set manually if you need to coordinate multiple HLS instances.
+
+### `iframeCacheLimit`
+
+(default: `2097152` (2 MB))
+
+The maximum total byte size of cached I-Frame data retained by I-Frame player instances. When the cache exceeds this limit, the oldest entries are evicted and their `Fragment.data` is cleared to free memory.
+
+Video I-Frame players (`hls.createIFramePlayer()`) cache loaded fragment data so that frames removed from the video SourceBuffer (buffered media beyond a rendered frame is removed so that it renders reliably) can be re-buffered without additional requests. Image I-Frame players (`hls.createImageIFramePlayer()`) cache the image data extracted from loaded fragments.
 
 ### `useMediaCapabilities`
 
@@ -2234,6 +2329,77 @@ function preloadIFrame(time) {
   hlsIframesOnly?.loadMediaAt(time, { seekOnAppend: false });
 }
 ```
+
+| Method                               | Description                                                       |
+| ------------------------------------ | ----------------------------------------------------------------- |
+| `hls.createIFramePlayer(config?)`    | Creates an I-Frame player, or `null` if no I-Frame variants exist |
+| `player.attachMedia(video)`          | Attach an `HTMLVideoElement` for frame rendering                  |
+| `player.detachMedia()`               | Detach the video element                                          |
+| `player.loadMediaAt(time, options?)` | Load, append and then seek to the I-Frame at the given time       |
+| `player.stopLoad()`                  | Cancel active loading of segment data                             |
+| `player.destroy()`                   | Clean up resources                                                |
+
+### `hls.createImageIFramePlayer()`
+
+`createImageIFramePlayer` returns a new `HlsImageIFramesOnly` instance that uses the current instance's `iframeVariants` filtered to only those with an image codec (e.g. `CODECS="mjpg"`) as its `levels`. Returns `null` when no image I-Frame variants are available or before levels have loaded. This method accepts an optional config overrides argument.
+
+Image I-Frame instances load JPEG keyframes from fMP4 I-Frame segments without requiring MSE or a `<video>` element. This is useful for thumbnail previews or trick-play, especially on devices limited to a single video decoder.
+
+#### Example usage
+
+```ts
+const mainVideo = document.getElementById('video');
+const thumbnailImg = document.getElementById('thumbnail') as HTMLImageElement;
+const hls = new Hls();
+
+let imagePlayer: HlsImageIFramesOnly | null = null;
+
+hls.loadSource('http://example.com/primary.m3u8');
+hls.attachMedia(mainVideo);
+
+hls.once(Events.MANIFEST_PARSED, () => {
+  imagePlayer = hls.createImageIFramePlayer();
+  if (imagePlayer) {
+    imagePlayer.attachImage(thumbnailImg);
+    imagePlayer.on(Events.FRAG_BUFFERED, (name, { frag }) => {
+      /* JPEG frame rendered to image element */
+    });
+    imagePlayer.on(Events.ERROR, (name, { error }) => {
+      /* handle error */
+    });
+  }
+});
+
+function showThumbnailAtTime(time: number) {
+  imagePlayer?.loadMediaAt(time);
+}
+```
+
+| Method                                 | Description                                                          |
+| -------------------------------------- | -------------------------------------------------------------------- |
+| `hls.createImageIFramePlayer(config?)` | Creates an image I-Frame player, or `null` if no MJPG variants exist |
+| `player.attachImage(img)`              | Attach an `HTMLImageElement` for frame rendering                     |
+| `player.detachImage()`                 | Detach the image element                                             |
+| `player.loadMediaAt(time)`             | Load and display the I-Frame at the given time                       |
+| `player.stopLoad()`                    | Cancel active loading of segment data                                |
+| `player.destroy()`                     | Clean up resources                                                   |
+
+#### Handling image data without an HTMLImageElement
+
+Developers can process image data directly instead of attaching an `HTMLImageElement`. Omit the `attachImage()` call and listen for `FRAG_PARSED` — the `Fragment.data` property on the event's `frag` contains the raw JPEG bytes (a `Uint8Array` extracted from the fMP4 mdat box):
+
+```ts
+const imagePlayer = hls.createImageIFramePlayer();
+if (imagePlayer) {
+  imagePlayer.on(Hls.Events.FRAG_PARSED, (name, { frag }) => {
+    const jpegBytes: Uint8Array = frag.data;
+    // Process JPEG data (e.g. draw to canvas, cache and replace frag.data, etc.)
+  });
+  imagePlayer.loadMediaAt(30);
+}
+```
+
+Note: `FRAG_BUFFERED` only fires when an `HTMLImageElement` is attached (emitted after `image.onload`). Without an attached image, use `FRAG_PARSED` which fires once the segment is demuxed and `Fragment.data` is populated.
 
 ## Live stream API
 

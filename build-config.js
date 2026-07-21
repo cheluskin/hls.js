@@ -149,12 +149,17 @@ const workerFnFooter = '})(false);';
 
 const extensions = ['.ts', '.js'];
 
+// Browser baseline for the legacy UMD/IIFE bundles. Chosen so that all listed
+// targets natively support the ES2015 built-ins (Map, Set, Array.from,
+// Uint8Array.from, Promise, etc.) that source and bundled @svta/* deps rely
+// on — we intentionally do NOT bundle core-js polyfills, to keep size down.
+// Keep this list in sync with the "Compatibility" section in README.md.
 const babelPresetEnvTargets = {
   chrome: '47',
   firefox: '51',
-  safari: '8',
-  ios: '8',
-  android: '4',
+  safari: '10',
+  ios: '10',
+  android: '5',
   samsung: '5',
   edge: '14',
 };
@@ -344,6 +349,8 @@ function getAliasesForDist(format, features) {
     aliases = {
       ...aliases,
       './controller/iframe-controller': `./${emptyFile}`,
+      './iframe-stream-controller': `./${emptyFile}`,
+      './image-iframe-stream-controller': `./${emptyFile}`,
     };
   }
 

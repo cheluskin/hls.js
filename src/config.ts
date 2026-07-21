@@ -46,6 +46,13 @@ import type {
 import type { CuesInterface } from './utils/cues';
 import type { ILogger } from './utils/logger';
 import type { KeySystems, MediaKeyFunc } from './utils/mediakeys-helper';
+import type {
+  CmcdCustomKey,
+  CmcdCustomValue,
+  CmcdEventReportConfig,
+  CmcdKey,
+  CmcdVersion,
+} from '@svta/cml-cmcd';
 
 export type ABRControllerConfig = {
   abrEwmaFastLive: number;
@@ -70,6 +77,7 @@ export type BufferControllerConfig = {
   appendTimeout: number;
   backBufferLength: number;
   frontBufferFlushThreshold: number;
+  loopBackBufferFlush?: boolean;
   liveDurationInfinity: boolean;
   /**
    * @deprecated use backBufferLength
@@ -81,11 +89,32 @@ export type CapLevelControllerConfig = {
   capLevelToPlayerSize: boolean;
 };
 
+export type CmcdCustomData = {
+  [index: CmcdCustomKey]: CmcdCustomValue | undefined;
+};
+
+export interface CmcdCustomReporter {
+  updateCustomData(data: CmcdCustomData): void;
+  recordCustomEvent(eventName: string, data?: CmcdCustomData): void;
+}
+
 export type CMCDControllerConfig = {
   sessionId?: string;
   contentId?: string;
   useHeaders?: boolean;
-  includeKeys?: string[];
+  includeKeys?: CmcdKey[];
+  version?: CmcdVersion;
+  rtpSafetyFactor?: number;
+  eventTargets?: (Omit<CmcdEventReportConfig, 'enabledKeys'> & {
+    includeKeys?: CmcdKey[];
+  })[];
+  loader?: (request: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: BodyInit;
+  }) => Promise<{ status: number }>;
+  reporterCallback?: (reporter: CmcdCustomReporter) => void;
 };
 
 export type DRMSystemOptions = {
@@ -124,7 +153,7 @@ export type EMEControllerConfig = {
     url: string,
     keyContext: MediaKeySessionContext & { decryptdata: LevelKey },
     licenseChallenge: Uint8Array,
-  ) => void | Uint8Array | Promise<Uint8Array | void>;
+  ) => void | Uint8Array | string | Promise<Uint8Array | string | void>;
   licenseResponseCallback?: (
     this: Hls,
     xhr: XMLHttpRequest,
@@ -174,6 +203,10 @@ export type LevelControllerConfig = {
 export type MP4RemuxerConfig = {
   stretchShortVideoTrack: boolean;
   maxAudioFramesDrift: number;
+};
+
+export type IFrameControllerConfig = {
+  iframeCacheLimit: number;
 };
 
 export interface PlaylistLoaderConstructor {
@@ -371,8 +404,8 @@ export type HlsConfig = {
 
   streamController: typeof StreamController;
   abrController: typeof AbrController;
-  bufferController: typeof BufferController;
-  capLevelController: typeof CapLevelController;
+  bufferController?: typeof BufferController;
+  capLevelController?: typeof CapLevelController;
   errorController: typeof ErrorController;
   fpsController?: typeof FPSController;
   progressive: boolean;
@@ -387,6 +420,7 @@ export type HlsConfig = {
   GapControllerConfig &
   LevelControllerConfig &
   MP4RemuxerConfig &
+  IFrameControllerConfig &
   StreamControllerConfig &
   SelectionPreferences &
   LatencyControllerConfig &
@@ -425,6 +459,7 @@ export const hlsDefaultConfig: HlsConfig = {
   maxBufferLength: 30, // used by stream-controller
   backBufferLength: Infinity, // used by buffer-controller
   frontBufferFlushThreshold: Infinity,
+  loopBackBufferFlush: undefined, // used by buffer-controller
   startOnSegmentBoundary: false, // used by stream-controller
   nextAudioTrackBufferFlushForwardOffset: 0.25, // used by stream-controller
   maxBufferSize: 60 * 1000 * 1000, // used by stream-controller
@@ -504,6 +539,7 @@ export const hlsDefaultConfig: HlsConfig = {
   enableInterstitialPlayback: __USE_INTERSTITIALS__,
   interstitialAppendInPlace: true,
   interstitialLiveLookAhead: 10,
+  iframeCacheLimit: 2 * 1024 * 1024,
   useMediaCapabilities: __USE_MEDIA_CAPABILITIES__,
   preserveManualLevelOnError: false,
   errorPenaltyExpireMs: 0, // used by error-controller and abr-controller

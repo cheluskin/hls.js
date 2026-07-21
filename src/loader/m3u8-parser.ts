@@ -48,7 +48,7 @@ export type ParsedMultivariantMediaOptions = {
 type LevelKeys = { [key: string]: LevelKey | undefined };
 
 const MASTER_PLAYLIST_REGEX =
-  /#EXT-X-STREAM-INF:([^\r\n]*)(?:[\r\n](?:#[^\r\n]*)?)*([^\r\n]+)|#EXT-X-(I-FRAME-STREAM-INF|SESSION-DATA|SESSION-KEY|DEFINE|CONTENT-STEERING|START):([^\r\n]*)[\r\n]+/g;
+  /#EXT-X-STREAM-INF:([^\r\n]*)(?:[\r\n](?:#[^\r\n]*)?)*([^\r\n]+)|#EXT-X-(I-FRAME-STREAM-INF|SESSION-DATA|SESSION-KEY|DEFINE|CONTENT-STEERING|START):([^\r\n]*)(?:[\r\n]+|$)/g;
 const MASTER_PLAYLIST_MEDIA_REGEX = /#EXT-X-MEDIA:(.*)/g;
 
 const IS_MEDIA_PLAYLIST = /^#EXT(?:INF|-X-TARGETDURATION):/m; // Handle empty Media Playlist (first EXTINF not signaled, but TARGETDURATION present)
@@ -487,10 +487,14 @@ export default class M3U8Parser {
           case 'MEDIA-SEQUENCE':
             if (level.startSN !== 0) {
               assignMultipleMediaPlaylistTagOccuranceError(level, tag, result);
-            } else if (fragments.length > 0) {
+            } else if (prevFrag !== null) {
+              // a real Media Segment (not an EXT-X-SKIP placeholder) precedes this tag
               assignMustAppearBeforeSegmentsError(level, tag, result);
             }
-            currentSN = level.startSN = parseInt(value1);
+            level.startSN = parseInt(value1);
+            // include skipped segments so the first real fragment keeps its sequence
+            // number when EXT-X-SKIP is declared before EXT-X-MEDIA-SEQUENCE
+            currentSN = level.startSN + level.skippedSegments;
             break;
           case 'SKIP': {
             if (level.skippedSegments) {
@@ -573,7 +577,9 @@ export default class M3U8Parser {
             if (dateRange.isValid || level.skippedSegments) {
               level.dateRanges[dateRange.id] = dateRange;
             } else {
-              logger.warn(`Ignoring invalid DATERANGE tag: "${value1}"`);
+              logger.log(
+                `Ignoring invalid DATERANGE tag: ${dateRange.invalidReason}: ${value1}`,
+              );
             }
             // Add to fragment tag list for backwards compatibility (< v1.2.0)
             frag.tagList.push(['EXT-X-DATERANGE', value1]);
@@ -772,7 +778,11 @@ export default class M3U8Parser {
        * computed.
        */
       if (firstPdtIndex > 0) {
-        backfillProgramDateTimes(fragments, firstPdtIndex);
+        backfillProgramDateTimes(
+          fragments,
+          firstPdtIndex,
+          firstPdtIndex > fragmentLength - 1 ? frag : null,
+        );
         if (firstFragment) {
           programDateTimes.unshift(firstFragment as MediaFragment);
         }
@@ -970,7 +980,7 @@ function setCodecs(
   level: CodecsParsed,
 ) {
   let codecs = (codecsAttributeValue || '').split(/[ ,]+/).filter((c) => c);
-  ['video', 'audio', 'text'].forEach((type: CodecType) => {
+  ['video', 'audio', 'text', 'image'].forEach((type: CodecType) => {
     const filtered = codecs.filter((codec) => isCodecType(codec, type));
     if (filtered.length) {
       // Comma separated list of all codecs for type
@@ -996,8 +1006,12 @@ function assignCodec(
 function backfillProgramDateTimes(
   fragments: M3U8ParserFragments,
   firstPdtIndex: number,
+  fragPrev: Fragment | null,
 ) {
-  let fragPrev = fragments[firstPdtIndex] as Fragment;
+  fragPrev ||= fragments[firstPdtIndex];
+  if (!fragPrev) {
+    return;
+  }
   for (let i = firstPdtIndex; i--; ) {
     const frag = fragments[i];
     // Exit on delta-playlist skipped segments

@@ -1,7 +1,8 @@
-import { uuid } from '@svta/common-media-library/utils/uuid';
+import { uuid } from '@svta/cml-utils';
 import { EventEmitter } from 'eventemitter3';
 import { buildAbsoluteURL } from 'url-toolkit';
 import { enableStreamingMode, hlsDefaultConfig, mergeConfig } from './config';
+import { State } from './controller/base-stream-controller';
 import { FragmentTracker } from './controller/fragment-tracker';
 import LevelController from './controller/level-controller';
 import { ErrorDetails, ErrorTypes } from './errors';
@@ -29,7 +30,7 @@ import type AbrController from './controller/abr-controller';
 import type AudioStreamController from './controller/audio-stream-controller';
 import type AudioTrackController from './controller/audio-track-controller';
 import type BasePlaylistController from './controller/base-playlist-controller';
-import type { InFlightData, State } from './controller/base-stream-controller';
+import type { InFlightData } from './controller/base-stream-controller';
 import type BaseStreamController from './controller/base-stream-controller';
 import type BufferController from './controller/buffer-controller';
 import type CapLevelController from './controller/cap-level-controller';
@@ -41,6 +42,7 @@ import type FPSController from './controller/fps-controller';
 import type GapController from './controller/gap-controller';
 import type {
   HlsIFramesOnly,
+  HlsImageIFramesOnly,
   IFrameController,
 } from './controller/iframe-controller';
 import type InterstitialsController from './controller/interstitials-controller';
@@ -124,8 +126,8 @@ export default class Hls implements HlsEventEmitter {
   private _autoLevelCapping: number = -1;
   private _maxHdcpLevel: HdcpLevel = null;
   private abrController: AbrComponentAPI;
-  private bufferController: BufferController;
-  private capLevelController: CapLevelController;
+  private bufferController?: BufferController;
+  private capLevelController?: CapLevelController;
   private latencyController?: LatencyController;
   private levelController: LevelController;
   private audioStreamController?: AudioStreamController;
@@ -245,18 +247,22 @@ export default class Hls implements HlsEventEmitter {
     const interstitialsController = _InterstitialsController
       ? (this.interstitialsController = new _InterstitialsController(this, Hls))
       : null;
-    const bufferController = (this.bufferController = new _BufferController(
-      this,
-      fragmentTracker,
-    ));
-    const capLevelController = (this.capLevelController =
-      new _CapLevelController(this));
-
+    const bufferController = _BufferController
+      ? (this.bufferController = new _BufferController(this, fragmentTracker))
+      : null;
+    const capLevelController = _CapLevelController
+      ? (this.capLevelController = new _CapLevelController(this))
+      : null;
     const fpsController = _FpsController ? new _FpsController(this) : null;
+    const _CMCDController = config.cmcdController;
+    // Instantiate CMCDController before PlaylistLoader to receive Manifest Loading events first
+    const cmcdController = _CMCDController
+      ? (this.cmcdController = new _CMCDController(this))
+      : null;
     const playListLoader = new PlaylistLoader(this);
 
     const _ContentSteeringController = config.contentSteeringController;
-    // Instantiate ConentSteeringController before LevelController to receive Multivariant Playlist events first
+    // Instantiate ContentSteeringController before LevelController to receive Multivariant Playlist events first
     const contentSteering = _ContentSteeringController
       ? new _ContentSteeringController(this)
       : null;
@@ -281,7 +287,9 @@ export default class Hls implements HlsEventEmitter {
       : undefined);
 
     // Cap level controller uses streamController to flush the buffer
-    capLevelController.setStreamController(streamController);
+    if (capLevelController) {
+      capLevelController.setStreamController(streamController);
+    }
 
     const networkControllers: NetworkComponentAPI[] = [
       playListLoader,
@@ -296,11 +304,16 @@ export default class Hls implements HlsEventEmitter {
     }
 
     this.networkControllers = networkControllers;
-    const coreComponents: ComponentAPI[] = [abrController, bufferController];
+    const coreComponents: ComponentAPI[] = [abrController];
+    if (bufferController) {
+      coreComponents.push(bufferController);
+    }
     if (gapController) {
       coreComponents.push(gapController);
     }
-    coreComponents.push(capLevelController);
+    if (capLevelController) {
+      coreComponents.push(capLevelController);
+    }
     if (fpsController) {
       // fpsController uses streamController to switch when frames are being dropped
       fpsController.setStreamController(streamController);
@@ -345,10 +358,9 @@ export default class Hls implements HlsEventEmitter {
       config.emeController,
       coreComponents,
     );
-    this.cmcdController = this.createController(
-      config.cmcdController,
-      coreComponents,
-    );
+    if (cmcdController) {
+      coreComponents.push(cmcdController);
+    }
     this.latencyController = this.createController(
       config.latencyController,
       coreComponents,
@@ -537,7 +549,7 @@ export default class Hls implements HlsEventEmitter {
    */
   transferMedia(): AttachMediaSourceData | null {
     this._media = null;
-    const transferMedia = this.bufferController.transferMedia();
+    const transferMedia = this.bufferController?.transferMedia() || null;
     const data = { transferMedia };
     this.trigger(Events.MEDIA_DETACHING, data);
     this.trigger(Events.MEDIA_DETACHED, data);
@@ -564,7 +576,8 @@ export default class Hls implements HlsEventEmitter {
     if (
       media &&
       loadedSource &&
-      (loadedSource !== loadingSource || this.bufferController.hasSourceTypes())
+      (loadedSource !== loadingSource ||
+        this.bufferController?.hasSourceTypes())
     ) {
       // Remove and re-create MediaSource
       this.detachMedia();
@@ -640,7 +653,7 @@ export default class Hls implements HlsEventEmitter {
    * Returns whether loading, toggled with `startLoad()` and `stopLoad()`, is active or not`.
    */
   get loadingEnabled(): boolean {
-    return this.started;
+    return this.started && this.streamController.state !== State.STOPPED;
   }
 
   /**
@@ -889,13 +902,17 @@ export default class Hls implements HlsEventEmitter {
    * Enables or disables level capping. If disabled after previously enabled, `nextLevelSwitch` will be immediately called.
    */
   set capLevelToPlayerSize(shouldStartCapping: boolean) {
+    const capLevelController = this.capLevelController;
     const newCapLevelToPlayerSize = !!shouldStartCapping;
 
-    if (newCapLevelToPlayerSize !== this.config.capLevelToPlayerSize) {
+    if (
+      capLevelController &&
+      newCapLevelToPlayerSize !== this.config.capLevelToPlayerSize
+    ) {
       if (newCapLevelToPlayerSize) {
-        this.capLevelController.startCapping(); // If capping occurs, nextLevelSwitch will happen based on size.
+        capLevelController.startCapping(); // If capping occurs, nextLevelSwitch will happen based on size.
       } else {
-        this.capLevelController.stopCapping();
+        capLevelController.stopCapping();
         this.autoLevelCapping = -1;
         this.streamController.nextLevelSwitch(); // Now we're uncapped, get the next level asap.
       }
@@ -1058,6 +1075,10 @@ export default class Hls implements HlsEventEmitter {
 
   public get mainForwardBufferInfo(): BufferInfo | null {
     return this.streamController.getMainFwdBufferInfo();
+  }
+
+  public get audioForwardBufferInfo(): BufferInfo | null {
+    return this.audioStreamController?.getFwdBufferInfo() || null;
   }
 
   public get maxBufferLength(): number {
@@ -1326,6 +1347,22 @@ export default class Hls implements HlsEventEmitter {
   }
 
   /**
+   * Returns an new image iframe focused Hls (HlsImageIFramesOnly) instance based on `iframeVariants` found in the
+   * current asset, or null when no image variants are available. An image iframe instance uses iframe variants with
+   * image codec values in CODECS ("mjpg") as its `levels`.
+   * Use HlsIFramesOnly.loadMediaAt(time) to load image IFrames.
+   * Attach an HTMLImageElement with HlsImageIFramesOnly.attachImage(image), or process image data on FRAG_LOADED.
+   */
+  createImageIFramePlayer(
+    configOverride?: Partial<HlsConfig>,
+  ): HlsImageIFramesOnly | null {
+    if (__USE_IFRAMES__ && this._url && this.iframeController) {
+      return this.iframeController.createImageIFramePlayer(configOverride);
+    }
+    return null;
+  }
+
+  /**
    * returns mediaCapabilities.decodingInfo for a variant/rendition
    */
   getMediaDecodingInfo(
@@ -1377,6 +1414,7 @@ export type {
   GapController,
   IFrameController,
   HlsIFramesOnly,
+  HlsImageIFramesOnly,
   InterstitialsController,
   LatencyController,
   StreamController,
@@ -1403,15 +1441,19 @@ export type {
   BufferControllerConfig,
   CapLevelControllerConfig,
   CMCDControllerConfig,
+  CmcdCustomReporter,
+  CmcdCustomData,
   EMEControllerConfig,
   DRMSystemConfiguration,
   DRMSystemsConfiguration,
   DRMSystemOptions,
+  ErrorControllerConfig,
   FPSControllerConfig,
   FragmentLoaderConfig,
   FragmentLoaderConstructor,
   GapControllerConfig,
   HlsLoadPolicies,
+  IFrameControllerConfig,
   LevelControllerConfig,
   LoaderConfig,
   LoadPolicy,
@@ -1439,6 +1481,7 @@ export type {
   FragmentState,
   FragmentTracker,
 } from './controller/fragment-tracker';
+export type { FragmentEntity } from './types/fragment-tracker';
 export type {
   PathwayClone,
   SteeringManifest,
@@ -1450,6 +1493,7 @@ export type {
   IErrorAction,
 } from './controller/error-controller';
 export type { ID3TrackController } from './controller/id3-track-controller';
+export type { LoadMediaAtOptions } from './controller/iframe-stream-controller';
 export type {
   HlsAssetPlayer,
   HlsAssetPlayerConfig,

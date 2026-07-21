@@ -37,7 +37,7 @@ export default class BasePlaylistController
   public destroy() {
     this.clearTimer();
     // @ts-ignore
-    this.hls = this.log = this.warn = null;
+    this.hls = null;
   }
 
   private clearTimer() {
@@ -155,7 +155,7 @@ export default class BasePlaylistController
     // Set last updated date-time
     const now = self.performance.now();
     const elapsed = stats.loading.first
-      ? Math.max(0, now - stats.loading.first)
+      ? Math.max(0, Math.floor(now - stats.loading.first))
       : 0;
     details.advancedDateTime = Date.now() - elapsed;
 
@@ -236,16 +236,21 @@ export default class BasePlaylistController
       );
       if (details.requestScheduled + reloadInterval < now) {
         details.requestScheduled = now;
-      } else {
+      } else if (details.requestScheduled <= now) {
         details.requestScheduled += reloadInterval;
       }
+      const requestedHls = data.deliveryDirectives;
       this.log(
         `live playlist ${index} ${
           details.advanced
-            ? 'REFRESHED ' + details.lastPartSn + '-' + details.lastPartIndex
+            ? `REFRESHED ${details.lastPartSn} - ${details.lastPartIndex}`
             : details.updated
               ? 'UPDATED'
-              : 'MISSED'
+              : `MISSED (received ${details.lastPartSn} - ${details.lastPartIndex}${
+                  requestedHls
+                    ? ` | requested ${requestedHls.msn} - ${requestedHls.part}`
+                    : ''
+                })`
         }`,
       );
       if (!this.canLoad || !details.live) {

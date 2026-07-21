@@ -2,7 +2,7 @@ import BufferOperationQueue from './buffer-operation-queue';
 import { createDoNothingErrorAction } from './error-controller';
 import { ErrorDetails, ErrorTypes } from '../errors';
 import { Events } from '../events';
-import { ElementaryStreamTypes, isMediaFragment } from '../loader/fragment';
+import { ElementaryStreamTypes } from '../loader/fragment';
 import { DEFAULT_TARGET_DURATION } from '../loader/level-details';
 import { PlaylistLevelType } from '../types/loader';
 import { BufferHelper } from '../utils/buffer-helper';
@@ -70,6 +70,8 @@ const VIDEO_CODEC_PROFILE_REPLACE =
 
 const TRACK_REMOVED_ERROR_NAME = 'HlsJsTrackRemovedError';
 
+const LOOP_FLUSH_SAFETY_MARGIN = 0.25;
+
 class HlsJsTrackRemovedError extends Error {
   constructor(message) {
     super(message);
@@ -99,11 +101,6 @@ export default class BufferController extends Logger implements ComponentAPI {
   // Last MP3 audio chunk appended
   private lastMpegAudioChunk: ChunkMetadata | null = null;
 
-  // Audio fragment blocked from appending until corresponding video appends or context changes
-  private blockedAudioAppend: {
-    op: BufferOperation;
-    frag: MediaFragment | Part;
-  } | null = null;
   // Keep track of video append position for unblocking audio
   private lastVideoAppendEnd: number = 0;
   // Whether or not to use ManagedMediaSource API and append source element to media element.
@@ -149,7 +146,7 @@ export default class BufferController extends Logger implements ComponentAPI {
   public destroy() {
     this.unregisterListeners();
     this.details = null;
-    this.lastMpegAudioChunk = this.blockedAudioAppend = null;
+    this.lastMpegAudioChunk = null;
     this.transferData = this.overrides = undefined;
     if (this.operationQueue) {
       this.operationQueue.destroy();
@@ -250,7 +247,7 @@ export default class BufferController extends Logger implements ComponentAPI {
     ];
     this.tracks = tracks;
     this.resetQueue();
-    this.lastMpegAudioChunk = this.blockedAudioAppend = null;
+    this.lastMpegAudioChunk = null;
     this.lastVideoAppendEnd = 0;
   }
 
@@ -750,16 +747,14 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     const op: BufferOperation = {
       label: 'block-audio',
       execute: () => {
-        const videoTrack = this.tracks.video;
+        const videoEnd = this.lastVideoAppendEnd;
         if (
-          this.lastVideoAppendEnd > pTime ||
-          (videoTrack?.buffer &&
-            BufferHelper.isBuffered(videoTrack.buffer, pTime)) ||
+          videoEnd > pTime ||
+          BufferHelper.isBuffered(this.tracks.video?.buffer, pTime) ||
           this.fragmentTracker.getAppendedFrag(pTime, PlaylistLevelType.MAIN)
             ?.gap === true
         ) {
-          this.blockedAudioAppend = null;
-          this.shiftAndExecuteNext('audio');
+          this.unblockAudio();
         }
       },
       onStart: () => {},
@@ -768,15 +763,12 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
         this.warn('Error executing block-audio operation', error);
       },
     };
-    this.blockedAudioAppend = { op, frag: partOrFrag };
     this.append(op, 'audio', true);
   }
 
   private unblockAudio() {
-    const { blockedAudioAppend, operationQueue } = this;
-    if (blockedAudioAppend && operationQueue) {
-      this.blockedAudioAppend = null;
-      operationQueue.unblockAudio(blockedAudioAppend.op);
+    if (this.operationQueue) {
+      this.operationQueue.unblockAudio();
     }
   }
 
@@ -818,23 +810,23 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     const videoTrack = tracks.video;
     const videoSb = videoTrack?.buffer;
     if (videoSb && sn !== 'initSegment' && offset !== undefined) {
+      const audioSb = audioTrack?.buffer;
       const partOrFrag = part || (frag as MediaFragment);
-      const blockedAudioAppend = this.blockedAudioAppend;
       if (
         type === 'audio' &&
         parent !== 'main' &&
-        !this.blockedAudioAppend &&
-        !(videoTrack.ending || videoTrack.ended)
+        !(videoTrack.ending || videoTrack.ended) &&
+        audioSb &&
+        BufferHelper.getBuffered(audioSb).length
       ) {
         const pStart = partOrFrag.start;
         const pTime = pStart + partOrFrag.duration * 0.05;
-        const vbuffered = videoSb.buffered;
+        const vbuffered = BufferHelper.getBuffered(videoSb);
         const vappending = this.currentOp('video');
         if (!vbuffered.length && !vappending) {
           // wait for video before appending audio
           this.blockAudio(partOrFrag);
         } else if (
-          !vappending &&
           !BufferHelper.isBuffered(videoSb, pTime) &&
           this.lastVideoAppendEnd < pTime
         ) {
@@ -843,17 +835,13 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
         }
       } else if (type === 'video') {
         const videoAppendEnd = partOrFrag.end;
-        if (blockedAudioAppend) {
-          const audioStart = blockedAudioAppend.frag.start;
-          if (
-            videoAppendEnd > audioStart ||
-            videoAppendEnd < this.lastVideoAppendEnd ||
-            BufferHelper.isBuffered(videoSb, audioStart)
-          ) {
-            this.unblockAudio();
-          }
-        }
+        const diff = this.lastVideoAppendEnd - videoAppendEnd;
         this.lastVideoAppendEnd = videoAppendEnd;
+        if (diff < 0 || diff > partOrFrag.duration) {
+          this.unblockAudio();
+        } else if (this.isAudioBlocked()) {
+          this.executeNext('audio');
+        }
       }
     }
 
@@ -940,7 +928,7 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
             if (evictEnd > 0) {
               this._quotaEvictionPending[type] = true;
               this.log(
-                `QuotaExceededError on "${type}" append sn: ${sn} — evicting back buffer to ${evictEnd.toFixed(3)}s and retrying`,
+                `QuotaExceededError on "${type}" append sn: ${sn} - evicting back buffer to ${evictEnd.toFixed(3)}s and retrying`,
               );
               const removeOp = this.getFlushOp(type, 0, evictEnd);
               const clearOp = this.getClearEvictionPendingOp(type);
@@ -949,7 +937,7 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
               return;
             }
             this.warn(
-              `QuotaExceededError on "${type}" sn: ${sn} — no back buffer available to evict`,
+              `QuotaExceededError on "${type}" sn: ${sn} - no back buffer available to evict`,
             );
           }
         }
@@ -1044,7 +1032,9 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
         this.removeExecutor(type, start, end);
       },
       onStart: () => {
-        // logger.debug(`[buffer-controller]: Started flushing ${start} -> ${end} for ${type} Source Buffer`);
+        // this.log(
+        //   `Started flushing ${start} -> ${end} for ${type} Source Buffer`,
+        // );
       },
       onComplete: () => {
         const sb = this.tracks[type]?.buffer;
@@ -1075,6 +1065,9 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     data: BufferFlushingData,
   ) {
     const { type, startOffset, endOffset } = data;
+    if (!type || type === 'audio') {
+      this.unblockAudio();
+    }
     if (type) {
       this.append(this.getFlushOp(type, startOffset, endOffset), type);
     } else {
@@ -1143,36 +1136,39 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
       return;
     }
     const { backBufferLength, frontBufferFlushThreshold } = config;
-    this.trimBuffers(frontBufferFlushThreshold, backBufferLength);
+    this.trimBuffers(
+      frontBufferFlushThreshold,
+      backBufferLength,
+      data.frag,
+      data.previousFrag,
+    );
 
     // Only clear append errors on successful encounter of buffered media. Init segments may complete without error for unsupported media.
-    if (isMediaFragment(data.frag)) {
-      const elementaryStreams = data.frag.elementaryStreams;
-      const { appendErrors } = this;
-      const appendErrorType = this.appendError?.sourceBufferName;
+    const elementaryStreams = data.frag.elementaryStreams;
+    const { appendErrors } = this;
+    const appendErrorType = this.appendError?.sourceBufferName;
 
-      Object.keys(elementaryStreams).forEach((type) => {
-        if (!elementaryStreams[type]) {
-          return;
-        }
-        appendErrors[type] = 0;
-        if (type === appendErrorType) {
+    Object.keys(elementaryStreams).forEach((type) => {
+      if (!elementaryStreams[type]) {
+        return;
+      }
+      appendErrors[type] = 0;
+      if (type === appendErrorType) {
+        this.appendError = undefined;
+      }
+      if (type === 'audio' || type === 'video') {
+        appendErrors.audiovideo = 0;
+        if (appendErrorType === 'audiovideo') {
           this.appendError = undefined;
         }
-        if (type === 'audio' || type === 'video') {
-          appendErrors.audiovideo = 0;
-          if (appendErrorType === 'audiovideo') {
-            this.appendError = undefined;
-          }
-        } else {
-          appendErrors.audio = 0;
-          appendErrors.video = 0;
-          if (appendErrorType !== 'audiovideo') {
-            this.appendError = undefined;
-          }
+      } else {
+        appendErrors.audio = 0;
+        appendErrors.video = 0;
+        if (appendErrorType !== 'audiovideo') {
+          this.appendError = undefined;
         }
-      });
-    }
+      }
+    });
   }
 
   public get bufferedToEnd(): boolean {
@@ -1191,7 +1187,7 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
   }
 
   // on BUFFER_EOS mark matching sourcebuffer(s) as "ending" and "ended" and queue endOfStream after remaining operations(s)
-  // an undefined data.type will mark all buffers as EOS.
+  // a nullish data.type will mark all buffers as EOS.
   private onBufferEos(event: Events.BUFFER_EOS, data: BufferEOSData) {
     this.sourceBuffers.forEach(([type]) => {
       if (type) {
@@ -1212,6 +1208,7 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
       !this.sourceBuffers.some(([type]) => type && !this.tracks[type]?.ended);
 
     if (allTracksEnding) {
+      this.unblockAudio();
       if (allowEndOfStream) {
         this.log(`Queueing EOS`);
         this.blockUntilOpen(() => {
@@ -1314,6 +1311,8 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
   private trimBuffers(
     frontBufferFlushThreshold: number,
     backBufferLength: number,
+    frag?: MediaFragment,
+    previousFrag?: MediaFragment | null,
   ) {
     const { hls, details, media } = this;
     if (!media || details === null) {
@@ -1334,12 +1333,30 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
         ? config.liveBackBufferLength
         : backBufferLength;
 
+    let targetBackBufferPosition = -Infinity;
     if (Number.isFinite(backBufferLength) && backBufferLength >= 0) {
       const maxBackBufferLength = Math.max(backBufferLength, targetDuration);
-      const targetBackBufferPosition =
+      targetBackBufferPosition =
         Math.floor(currentTime / targetDuration) * targetDuration -
         maxBackBufferLength;
+    }
 
+    // For looped media with a quality upgrade, extend the flush position
+    // to remove lower-quality segments from the back buffer.
+    if (frag) {
+      const loopFlushEnd = this.getLoopBackBufferFlushEnd(
+        frag,
+        previousFrag ?? null,
+      );
+      if (loopFlushEnd > 0) {
+        targetBackBufferPosition = Math.max(
+          targetBackBufferPosition,
+          loopFlushEnd,
+        );
+      }
+    }
+
+    if (targetBackBufferPosition > 0) {
       this.flushBackBuffer(
         currentTime,
         targetDuration,
@@ -1369,6 +1386,57 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     }
   }
 
+  /**
+   * For looped media, determine the back buffer flush position to remove
+   * lower-quality segments on a quality upgrade. Returns 0 if no flush is needed.
+   */
+  private getLoopBackBufferFlushEnd(
+    frag: MediaFragment,
+    previousFrag: MediaFragment | null,
+  ): number {
+    const { media } = this;
+    if (
+      this.hls?.config.loopBackBufferFlush === false ||
+      !media?.loop ||
+      !previousFrag ||
+      frag.level <= previousFrag.level
+    ) {
+      return 0;
+    }
+
+    const { video, audiovideo } = frag.elementaryStreams;
+    if (video?.partial || audiovideo?.partial) {
+      return 0;
+    }
+
+    const flushEnd =
+      this.getEarliestElementaryStreamStart(frag) - LOOP_FLUSH_SAFETY_MARGIN;
+    if (flushEnd <= 0) {
+      return 0;
+    }
+
+    this.log(
+      `Flushing lower quality back buffer for loop: level ${frag.level}, range [0-${flushEnd.toFixed(3)}]`,
+    );
+    return flushEnd;
+  }
+
+  private getEarliestElementaryStreamStart(frag: MediaFragment): number {
+    const { audio, video, audiovideo } = frag.elementaryStreams;
+    let earliest = frag.start;
+    if (audiovideo) {
+      earliest = Math.min(earliest, audiovideo.startDTS);
+    } else {
+      if (audio) {
+        earliest = Math.min(earliest, audio.startDTS);
+      }
+      if (video) {
+        earliest = Math.min(earliest, video.startDTS);
+      }
+    }
+    return earliest;
+  }
+
   private flushBackBuffer(
     currentTime: number,
     targetDuration: number,
@@ -1392,7 +1460,12 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
             this.hls.trigger(Events.LIVE_BACK_BUFFER_REACHED, {
               bufferEnd: targetBackBufferPosition,
             });
-          } else if (track?.ended) {
+          } else if (
+            track?.ended &&
+            !(
+              this.media?.loop && this.hls?.config.loopBackBufferFlush !== false
+            )
+          ) {
             this.log(
               `Cannot flush ${type} back buffer while SourceBuffer is in ended state`,
             );
@@ -1806,6 +1879,15 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
       return;
     }
     operation.onComplete();
+
+    const updating = this.tracks[type]?.buffer?.updating;
+    if (updating) {
+      this.log(`${type} SourceBuffer updating on "updateend"`);
+      this.blockUntilOpen(() => {
+        this.shiftAndExecuteNext(type);
+      });
+      return;
+    }
     this.shiftAndExecuteNext(type);
   }
 
@@ -1869,6 +1951,11 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
       ? mediaSource.duration
       : Infinity;
     const removeStart = Math.max(0, startOffset);
+    if (removeStart >= msDuration) {
+      this.currentOp(type)?.onComplete();
+      this.shiftAndExecuteNext(type);
+      return;
+    }
     const removeEnd = Math.min(endOffset, mediaDuration, msDuration);
     if (removeEnd > removeStart && (!track.ending || track.ended)) {
       track.ended = false;
@@ -1996,6 +2083,17 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     return !!track && !track.buffer;
   }
 
+  private isAudioBlocked(): boolean {
+    return this.currentOp('audio')?.label === 'block-audio';
+  }
+
+  private isAudioBlocking(): boolean {
+    if (this.operationQueue) {
+      return this.operationQueue.audioBlocking();
+    }
+    return false;
+  }
+
   // Enqueues an operation to each SourceBuffer queue which, upon execution, resolves a promise. When all promises
   // resolve, the onUnblocked function is executed. Functions calling this method do not need to unblock the queue
   // upon completion, since we already do it here
@@ -2009,14 +2107,12 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     }
     const { operationQueue } = this;
 
+    const audioAlreadyBlocked =
+      bufferNames.length === 2 && this.isAudioBlocking();
     // logger.debug(`[buffer-controller]: Blocking ${buffers} SourceBuffer`);
-    const blockingOperations = bufferNames.map((type) =>
-      this.appendBlocker(type),
-    );
-    const audioBlocked = bufferNames.length > 1 && !!this.blockedAudioAppend;
-    if (audioBlocked) {
-      this.unblockAudio();
-    }
+    const blockingOperations = audioAlreadyBlocked
+      ? [this.appendBlocker('video')]
+      : bufferNames.map((type) => this.appendBlocker(type));
     return Promise.all(blockingOperations).then((result) => {
       if (operationQueue !== this.operationQueue) {
         return;
@@ -2033,7 +2129,7 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
       // Only cycle the queue if the SB is not updating. There's a bug in Chrome which sets the SB updating flag to
       // true when changing the MediaSource duration (https://bugs.chromium.org/p/chromium/issues/detail?id=959359&can=2&q=mediasource%20duration)
       // While this is a workaround, it's probably useful to have around
-      if (!sb || sb.updating) {
+      if (!sb || sb.updating || (type === 'audio' && this.isAudioBlocked())) {
         return;
       }
       this.shiftAndExecuteNext(type);

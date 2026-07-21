@@ -33,7 +33,12 @@ type EMEControllerTestable = Omit<EMEController, 'hls' | 'mediaKeySessions'> & {
     data: MediaAttachedData,
   ) => void;
   onMediaDetached: () => void;
+  onManifestLoaded: (
+    event: Events.MANIFEST_LOADED,
+    data: { sessionKeys: LevelKey[] },
+  ) => void;
   media: HTMLMediaElement | null;
+  keyFormatPromise: Promise<KeySystemFormats> | null;
   getKeyStatuses: (mediaKeySessionContext: MediaKeySessionContext) => {
     [keyId: string]: MediaKeyStatus;
   };
@@ -582,6 +587,112 @@ describe('EMEController', function () {
       });
   });
 
+  it('should reject pending session-key key-system selection with invalid state when destroyed', function () {
+    let resolveKeySystemAccess!: (value: MediaKeySystemAccess) => void;
+    const keySystemAccessPromise = new Promise<MediaKeySystemAccess>(
+      (resolve) => {
+        resolveKeySystemAccess = resolve;
+      },
+    );
+    const createMediaKeysSpy = sinon.spy(() =>
+      Promise.resolve(new MediaKeysMock()),
+    );
+    const reqMediaKsAccessSpy = sinon.spy(() => keySystemAccessPromise);
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      drmSystems: {
+        'com.apple.fps': {},
+      },
+    });
+
+    const levelKey = getParsedLevelKey();
+
+    emeController.onManifestLoaded(Events.MANIFEST_LOADED, {
+      sessionKeys: [levelKey],
+    });
+
+    const keyFormatPromise = emeController.keyFormatPromise;
+    if (!keyFormatPromise) {
+      throw new Error('Expected pending key-system selection');
+    }
+
+    emeController.destroy();
+    const mediaKeySystemAccess: MediaKeySystemAccess = {
+      keySystem: KeySystems.FAIRPLAY,
+      createMediaKeys: createMediaKeysSpy,
+      getConfiguration: () => ({}),
+    };
+    resolveKeySystemAccess(mediaKeySystemAccess);
+
+    return keyFormatPromise.then(
+      () => {
+        throw new Error('Expected key-system selection to reject');
+      },
+      (error) => {
+        expect(error).to.be.instanceOf(Error);
+        expect(error.message).to.equal('invalid state');
+        expect(createMediaKeysSpy).not.to.have.been.called;
+      },
+    );
+  });
+
+  it('should handle unused session-key key-system selection rejections', function () {
+    let rejectKeySystemAccess!: (error: Error) => void;
+    const keySystemAccessPromise = new Promise<MediaKeySystemAccess>(
+      (resolve, reject) => {
+        rejectKeySystemAccess = reject;
+      },
+    );
+    let unhandledRejection: PromiseRejectionEvent | null = null;
+    const onUnhandledRejection = (event: PromiseRejectionEvent) => {
+      unhandledRejection = event;
+      event.preventDefault();
+    };
+
+    self.addEventListener('unhandledrejection', onUnhandledRejection);
+
+    setupEach({
+      emeEnabled: true,
+      requestMediaKeySystemAccessFunc: () => keySystemAccessPromise,
+      drmSystems: {
+        'com.apple.fps': {},
+      },
+    });
+
+    emeController.onManifestLoaded(Events.MANIFEST_LOADED, {
+      sessionKeys: [getParsedLevelKey()],
+    });
+
+    const keyFormatPromise = emeController.keyFormatPromise;
+    if (!keyFormatPromise) {
+      throw new Error('Expected key-system selection promise');
+    }
+
+    rejectKeySystemAccess(new Error('key-system access failed'));
+
+    return new Promise<void>((resolve) => {
+      self.setTimeout(resolve, 0);
+    })
+      .then(() => {
+        expect(unhandledRejection).to.equal(null);
+        expect(emeController.hls.trigger).not.to.have.been.called;
+        return keyFormatPromise.then(
+          () => {
+            throw new Error('Expected key-system selection to reject');
+          },
+          (error) => {
+            expect(error).to.be.instanceOf(Error);
+            expect(error.message).to.equal('key-system access failed');
+          },
+        );
+      })
+      .finally(() => {
+        self.removeEventListener('unhandledrejection', onUnhandledRejection);
+      });
+  });
+
   it('should remove media property  when media is detached', function () {
     const reqMediaKsAccessSpy = sinon.spy(function () {
       return Promise.resolve({
@@ -743,6 +854,182 @@ describe('EMEController', function () {
     return EMEController.CDMCleanupPromise.then(() => {
       expect(keySessionCloseSpy).callCount(1);
       expect(emeController.mediaKeySessions.length).to.equal(0);
+    });
+  });
+
+  describe('serialized key-session setup (#7796)', function () {
+    class DeferredMediaKeySessionMock extends MediaKeySessionMock {
+      generateRequest() {
+        this.emit('message', {
+          messageType: 'license-request',
+          message: new Uint8Array(0),
+        });
+        // Do not auto-publish key statuses — tests drive timing manually.
+        return Promise.resolve();
+      }
+
+      publishKeyStatus(keyId: Uint8Array<ArrayBuffer> = new Uint8Array(16)) {
+        this._keyStatuses.set(keyId, 'usable');
+        this.emit('keystatuseschange', {});
+      }
+    }
+
+    const drain = () =>
+      new Promise<void>((resolve) => self.setTimeout(() => resolve(), 0));
+
+    const buildKsAccessSpy = (sessions: DeferredMediaKeySessionMock[]) => {
+      const createSessionSpy = sinon.spy(() => {
+        const session = new DeferredMediaKeySessionMock();
+        sessions.push(session);
+        return session;
+      });
+      const reqMediaKsAccessSpy = sinon.spy(function () {
+        return Promise.resolve({
+          keySystem: 'com.apple.fps',
+          createMediaKeys: sinon.spy(() =>
+            Promise.resolve({
+              setServerCertificate: () => Promise.resolve(),
+              createSession: createSessionSpy,
+            }),
+          ),
+        });
+      });
+      return { reqMediaKsAccessSpy, createSessionSpy };
+    };
+
+    const respondToXhrEmpty = () => {
+      sinonFakeXMLHttpRequestStatic.onCreate = (
+        xhr: sinon.SinonFakeXMLHttpRequest,
+      ) => {
+        self.setTimeout(() => {
+          (xhr as any).response = new Uint8Array();
+          xhr.respond(200, {}, '');
+        }, 0);
+      };
+    };
+
+    it('blocks concurrent loadKey for the same URI on a single session', function () {
+      const sessions: DeferredMediaKeySessionMock[] = [];
+      const { reqMediaKsAccessSpy, createSessionSpy } =
+        buildKsAccessSpy(sessions);
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.apple.fps': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      respondToXhrEmpty();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      const levelKey = getParsedLevelKey();
+      const pA = emeController.loadKey(getEncryptedFrag(levelKey));
+      const pB = emeController.loadKey(getEncryptedFrag(levelKey));
+
+      return drain()
+        .then(() => {
+          expect(createSessionSpy).callCount(1);
+          sessions[0].publishKeyStatus();
+          return Promise.all([pA, pB]);
+        })
+        .then(() => {
+          expect(createSessionSpy).callCount(1);
+          expect(emeController.mediaKeySessions.length).to.equal(1);
+        });
+    });
+
+    it('creates distinct concurrent sessions for distinct URIs', function () {
+      const sessions: DeferredMediaKeySessionMock[] = [];
+      const { reqMediaKsAccessSpy, createSessionSpy } =
+        buildKsAccessSpy(sessions);
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.apple.fps': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      respondToXhrEmpty();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      // Distinct keyIds mirror real HLS where different key URIs map to
+      // different keys. Distinct URIs do not block each other — FPS in
+      // particular relies on parallel session setup.
+      const keyA = getParsedLevelKey('data://key-uri-A');
+      keyA.keyId = new Uint8Array(16).fill(0xa1);
+      const keyB = getParsedLevelKey('data://key-uri-B');
+      keyB.keyId = new Uint8Array(16).fill(0xb2);
+      const fragA = getEncryptedFrag(keyA);
+      const fragB = getEncryptedFrag(keyB);
+
+      const pA = emeController.loadKey(fragA);
+      const pB = emeController.loadKey(fragB);
+
+      return drain()
+        .then(() => {
+          // Distinct URIs run in parallel — each gets its own session.
+          expect(createSessionSpy).callCount(2);
+          sessions[0].publishKeyStatus(keyA.keyId!);
+          sessions[1].publishKeyStatus(keyB.keyId!);
+          return Promise.all([pA, pB]);
+        })
+        .then(() => {
+          expect(emeController.mediaKeySessions.length).to.equal(2);
+        });
+    });
+
+    it('does not orphan blocked callers when the first session setup fails', function () {
+      const sessions: DeferredMediaKeySessionMock[] = [];
+      const createSessionSpy = sinon.spy(() => {
+        const session = new DeferredMediaKeySessionMock();
+        if (sessions.length === 0) {
+          (session as any).generateRequest = () =>
+            Promise.reject(new Error('first session failed'));
+        }
+        sessions.push(session);
+        return session;
+      });
+      const reqMediaKsAccessSpy = sinon.spy(function () {
+        return Promise.resolve({
+          keySystem: 'com.apple.fps',
+          createMediaKeys: sinon.spy(() =>
+            Promise.resolve({
+              setServerCertificate: () => Promise.resolve(),
+              createSession: createSessionSpy,
+            }),
+          ),
+        });
+      });
+      setupEach({
+        emeEnabled: true,
+        drmSystems: { 'com.apple.fps': { licenseUrl: 'http://noop' } },
+        requestMediaKeySystemAccessFunc: reqMediaKsAccessSpy,
+      });
+      respondToXhrEmpty();
+      emeController.onMediaAttached(Events.MEDIA_ATTACHED, {
+        media: media as any as HTMLMediaElement,
+      });
+
+      const levelKey = getParsedLevelKey();
+      const pA = emeController
+        .loadKey(getEncryptedFrag(levelKey))
+        .catch(() => undefined);
+      const pB = emeController.loadKey(getEncryptedFrag(levelKey));
+
+      return drain()
+        .then(() => drain())
+        .then(() => {
+          // After A's failure, B should drive a fresh session creation.
+          expect(createSessionSpy.callCount).to.be.at.least(1);
+          if (sessions.length >= 2) {
+            sessions[1].publishKeyStatus();
+          }
+          return Promise.all([pA, pB]);
+        })
+        .then(() => {
+          expect(createSessionSpy.callCount).to.be.at.least(2);
+          expect(emeController.mediaKeySessions.length).to.equal(1);
+        });
     });
   });
 });

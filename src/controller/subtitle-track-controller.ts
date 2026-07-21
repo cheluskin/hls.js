@@ -176,8 +176,12 @@ class SubtitleTrackController extends BasePlaylistController {
 
     if (this.hls.config.renderTextTracksNatively) {
       this.tracksInGroup.forEach((track) => {
-        if (track.trackNode) {
-          track.trackNode.remove();
+        const trackNode = track.trackNode;
+        if (trackNode) {
+          // Chrome displays cached track state after re-adding tracks.
+          // Hide track to avoid re-rendering captions from this session.
+          trackNode.track.mode = 'hidden';
+          trackNode.remove();
           track.trackNode = undefined;
         }
       });
@@ -264,7 +268,7 @@ class SubtitleTrackController extends BasePlaylistController {
             ? this.hls.config.enableIMSC1
             : this.hls.config.enableWebVTT
         ) {
-          if (!subtitleGroups || subtitleGroups.includes(track.groupId)) {
+          if (!subtitleGroups || subtitleGroups.indexOf(track.groupId) > -1) {
             // track.id should match hls.subtitleTracks index
             track.id = subtitleTracks.length;
             subtitleTracks.push(track);

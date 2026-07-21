@@ -354,16 +354,27 @@ HLS.js is only compatible with browsers supporting MediaSource extensions (MSE) 
 
 HLS.js is supported on:
 
-- Chrome 39+ for Android
-- Chrome 39+ for Desktop
-- Firefox 41+ for Android
-- Firefox 42+ for Desktop
+- Chrome 47+ for Desktop
+- Firefox 51+ for Desktop
 - Edge for Windows 10+
-- Safari 9+ for macOS 10.11+
+- Safari 10+ for macOS 10.11+
 - Safari for iPadOS 13+
 - Safari for iOS 17.1+ since HLS version [1.5.0](https://github.com/video-dev/hls.js/releases/tag/v1.5.0) using Managed Media Source (MMS) [WebKit blog](https://webkit.org/blog/14735/webkit-features-in-safari-17-1/)
+- Chrome for Android 5+
+- Firefox for Android 5+
 
-A [Promise polyfill](https://github.com/taylorhakes/promise-polyfill) is required in browsers missing native promise support.
+These versions are the targets passed to [`@babel/preset-env`](https://babeljs.io/docs/babel-preset-env) when building the UMD bundles in `dist/`. They share an **ES2016 runtime baseline**: ES5-style syntax plus native ES2016 globals (`Map`, `Set`, `Promise`, `Array.from`, `Uint8Array.from`, `Array.prototype.includes`, etc.). To keep bundle size small, no `core-js` polyfills are bundled.
+
+Optional features such as CMCD pull in ES2017 APIs (e.g. `Object.entries`), so the full UMD bundle effectively requires an ES2017-capable runtime. The `light` bundle excludes those features and stays at the ES2016 baseline.
+
+The `dist/` folder ships two distribution variants:
+
+- **UMD** (`dist/hls.js`, `dist/hls.min.js`, `dist/hls.light.js`, `dist/hls.light.min.js`) — embeddable directly via a `<script>` tag (exposes a global `Hls`) or resolved by `require('hls.js')` via `package.json`'s `main` field. Targets the browser list above. The companion `dist/hls.worker.js` is the bundled transmuxer Web Worker.
+- **ESM** (`dist/hls.mjs`, `dist/hls.light.mjs`) — resolved by `import 'hls.js'` via the `module` field. Built with `@babel/preset-env`'s `esmodules: true` target (≈ Chrome 61+, Firefox 60+, Safari 10.1+, Edge 16+) and intended to be consumed by a modern bundler. Uses ES2015+ syntax but stays below ES2019 (no `Array.prototype.flatMap`, `Object.fromEntries`, etc.).
+
+If you import from `src/` directly or include any of our runtime dependencies untranspiled in your own build, you bypass this Babel pipeline and become responsible for transpilation; those source modules can reach for ES2019+ APIs that are tree-shaken out of the bundles we publish.
+
+To run on browsers below this baseline, supply your own polyfills for any missing globals before HLS.js loads.
 
 **Please note:**
 
@@ -425,7 +436,9 @@ native browser support for HLS playback in HTMLMediaElements:
 
 #### Alternative setup
 
-To check for native browser support first and then fallback to HLS.js, swap these conditionals. See [this comment](https://github.com/video-dev/hls.js/pull/2954#issuecomment-670021358) to understand some of the tradeoffs.
+To check for native browser support first and then fallback to HLS.js, swap these conditionals.
+
+> **Note:** `video.canPlayType('application/vnd.apple.mpegurl')` returns a non-empty string ("maybe") in Safari, Chrome, and potentially other browsers. However, not all browsers support HLS content equally — for example, Chrome 147 reports support but may fail to play certain streams natively. Using `Hls.isSupported()` first (the default setup above) is recommended unless you specifically need native playback.
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
@@ -436,12 +449,17 @@ To check for native browser support first and then fallback to HLS.js, swap thes
   var video = document.getElementById('video');
   var videoSrc = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';
   //
-  // First check for native browser HLS support
+  // Only use native HLS in browsers with ManagedMediaSource (e.g. modern Safari)
+  // where native playback is well-supported. Other browsers may report HLS support
+  // via canPlayType but fail to play certain streams reliably.
   //
-  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+  if (
+    video.canPlayType('application/vnd.apple.mpegurl') &&
+    'ManagedMediaSource' in window
+  ) {
     video.src = videoSrc;
     //
-    // If no native HLS support, check if HLS.js is supported
+    // If not using native HLS, check if HLS.js is supported
     //
   } else if (Hls.isSupported()) {
     var hls = new Hls();
@@ -522,6 +540,7 @@ The following players integrate HLS.js for HLS playback:
 |                          [<img src="https://showmax.akamaized.net/e/logo/showmax_black.png" width="120">](https://tech.showmax.com)                          | [<img src="https://static3.1tv.ru/assets/web/logo-ac67852f1625b338f9d1fb96be089d03557d50bfc5790d5f48dc56799f59dec6.svg" width="120" height="120">](https://www.1tv.ru/) |       [<img src="https://user-images.githubusercontent.com/1480052/40482633-c013ebce-5f55-11e8-96d5-b776415de0ce.png" width="120">](https://www.zdf.de)        |                                                                  [<img src="https://cms-static.brid.tv/img/brid-logo-120x120.jpg" width="120">](https://www.brid.tv/)                                                                   |
 |                                                            [cdn77](https://streaming.cdn77.com/)                                                             |                                  [<img src="https://avatars0.githubusercontent.com/u/7442371?s=200&v=4" width="120">](https://r7.com/)                                  | [<img src="https://raw.githubusercontent.com/Novage/p2p-media-loader/gh-pages/images/p2pml-logo.png" width="120">](https://github.com/Novage/p2p-media-loader) |                                                              [<img src="https://avatars3.githubusercontent.com/u/45617200?s=400" width="120">](https://kayosports.com.au)                                                               |
 |    [<img src="https://avatars1.githubusercontent.com/u/5279615?s=400&u=9771a216836c613f1edf4afe71cfc69d4c5657ed&v=4" width="120">](https://flosports.tv)     |                  [<img src="https://www.logolynx.com/images/logolynx/c6/c67a2cb3ad33a82b5518f8ad8f124703.png" width="120">](https://global.axon.com/)                   |                    [<img src="https://static.rutube.ru/static/img/svg/logo_rutube_black_color_154x25.svg" width="120">](https://rutube.ru/)                    |                                                 [<img src="https://raw.githubusercontent.com/aaskaoui/labra-flex-assets/master/labra-flex.png" width="120">](https://labra-flex.world/)                                                 |
+|                              [<img src="https://store-prod.b-cdn.net/logo/streamfizz.png" width="120">](https://streamfizz.fr)                               |                                                                                                                                                                         |                                                                                                                                                                |                                                                                                                                                                                                                                         |
 
 ## Chrome/Firefox integration
 

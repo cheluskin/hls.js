@@ -54,3 +54,6 @@ _ReSharper*/
 # Failback variant builds
 dist-armdb/
 dist-intrdb/
+
+# Claude local settings
+.claude/settings.local.json

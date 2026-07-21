@@ -1,5 +1,6 @@
-import { utf8ArrayToStr } from '@svta/common-media-library/utils/utf8ArrayToStr';
+import { utf8ArrayToStr } from '@svta/cml-id3';
 import { arrayToHex } from './hex';
+import { bin2str } from './numeric-encoding-utils';
 import { ElementaryStreamTypes } from '../loader/fragment';
 import { logger } from '../utils/logger';
 import type { ChunkMetadata } from '../hls';
@@ -72,28 +73,24 @@ export const RemuxerTrackIdConfig = {
   text: 4,
 };
 
-export function bin2str(data: Uint8Array): string {
-  return String.fromCharCode.apply(null, data);
-}
-
-export function readUint16(buffer: Uint8Array, offset: number): number {
+function readUint16(buffer: Uint8Array, offset: number): number {
   const val = (buffer[offset] << 8) | buffer[offset + 1];
   return val < 0 ? 65536 + val : val;
 }
 
-export function readUint32(buffer: Uint8Array, offset: number): number {
+function readUint32(buffer: Uint8Array, offset: number): number {
   const val = readSint32(buffer, offset);
   return val < 0 ? 4294967296 + val : val;
 }
 
-export function readUint64(buffer: Uint8Array, offset: number) {
+function readUint64(buffer: Uint8Array, offset: number) {
   let result = readUint32(buffer, offset);
   result *= Math.pow(2, 32);
   result += readUint32(buffer, offset + 4);
   return result;
 }
 
-export function readSint32(buffer: Uint8Array, offset: number): number {
+function readSint32(buffer: Uint8Array, offset: number): number {
   return (
     (buffer[offset] << 24) |
     (buffer[offset + 1] << 16) |
@@ -107,6 +104,54 @@ export function writeUint32(buffer: Uint8Array, offset: number, value: number) {
   buffer[offset + 1] = (value >> 16) & 0xff;
   buffer[offset + 2] = (value >> 8) & 0xff;
   buffer[offset + 3] = value & 0xff;
+}
+
+export function truncateIFrameMoofToSamples(
+  data: Uint8Array<ArrayBuffer>,
+  keepSampleCount: number,
+  keepTotalSize: number,
+): number | undefined {
+  const moofs = findBox(data, ['moof']);
+  if (moofs.length !== 1) {
+    return;
+  }
+  const moof = moofs[0];
+  const trafs = findBox(moof, ['traf']);
+  for (let i = 0; i < trafs.length; i++) {
+    const traf = trafs[i];
+    const trun = findBox(traf, ['trun'])[0];
+    if (trun) {
+      writeUint32(data, trun.byteOffset - data.byteOffset + 4, keepSampleCount);
+    }
+    const senc = findBox(traf, ['senc'])[0];
+    if (senc) {
+      writeUint32(data, senc.byteOffset - data.byteOffset + 4, keepSampleCount);
+    }
+    const saiz = findBox(traf, ['saiz'])[0];
+    if (saiz) {
+      const saizFlags = (saiz[1] << 16) | (saiz[2] << 8) | saiz[3];
+      let off = 4;
+      if (saizFlags & 0x01) {
+        off += 8;
+      }
+      off += 1;
+      writeUint32(
+        data,
+        saiz.byteOffset - data.byteOffset + off,
+        keepSampleCount,
+      );
+    }
+  }
+  const mdats = findBox(data, ['mdat']);
+  if (mdats.length === 1) {
+    writeUint32(
+      data,
+      mdats[0].byteOffset - data.byteOffset - 8,
+      8 + keepTotalSize,
+    );
+    // Callers use the mdat end to exclude trailing partial-sample bytes
+    return mdats[0].byteOffset - data.byteOffset + keepTotalSize;
+  }
 }
 
 export function hasBoxData(data: Uint8Array, type: BoxType): boolean {
@@ -701,6 +746,7 @@ export function parseSinf(sinf: Uint8Array): BoxDataOrUndefined {
 
 type TrackFragmentRunSample = {
   cts?: number;
+  duration: number;
   size: number;
   flags?: {
     dependsOn: 1 | 2;
@@ -710,6 +756,8 @@ type TrackFragmentRunSample = {
 type TrackFragmentRun = {
   sampleOffset: number;
   samples: TrackFragmentRunSample[];
+  lastSampleDurationOffset?: number;
+  defaultSampleDurationOffset?: number;
 };
 export type TrackTimes = {
   duration: number;
@@ -787,19 +835,32 @@ export function getSampleData(
       }
 
       const trackDefault = track.default;
-      const tfhdFlags = readUint32(tfhd, 0) | trackDefault?.flags!;
+      const tfhdFlags = readUint32(tfhd, 0) & 0xffffff;
+      // tfhd optional fields follow track_ID (at byte 8) in this fixed order,
+      // each present only when its flag is set. Walk them so default_sample_size
+      // is read at the correct offset regardless of which earlier fields exist.
       let defaultSampleDuration = trackDefault?.duration || 0;
-      const defaultSampleSize = trackDefault?.sampleSize || 0;
+      let defaultSampleDurationOffset: number | undefined;
+      let defaultSampleSize = trackDefault?.sampleSize || 0;
+      let tfhdOptOffset = 8;
+      if (tfhdFlags & 0x000001) {
+        // base_data_offset (64-bit)
+        tfhdOptOffset += 8;
+      }
+      if (tfhdFlags & 0x000002) {
+        // sample_description_index
+        tfhdOptOffset += 4;
+      }
       if (tfhdFlags & 0x000008) {
-        // 0x000008 indicates the presence of the default_sample_duration field
-        if (tfhdFlags & 0x000002) {
-          // 0x000002 indicates the presence of the sample_description_index field, which precedes default_sample_duration
-          // If present, the default_sample_duration exists at byte offset 12
-          defaultSampleDuration = readUint32(tfhd, 12);
-        } else {
-          // Otherwise, the duration is at byte offset 8
-          defaultSampleDuration = readUint32(tfhd, 8);
-        }
+        // default_sample_duration
+        defaultSampleDuration = readUint32(tfhd, tfhdOptOffset);
+        defaultSampleDurationOffset =
+          tfhd.byteOffset - data.byteOffset + tfhdOptOffset;
+        tfhdOptOffset += 4;
+      }
+      if (tfhdFlags & 0x000010) {
+        // default_sample_size
+        defaultSampleSize = readUint32(tfhd, tfhdOptOffset);
       }
       let baseDataOffset = 0;
       const baseDataOffsetPresent = (tfhdFlags & 0x000001) !== 0;
@@ -847,16 +908,20 @@ export function getSampleData(
         }
         let sampleOffset = baseDataOffset + dataOffset;
         const samples: TrackFragmentRunSample[] = [];
+        const fragRun: TrackFragmentRun = {
+          sampleOffset,
+          samples,
+          defaultSampleDurationOffset,
+        };
         if (sampleOffset <= eof) {
-          const fragRun: TrackFragmentRun = {
-            sampleOffset,
-            samples,
-          };
           trackTimes.trun.push(fragRun);
         }
         let size;
         for (let ix = 0; ix < sampleCount; ix++) {
+          let thisSampleDurationOffset: number | undefined;
           if (sampleDurationPresent) {
+            thisSampleDurationOffset =
+              trun.byteOffset - data.byteOffset + offset;
             sampleDuration = readUint32(trun, offset);
             offset += 4;
           } else {
@@ -868,31 +933,39 @@ export function getSampleData(
           } else {
             size = defaultSampleSize;
           }
+          let flags;
+          if (sampleFlagsPresent) {
+            const isNonSyncSample = trun[offset + 1] & 0x01;
+            flags = {
+              isNonSync: isNonSyncSample ? 1 : 0,
+              dependsOn: (trun[offset] & 0x03) === 1 ? 1 : 2,
+            };
+            offset += 4;
+          }
+          let cts = 0;
+          if (sampleCompositionTimeOffsetPresent) {
+            const version = trun[0];
+            cts =
+              version === 0
+                ? readUint32(trun, offset)
+                : readSint32(trun, offset);
+            offset += 4;
+          }
           sampleOffset += size;
+          // Capture only fitting samples so a partial-mdat truncation
+          // can still rewrite the right uint32 to balance EXTINF. Field
+          // offsets above advance for every declared sample to stay aligned.
           if (sampleOffset <= eof) {
-            let flags;
-            let cts = 0;
-            if (sampleFlagsPresent) {
-              const isNonSyncSample = trun[offset + 1] & 0x01;
-              flags = {
-                isNonSync: isNonSyncSample ? 1 : 0,
-                dependsOn: (trun[offset] & 0x03) === 1 ? 1 : 2,
-              };
-              if (!isNonSyncSample) {
-                if (trackTimes.keyFrameIndex === undefined) {
-                  trackTimes.keyFrameIndex = ix;
-                  trackTimes.keyFrameStart = sampleDTS;
-                }
-              }
-              offset += 4;
+            if (thisSampleDurationOffset !== undefined) {
+              fragRun.lastSampleDurationOffset = thisSampleDurationOffset;
             }
-            if (sampleCompositionTimeOffsetPresent) {
-              const version = trun[0];
-              cts =
-                version === 0
-                  ? readUint32(trun, offset)
-                  : readSint32(trun, offset);
-              offset += 4;
+            if (
+              flags &&
+              !flags.isNonSync &&
+              trackTimes.keyFrameIndex === undefined
+            ) {
+              trackTimes.keyFrameIndex = ix;
+              trackTimes.keyFrameStart = sampleDTS;
             }
             const pts = sampleDTS + cts;
             if (
@@ -909,6 +982,7 @@ export function getSampleData(
             }
             samples[ix] = {
               cts,
+              duration: sampleDuration,
               flags,
               size,
             };

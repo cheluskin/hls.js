@@ -44,6 +44,7 @@ import type {
 import type { MediaPlaylist } from '../types/media-playlist';
 import type { TrackSet } from '../types/track';
 import type { TransmuxerResult } from '../types/transmuxer';
+import type { BufferInfo } from '../utils/buffer-helper';
 
 const TICK_INTERVAL = 100; // how often to tick in ms
 
@@ -221,20 +222,29 @@ class AudioStreamController
     const lastCurrentTime = this.lastCurrentTime;
     this.stopLoad();
     this.setInterval(TICK_INTERVAL);
-    if (lastCurrentTime > 0 && startPosition === -1) {
+    if (
+      lastCurrentTime > 0 &&
+      startPosition === -1 &&
+      !skipSeekToStartPosition &&
+      this.initPTS.length
+    ) {
       this.log(
         `Override startPosition with lastCurrentTime @${lastCurrentTime.toFixed(
           3,
         )}`,
       );
       startPosition = lastCurrentTime;
-      this.state = State.IDLE;
-    } else {
-      this.state = State.WAITING_TRACK;
     }
+    this.state = State.IDLE;
     this.nextLoadPosition = this.lastCurrentTime =
       startPosition + this.timelineOffset;
     this.startPosition = skipSeekToStartPosition ? -1 : startPosition;
+    if (
+      !skipSeekToStartPosition &&
+      !this.fragmentTracker.hasFragments(this.playlistType)
+    ) {
+      this.startFragRequested = false;
+    }
     this.tick();
   }
 
@@ -344,16 +354,13 @@ class AudioStreamController
       return;
     }
 
-    const bufferable = this.mediaBuffer ? this.mediaBuffer : this.media;
+    const bufferable = this.getBufferOutput();
     if (this.bufferFlushed && bufferable) {
       this.bufferFlushed = false;
       this.afterBufferFlushed(bufferable, ElementaryStreamTypes.AUDIO);
     }
 
-    const bufferInfo = this.getFwdBufferInfo(
-      bufferable,
-      PlaylistLevelType.AUDIO,
-    );
+    const bufferInfo = this.getFwdBufferInfo();
     if (bufferInfo === null) {
       return;
     }
@@ -379,11 +386,11 @@ class AudioStreamController
     if (this.switchingTrack && media) {
       const pos = loadPosition;
       // if currentTime (pos) is less than alt audio playlist start time, it means that alt audio is ahead of currentTime
-      if (trackDetails.PTSKnown && pos < start) {
+      if (trackDetails.PTSKnown && pos < start && pos >= this.timelineOffset) {
         // if everything is buffered from pos to start or if audio buffer upfront, let's seek to start
         if (bufferInfo.end > start || bufferInfo.nextStart) {
           this.log(
-            'Alt audio track ahead of main track, seek to start of alt audio track',
+            `Alt audio track ahead of main track, seek to start of alt audio track ${pos} -> ${start} + 0.05`,
           );
           media.currentTime = start + 0.05;
         }
@@ -762,7 +769,6 @@ class AudioStreamController
       return;
     }
     if (isMediaFragment(frag)) {
-      this.fragPrevious = frag;
       const track = this.switchingTrack;
       if (track) {
         this.bufferedTrack = track;
@@ -774,13 +780,18 @@ class AudioStreamController
     }
   }
 
+  public getFwdBufferInfo(): BufferInfo | null {
+    const bufferable = this.getBufferOutput();
+    return super.getFwdBufferInfo(bufferable, PlaylistLevelType.AUDIO);
+  }
+
   protected getBufferOutput(): Bufferable | null {
     return this.mediaBuffer ? this.mediaBuffer : this.media;
   }
 
   protected checkFragmentChanged() {
     const previousFrag = this.fragPlaying;
-    const fragChanged = super.checkFragmentChanged();
+    const fragChanged = this.checkFragPlaying();
     if (!fragChanged) {
       return false;
     }
@@ -870,7 +881,7 @@ class AudioStreamController
       if (this.state === State.ENDED) {
         this.state = State.IDLE;
       }
-      const mediaBuffer = this.mediaBuffer || this.media;
+      const mediaBuffer = this.getBufferOutput();
       if (mediaBuffer) {
         this.afterBufferFlushed(mediaBuffer, type);
         this.tick();
@@ -1030,7 +1041,7 @@ class AudioStreamController
   }
 
   protected loadFragment(
-    frag: Fragment,
+    frag: MediaFragment,
     track: Level,
     targetBufferTime: number,
   ) {
@@ -1043,9 +1054,7 @@ class AudioStreamController
       fragState === FragmentState.NOT_LOADED ||
       fragState === FragmentState.PARTIAL
     ) {
-      if (!isMediaFragment(frag)) {
-        this._loadInitSegment(frag, track);
-      } else if (track.details?.live && !this.initPTS[frag.cc]) {
+      if (track.details?.live && !this.initPTS[frag.cc]) {
         this.log(
           `Waiting for video PTS in continuity counter ${frag.cc} of live stream before loading audio fragment ${frag.sn} of level ${this.trackId}`,
         );

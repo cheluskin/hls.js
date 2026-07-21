@@ -6,7 +6,11 @@ import { FragmentTracker } from '../../../src/controller/fragment-tracker';
 import { ErrorDetails, ErrorTypes } from '../../../src/errors';
 import { Events } from '../../../src/events';
 import Hls from '../../../src/hls';
-import { ElementaryStreamTypes, Fragment } from '../../../src/loader/fragment';
+import {
+  ElementaryStreamTypes,
+  Fragment,
+  type MediaFragment,
+} from '../../../src/loader/fragment';
 import M3U8Parser from '../../../src/loader/m3u8-parser';
 import { PlaylistLevelType } from '../../../src/types/loader';
 import { ChunkMetadata } from '../../../src/types/transmuxer';
@@ -62,7 +66,11 @@ function setSourceBufferBufferedRange(
 
 function evokeTrimBuffers(hls: HlsTestable) {
   const frag = new Fragment(PlaylistLevelType.MAIN, '');
-  hls.trigger(Events.FRAG_CHANGED, { frag });
+  frag.sn = 0;
+  hls.trigger(Events.FRAG_CHANGED, {
+    frag: frag as MediaFragment,
+    previousFrag: null,
+  });
 }
 
 describe('BufferController with attached media', function () {
@@ -832,6 +840,86 @@ describe('BufferController with attached media', function () {
         'Cannot remove invalid range (9001 >= 9000) from the audio SourceBuffer',
       );
     });
+
+    it('advances the queue without removing when start is at/after mediaSource.duration', function () {
+      // endOfStream() clamps mediaSource.duration below the requested flush start
+      (bufferController as any).mediaSource.duration = 9;
+
+      hls.trigger(Events.BUFFER_FLUSHING, {
+        startOffset: 11,
+        endOffset: Infinity,
+        type: 'video',
+      });
+
+      const buffer = getSourceBufferTrack(bufferController, 'video')?.buffer;
+      expect(buffer).to.not.be.undefined;
+      if (!buffer) {
+        return;
+      }
+      // No SourceBuffer.remove(): no 'updateend' will fire for this operation
+      expect(
+        buffer.remove,
+        'remove should not be called when start is at/after duration',
+      ).to.not.have.been.called;
+      // Regression guard: the queue must still advance (previously locked here)
+      expect(
+        shiftAndExecuteNextSpy,
+        'the queue must advance even though remove was skipped',
+      ).to.have.been.calledOnce;
+      // onComplete still signals a (no-op) flush
+      expect(triggerSpy).to.have.been.calledWith(Events.BUFFER_FLUSHED, {
+        type: 'video',
+        start: 11,
+        end: Infinity,
+      });
+    });
+
+    it('does not block a following queued operation when start is at/after mediaSource.duration', function () {
+      (bufferController as any).mediaSource.duration = 9;
+      const videoQueue = (operationQueue as any).queues
+        .video as BufferOperation[];
+
+      // Occupy the head so subsequently-queued ops accumulate behind it
+      // (direct push does not auto-execute)
+      videoQueue.push({
+        label: 'head',
+        execute: () => {},
+        onStart: () => {},
+        onComplete: () => {},
+        onError: () => {},
+      });
+
+      // Queues the no-op remove behind the head (queue length > 1, no auto-exec)
+      hls.trigger(Events.BUFFER_FLUSHING, {
+        startOffset: 11,
+        endOffset: Infinity,
+        type: 'video',
+      });
+
+      // Queue a following operation behind the remove
+      const nextExecute = sandbox.spy();
+      videoQueue.push({
+        label: 'next',
+        execute: nextExecute,
+        onStart: () => {},
+        onComplete: () => {},
+        onError: () => {},
+      });
+
+      expect(videoQueue.map((op) => op.label)).to.deep.equal([
+        'head',
+        'remove',
+        'next',
+      ]);
+
+      // Complete the head op: cascades to the no-op remove, then to next
+      (operationQueue as any).shiftAndExecuteNext('video');
+
+      expect(
+        nextExecute,
+        'the operation queued behind the no-op remove must execute',
+      ).to.have.been.calledOnce;
+    });
   });
 
   describe('trimBuffers', function () {
@@ -1092,7 +1180,7 @@ describe('BufferController with attached media', function () {
   describe('onBufferEos', function () {
     it('marks the ExtendedSourceBuffer as ended', function () {
       // No type arg ends both SourceBuffers
-      hls.trigger(Events.BUFFER_EOS, {});
+      hls.trigger(Events.BUFFER_EOS, { type: null });
       queueNames.forEach((type) => {
         const track = getSourceBufferTrack(bufferController, type);
         const buffer = track?.buffer;
@@ -1102,6 +1190,226 @@ describe('BufferController with attached media', function () {
         }
         expect(track.ended, 'SourceBufferTrack.ended').to.be.true;
       });
+    });
+  });
+
+  describe('blockAudio / unblockAudio', function () {
+    function triggerAudioAppend(start: number, duration: number) {
+      const frag = new Fragment(PlaylistLevelType.AUDIO, '');
+      frag.start = start;
+      frag.duration = duration;
+      const chunkMeta = new ChunkMetadata(frag.start, 0, 0, 0);
+      const data: BufferAppendingData = {
+        parent: PlaylistLevelType.AUDIO,
+        type: 'audio',
+        data: new Uint8Array(),
+        frag,
+        part: null,
+        chunkMeta,
+        offset: start,
+      };
+      hls.trigger(Events.BUFFER_APPENDING, data);
+      return frag;
+    }
+
+    function triggerVideoAppend(start: number, duration: number) {
+      const frag = new Fragment(PlaylistLevelType.MAIN, '');
+      frag.start = start;
+      frag.duration = duration;
+      const chunkMeta = new ChunkMetadata(frag.start, 0, 0, 0);
+      const data: BufferAppendingData = {
+        parent: PlaylistLevelType.MAIN,
+        type: 'video',
+        data: new Uint8Array(),
+        frag,
+        part: null,
+        chunkMeta,
+        offset: start,
+      };
+      hls.trigger(Events.BUFFER_APPENDING, data);
+      return frag;
+    }
+
+    function getAudioQueue(): BufferOperation[] {
+      return (operationQueue as any).queues.audio;
+    }
+
+    function completeAppend(type: SourceBufferName) {
+      const track = getSourceBufferTrack(bufferController, type);
+      track?.buffer?.dispatchEvent(new Event('updateend'));
+    }
+
+    it('blocks audio append when video buffer is empty', function () {
+      const audioQueue = getAudioQueue();
+      // Audio arrives with no video buffered - first append is not blocked
+      triggerAudioAppend(0, 2);
+      // Queue should have block-audio op followed by the audio append
+      expect(audioQueue.length).to.equal(1);
+      expect(audioQueue[0].label).to.equal('append-audio');
+
+      audioQueue.length = 0;
+      setSourceBufferBufferedRange(bufferController, 'audio', 0, 2);
+
+      // Morem audio arrives with no video buffered - blocked
+      triggerAudioAppend(2, 4);
+
+      // Queue should have block-audio op followed by the audio append
+      expect(audioQueue.length).to.equal(2);
+      expect(audioQueue[0].label).to.equal('block-audio');
+      expect(audioQueue[1].label).to.equal('append-audio');
+    });
+
+    it('does not block audio append when video is already buffered at audio start', function () {
+      // Buffer video first
+      setSourceBufferBufferedRange(bufferController, 'video', 0, 5);
+
+      const audioQueue = getAudioQueue();
+      triggerAudioAppend(0, 2);
+
+      // Should not be blocked - just the append
+      expect(audioQueue.length).to.equal(1);
+      expect(audioQueue[0].label).to.equal('append-audio');
+    });
+
+    it('blocks audio when audio is ahead of video', function () {
+      // Video has buffered 0-5, but audio segment starts at 6 (ahead of video)
+      setSourceBufferBufferedRange(bufferController, 'video', 0, 5);
+      setSourceBufferBufferedRange(bufferController, 'audio', 0, 6);
+      (bufferController as any).lastVideoAppendEnd = 5;
+
+      const audioQueue = getAudioQueue();
+      triggerAudioAppend(6, 2);
+
+      expect(audioQueue.length).to.equal(2);
+      expect(audioQueue[0].label).to.equal('block-audio');
+      expect(audioQueue[1].label).to.equal('append-audio');
+    });
+
+    it('unblocks audio when video append advances past blocked audio position', function () {
+      const audioQueue = getAudioQueue();
+      // Audio arrives first, second append gets blocked (no video buffered)
+      setSourceBufferBufferedRange(bufferController, 'audio', 0, 1);
+      triggerAudioAppend(1, 1);
+      expect(audioQueue[0].label).to.equal('block-audio');
+
+      // Video append arrives — advances lastVideoAppendEnd past audio pTime
+      // pTime = 0 + 2 * 0.05 = 0.1, videoAppendEnd = 4
+      triggerVideoAppend(0, 4);
+
+      // block-audio execute handler re-runs via executeNext('audio'),
+      // sees lastVideoAppendEnd (4) > pTime (0.1), calls unblockAudio
+      expect(audioQueue[0].label).to.equal('append-audio');
+    });
+
+    it('executes audio append after video unblocks it', function () {
+      const audioBuffer = getSourceBufferTrack(
+        bufferController,
+        'audio',
+      )?.buffer;
+      expect(audioBuffer).to.exist;
+
+      // Audio arrives first, gets blocked
+      triggerAudioAppend(0, 2);
+
+      // Video append arrives and unblocks audio
+      triggerVideoAppend(0, 4);
+
+      // Audio append should have executed (appendBuffer called)
+      expect(audioBuffer!.appendBuffer).to.have.been.calledOnce;
+    });
+
+    it('blocks each audio segment independently and releases as video advances', function () {
+      const audioBuffer = getSourceBufferTrack(
+        bufferController,
+        'audio',
+      )?.buffer;
+      const audioQueue = getAudioQueue();
+
+      // First audio is appended
+      setSourceBufferBufferedRange(bufferController, 'audio', 0, 2);
+
+      // Second audio also triggers block (guard removed)
+      triggerAudioAppend(2, 2);
+      triggerAudioAppend(2, 2);
+      expect(audioQueue.length).to.equal(4);
+      expect(audioQueue[0].label).to.equal('block-audio');
+      expect(audioQueue[1].label).to.equal('append-audio');
+      expect(audioQueue[2].label).to.equal('block-audio');
+      expect(audioQueue[3].label).to.equal('append-audio');
+
+      // Video arrives and unblocks first block-audio
+      triggerVideoAppend(0, 4);
+
+      // First block-audio removed, first append-audio executes
+      expect(audioQueue[0].label).to.equal('append-audio');
+      expect(audioBuffer!.appendBuffer).to.have.been.calledOnce;
+
+      // Complete first audio append — second block-audio becomes head,
+      // its execute runs and self-resolves (lastVideoAppendEnd=4 > pTime=2.1)
+      completeAppend('audio');
+      expect(audioBuffer!.appendBuffer).to.have.been.calledTwice;
+    });
+
+    it('audio queue does not lock when block-audio is behind an in-flight append (#7808)', function () {
+      const audioBuffer = getSourceBufferTrack(
+        bufferController,
+        'audio',
+      )?.buffer;
+      const audioQueue = getAudioQueue();
+
+      // Video is buffered so first audio append goes through without blocking
+      setSourceBufferBufferedRange(bufferController, 'video', 0, 4);
+      (bufferController as any).lastVideoAppendEnd = 4;
+      triggerAudioAppend(0, 2);
+      expect(audioQueue.length).to.equal(1);
+      expect(audioQueue[0].label).to.equal('append-audio');
+      expect(audioBuffer!.appendBuffer).to.have.been.calledOnce;
+      setSourceBufferBufferedRange(bufferController, 'audio', 0, 2);
+
+      // While audio[0] is still in-flight (no updateend yet), second audio
+      // arrives ahead of video — block-audio lands behind the in-flight append
+      triggerAudioAppend(6, 2);
+      expect(audioQueue.length).to.equal(3);
+      expect(audioQueue[0].label).to.equal('append-audio');
+      expect(audioQueue[1].label).to.equal('block-audio');
+      expect(audioQueue[2].label).to.equal('append-audio');
+
+      // Video append arrives — advances lastVideoAppendEnd to 8
+      triggerVideoAppend(4, 4);
+
+      // block-audio is not at head so isAudioBlocked() is false;
+      // video handler just updates lastVideoAppendEnd
+      expect(audioQueue[1].label).to.equal('block-audio');
+
+      // First audio completes — shiftAndExecuteNext makes block-audio the head,
+      // its execute handler sees lastVideoAppendEnd(8) > pTime(6.1) and self-resolves
+      completeAppend('audio');
+      expect(
+        audioQueue.some((op) => op.label === 'block-audio'),
+        'block-audio should have self-resolved',
+      ).to.be.false;
+      expect(audioBuffer!.appendBuffer).to.have.been.calledTwice;
+    });
+
+    it('does not block audio from main parent (muxed content)', function () {
+      const audioQueue = getAudioQueue();
+      // Audio with parent='main' should never be blocked
+      const frag = new Fragment(PlaylistLevelType.MAIN, '');
+      frag.start = 0;
+      frag.duration = 2;
+      const chunkMeta = new ChunkMetadata(0, 0, 0, 0);
+      hls.trigger(Events.BUFFER_APPENDING, {
+        parent: PlaylistLevelType.MAIN,
+        type: 'audio',
+        data: new Uint8Array(),
+        frag,
+        part: null,
+        chunkMeta,
+        offset: 0,
+      });
+
+      expect(audioQueue.length).to.equal(1);
+      expect(audioQueue[0].label).to.equal('append-audio');
     });
   });
 });

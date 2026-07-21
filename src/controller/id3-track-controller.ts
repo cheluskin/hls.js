@@ -1,5 +1,4 @@
-import { getId3Frames } from '@svta/common-media-library/id3/getId3Frames';
-import { isId3TimestampFrame } from '@svta/common-media-library/id3/isId3TimestampFrame';
+import { getId3Frames, isId3TimestampFrame } from '@svta/cml-id3';
 import { Events } from '../events';
 import {
   isDateRangeCueAttribute,
@@ -361,7 +360,7 @@ export class ID3TrackController implements ComponentAPI {
     if (id3Track && removeOldCues) {
       if (id3Track.track.cues?.length) {
         const idsToRemove = Object.keys(dateRangeCuesAppended).filter(
-          (id) => !ids.includes(id),
+          (id) => ids.indexOf(id) === -1,
         );
         for (let i = idsToRemove.length; i--; ) {
           const id = idsToRemove[i];

@@ -1,5 +1,4 @@
-import { getId3Data } from '@svta/common-media-library/id3/getId3Data';
-import { getId3Timestamp } from '@svta/common-media-library/id3/getId3Timestamp';
+import { getId3Data, getId3Timestamp } from '@svta/cml-id3';
 import BaseAudioDemuxer from './base-audio-demuxer';
 import { getAudioBSID } from './dolby';
 import type { HlsEventEmitter } from '../../events';
@@ -72,11 +71,15 @@ export class AC3Demuxer extends BaseAudioDemuxer {
     if (
       data[offset] === 0x0b &&
       data[offset + 1] === 0x77 &&
-      getId3Timestamp(id3Data) !== undefined &&
-      // check the bsid to confirm ac-3
-      getAudioBSID(data, offset) < 16
+      getId3Timestamp(id3Data) !== undefined
     ) {
-      return true;
+      // check the bsid to confirm ac-3
+      const bsid = getAudioBSID(data, offset);
+      if (bsid < 16) {
+        return true;
+      } else {
+        throw new Error('Containerless ec-3 is not supported');
+      }
     }
     return false;
   }

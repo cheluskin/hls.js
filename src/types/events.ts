@@ -106,7 +106,7 @@ export interface BufferAppendedData {
 }
 
 export interface BufferEOSData {
-  type?: SourceBufferName;
+  type: SourceBufferName | null;
 }
 
 export interface BufferFlushingData {
@@ -298,7 +298,8 @@ export interface SubtitleFragProcessed {
 }
 
 export interface FragChangedData {
-  frag: Fragment;
+  frag: MediaFragment;
+  previousFrag: MediaFragment | null;
 }
 
 export interface FPSDropData {
@@ -368,16 +369,18 @@ export interface CuesParsedData {
   type: 'captions' | 'subtitles';
   cues: any;
   track: string;
+  closedCaptions?: MediaPlaylist | undefined;
+  subtitleTrack?: MediaPlaylist;
 }
 
-export interface NonNativeTextTrack {
+export type NonNativeTextTrack = {
   _id?: string;
-  label: any;
+  label: string;
   kind: string;
   default: boolean;
   closedCaptions?: MediaPlaylist;
   subtitleTrack?: MediaPlaylist;
-}
+};
 
 export interface NonNativeTextTracksData {
   tracks: Array<NonNativeTextTrack>;
@@ -419,6 +422,7 @@ export interface PartsLoadedData {
 
 export interface FragDecryptedData {
   frag: Fragment;
+  part: Part | null;
   payload: ArrayBuffer;
   stats: {
     tstart: number;

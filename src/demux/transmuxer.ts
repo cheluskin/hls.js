@@ -52,7 +52,7 @@ if (__USE_M2TS_ADVANCED_CODECS__) {
 export default class Transmuxer {
   private asyncResult: boolean = false;
   private logger: ILogger;
-  private observer: HlsEventEmitter;
+  private observer: HlsEventEmitter | undefined;
   private typeSupported: TypeSupported;
   private config: HlsConfig;
   private id: PlaylistLevelType;
@@ -92,6 +92,9 @@ export default class Transmuxer {
     chunkMeta: ChunkMetadata,
     state?: TransmuxState,
   ): TransmuxerResult | Promise<TransmuxerResult> {
+    if (!this.observer) {
+      return emptyResult(chunkMeta);
+    }
     const stats = chunkMeta.transmuxing;
     stats.executeStart = now();
 
@@ -121,12 +124,6 @@ export default class Transmuxer {
     if (keyData && isFullSegmentEncryption(keyData.method)) {
       const decrypter = this.getDecrypter();
       const aesMode = getAesModeFromFullSegmentMethod(keyData.method);
-
-      const plainTextLength =
-        chunkMeta.size !== data.byteLength && chunkMeta.iframe
-          ? chunkMeta.size
-          : 0;
-
       this.asyncResult = true;
       this.decryptionPromise = decrypter
         .decrypt(
@@ -134,16 +131,12 @@ export default class Transmuxer {
           keyData.key.buffer,
           keyData.iv.buffer,
           aesMode,
-          plainTextLength,
+          chunkMeta.decryptRange,
         )
-        .then((decryptedData): TransmuxerResult => {
+        .then((decryptedData) => {
           // Calling push here is important; if flush() is called while this is still resolving, this ensures that
           // the decrypted data has been transmuxed
-          const result = this.push(
-            decryptedData,
-            null,
-            chunkMeta,
-          ) as TransmuxerResult;
+          const result = this.push(decryptedData, null, chunkMeta);
           this.decryptionPromise = null;
           return result;
         });
@@ -153,28 +146,26 @@ export default class Transmuxer {
     const resetMuxers = this.needsProbing(discontinuity, trackSwitch);
 
     if (resetMuxers) {
-      if (!this.demuxer) {
-        // Configure the demuxer using an init segment when I-FRAME MPEG2-TS (I-FRAME media segments have no PMT).
-        // MP4 probing only works on media segments (which have moof data).
-        const segmentFormatData =
-          chunkMeta.iframe &&
-          initSegmentData &&
-          TSDemuxer.probe(initSegmentData, this.logger)
-            ? initSegmentData
-            : uintData;
-        const error = this.configureTransmuxer(segmentFormatData);
-        if (error) {
-          this.logger.warn(`[transmuxer] ${error.message}`);
-          this.observer.emit(Events.ERROR, Events.ERROR, {
-            type: ErrorTypes.MEDIA_ERROR,
-            details: ErrorDetails.FRAG_PARSING_ERROR,
-            fatal: false,
-            error,
-            reason: error.message,
-          });
-          stats.executeEnd = now();
-          return emptyResult(chunkMeta);
-        }
+      // Configure the demuxer using an init segment when I-FRAME MPEG2-TS (I-FRAME media segments have no PMT).
+      // MP4 probing only works on media segments (which have moof data).
+      const segmentFormatData =
+        chunkMeta.iframe &&
+        initSegmentData &&
+        TSDemuxer.probe(initSegmentData, this.logger)
+          ? initSegmentData
+          : uintData;
+      const error = this.configureTransmuxer(segmentFormatData);
+      if (error) {
+        this.logger.warn(`[transmuxer] ${error.message}`);
+        this.observer.emit(Events.ERROR, Events.ERROR, {
+          type: ErrorTypes.MEDIA_ERROR,
+          details: ErrorDetails.FRAG_PARSING_ERROR,
+          fatal: false,
+          error,
+          reason: error.message,
+        });
+        stats.executeEnd = now();
+        return emptyResult(chunkMeta);
       }
     }
 
@@ -282,6 +273,9 @@ export default class Transmuxer {
     demuxResult: DemuxerResult,
     chunkMeta: ChunkMetadata,
   ) {
+    if (!this.remuxer) {
+      return;
+    }
     const { audioTrack, videoTrack, id3Track, textTrack } = demuxResult;
     const { accurateTimeOffset, timeOffset } = this.currentTransmuxState;
     this.logger.log(
@@ -289,7 +283,7 @@ export default class Transmuxer {
         chunkMeta.part > -1 ? ' part: ' + chunkMeta.part : ''
       } of ${this.id} playlist ${chunkMeta.level}`,
     );
-    const remuxResult = this.remuxer!.remux(
+    const remuxResult = this.remuxer.remux(
       audioTrack,
       videoTrack,
       id3Track,
@@ -363,6 +357,13 @@ export default class Transmuxer {
       this.remuxer.destroy();
       this.remuxer = undefined;
     }
+    if (this.observer) {
+      this.observer.removeAllListeners();
+    }
+    this.decryptionPromise = null;
+    this.decrypter = this.observer = undefined;
+    //@ts-ignore
+    this.logger = this.config = this.probe = undefined;
   }
 
   private transmux(
@@ -398,10 +399,18 @@ export default class Transmuxer {
     accurateTimeOffset: boolean,
     chunkMeta: ChunkMetadata,
   ): TransmuxerResult {
-    const { audioTrack, videoTrack, id3Track, textTrack } = (
-      this.demuxer as Demuxer
-    ).demux(data, timeOffset, chunkMeta, false, !this.config.progressive);
-    const remuxResult = this.remuxer!.remux(
+    const { demuxer, remuxer } = this;
+    if (!demuxer || !remuxer) {
+      return emptyResult(chunkMeta);
+    }
+    const { audioTrack, videoTrack, id3Track, textTrack } = demuxer.demux(
+      data,
+      timeOffset,
+      chunkMeta,
+      false,
+      !this.config.progressive,
+    );
+    const remuxResult = remuxer.remux(
       audioTrack,
       videoTrack,
       id3Track,
@@ -425,7 +434,10 @@ export default class Transmuxer {
     accurateTimeOffset: boolean,
     chunkMeta: ChunkMetadata,
   ): Promise<TransmuxerResult> {
-    return (this.demuxer as Demuxer)
+    if (!this.demuxer) {
+      return Promise.reject(new Error('no demuxer'));
+    }
+    return this.demuxer
       .demuxSampleAes(data, decryptData, timeOffset, chunkMeta)
       .then((demuxResult) => {
         const remuxResult = this.remuxer!.remux(
@@ -448,13 +460,20 @@ export default class Transmuxer {
 
   private configureTransmuxer(data: Uint8Array): undefined | Error {
     const { config, observer, typeSupported } = this;
+    if (!observer) {
+      return;
+    }
     // probe for content type
     let mux: MuxConfig | undefined;
-    for (let i = 0, len = muxConfig.length; i < len; i++) {
-      if (muxConfig[i].demux?.probe(data, this.logger)) {
-        mux = muxConfig[i];
-        break;
+    try {
+      for (let i = 0, len = muxConfig.length; i < len; i++) {
+        if (muxConfig[i].demux?.probe(data, this.logger)) {
+          mux = muxConfig[i];
+          break;
+        }
       }
+    } catch (error) {
+      return error;
     }
     if (!mux) {
       return new Error('Failed to find demuxer by probing fragment data');

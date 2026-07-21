@@ -58,6 +58,27 @@ http://proxy-62.dailymotion.com/sec(3ae40f708f79ca9471f52b86da76a3a8)/video/107/
     expect(result.sessionData).to.equal(null);
   });
 
+  it('parses #EXT-X-I-FRAME-STREAM-INF on the last line without a trailing newline', function () {
+    const manifest = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=7700000,RESOLUTION=1920x1080,CODECS="avc1.64002a"
+video.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=300000,CODECS="avc1.64002a",RESOLUTION=1920x1080,URI="iframe.m3u8"`;
+    const result = M3U8Parser.parseMasterPlaylist(
+      manifest,
+      'http://example.com/master.m3u8',
+    );
+    expect(result.playlistParsingError).to.be.null;
+    expect(result.levels).to.have.lengthOf(1);
+    expect(result.iframeVariants).to.have.lengthOf(1);
+    expect(result.iframeVariants[0].bitrate).to.equal(300000);
+    expect(result.iframeVariants[0].width).to.equal(1920);
+    expect(result.iframeVariants[0].height).to.equal(1080);
+    expect(result.iframeVariants[0].videoCodec).to.equal('avc1.64002a');
+    expect(result.iframeVariants[0].url).to.equal(
+      'http://example.com/iframe.m3u8',
+    );
+  });
+
   it('parses manifest containing comment', function () {
     const manifest = `#EXTM3U
 #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=836280,CODECS="mp4a.40.2,avc1.64001f",RESOLUTION=848x360,NAME="480"
@@ -1326,6 +1347,54 @@ Rollover38803/20160525T064049-01-69844069.ts
       'http://video.example.com/Rollover38803/20160525T064049-01-69844069.ts',
     );
     expect(result.fragments[2].programDateTime).to.equal(1464366904000);
+  });
+
+  it('parses delta playlists with one #EXT-X-PROGRAM-DATE-TIME after segments', function () {
+    const level = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-MAP:URI="fileSequence1.mp4"
+#EXT-X-SKIP:SKIPPED-SEGMENTS=17
+#EXTINF:6.00000,	
+fileSequence18.m4s
+#EXTINF:6.00000,	
+fileSequence19.m4s
+#EXTINF:6.00000,	
+fileSequence20.m4s
+#EXTINF:6.00000,	
+fileSequence21.m4s
+#EXTINF:6.00000,	
+fileSequence22.m4s
+#EXTINF:6.00000,	
+fileSequence23.m4s
+#EXTINF:6.00000,	
+fileSequence24.m4s
+#EXT-X-PROGRAM-DATE-TIME:2026-05-11T19:03:26.000Z
+`;
+    const result = M3U8Parser.parseLevelPlaylist(
+      level,
+      'http://video.example.com/disc.m3u8',
+      0,
+      PlaylistLevelType.MAIN,
+      0,
+      null,
+    );
+    expect(result.playlistParsingError).to.be.null;
+    expect(result.fragments).to.have.lengthOf(24);
+    expect(result.hasProgramDateTime).to.be.true;
+    expect(result.totalduration).to.equal(144);
+    expect(result.fragments[23].url).to.equal(
+      'http://video.example.com/fileSequence24.m4s',
+    );
+    expect(
+      new Date(result.fragments[23].programDateTime as number).toISOString(),
+    ).to.equal('2026-05-11T19:03:20.000Z');
+    expect(
+      new Date(result.fragments[22].programDateTime as number).toISOString(),
+    ).to.equal('2026-05-11T19:03:14.000Z');
+    expect(
+      new Date(result.fragments[21].programDateTime as number).toISOString(),
+    ).to.equal('2026-05-11T19:03:08.000Z');
   });
 
   it('parses #EXTINF without a leading digit', function () {
@@ -3297,6 +3366,90 @@ a{$bar}.mp4
         details,
         '#EXT-X-MEDIA-SEQUENCE must appear before the first Media Segment (#EXT-X-MEDIA-SEQUENCE:2)',
       );
+    });
+
+    it('does not error when EXT-X-MEDIA-SEQUENCE is declared after EXT-X-SKIP', function () {
+      const level = `#EXTM3U
+#EXT-X-VERSION:10
+#EXT-X-TARGETDURATION:3
+#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK=3.008,CAN-SKIP-UNTIL=35.4
+#EXT-X-PART-INF:PART-TARGET=1.001
+#EXT-X-SKIP:SKIPPED-SEGMENTS=191
+#EXT-X-MEDIA-SEQUENCE:7126
+#EXT-X-MAP:URI="https://sample-host/init.m4s"
+#EXTINF:2.953,
+https://sample-host/1080p_7317.m4v`;
+      const details = M3U8Parser.parseLevelPlaylist(
+        level,
+        'http://example.com/hls/index.m3u8',
+        0,
+        PlaylistLevelType.MAIN,
+        0,
+        null,
+      );
+      expect(details.playlistParsingError).to.be.null;
+      expect(details.startSN).to.equal(7126);
+      expect(details.skippedSegments).to.equal(191);
+      // 191 skipped placeholders (sn 7126..7316), then the first real segment at sn 7317
+      expect(details.fragments.length).to.equal(192);
+      expect(details.fragments[0]).to.equal(null);
+      expect(details.fragments[190]).to.equal(null);
+      expect(details.fragments[191]?.sn).to.equal(7317);
+    });
+
+    it('errors when a Media Segment precedes EXT-X-SKIP and EXT-X-MEDIA-SEQUENCE', function () {
+      const level = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXTINF:6,
+fileSequence102.ts
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXT-X-MEDIA-SEQUENCE:102
+#EXTINF:6,
+fileSequence106.ts`;
+      const details = M3U8Parser.parseLevelPlaylist(
+        level,
+        'http://example.com/hls/index.m3u8',
+        0,
+        PlaylistLevelType.MAIN,
+        0,
+        null,
+      );
+      expectPlaylistParsingError(
+        details,
+        '#EXT-X-MEDIA-SEQUENCE must appear before the first Media Segment (#EXT-X-MEDIA-SEQUENCE:102)',
+      );
+    });
+
+    it('does not error when EXT-X-SKIP replaces segments after the first Media Segment', function () {
+      const level = `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-VERSION:9
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=36
+#EXT-X-MEDIA-SEQUENCE:102
+#EXTINF:6,
+fileSequence102.ts
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXTINF:6,
+fileSequence106.ts`;
+      const details = M3U8Parser.parseLevelPlaylist(
+        level,
+        'http://example.com/hls/index.m3u8',
+        0,
+        PlaylistLevelType.MAIN,
+        0,
+        null,
+      );
+      expect(details.playlistParsingError).to.be.null;
+      expect(details.startSN).to.equal(102);
+      expect(details.skippedSegments).to.equal(3);
+      // sn 102, then 3 skipped placeholders (sn 103..105), then sn 106
+      expect(details.fragments.length).to.equal(5);
+      expect(details.fragments[0]?.sn).to.equal(102);
+      expect(details.fragments[1]).to.equal(null);
+      expect(details.fragments[3]).to.equal(null);
+      expect(details.fragments[4]?.sn).to.equal(106);
     });
   });
 });
