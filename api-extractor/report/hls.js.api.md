@@ -1709,11 +1709,18 @@ export type ExtendedSourceBuffer = SourceBuffer & {
 //
 // @public
 export interface FailbackConfig {
+    dataStallTimeoutMs?: number;
     dnsDomain?: string;
     enableCacheControlHeader?: boolean;
+    failbackHostCooldownMs?: number;
+    firstByteTimeoutMs?: number;
+    hedge?: boolean;
+    hedgeDelayMs?: number;
+    maxParallelAttempts?: number;
     onAllFailed?: (originalUrl: string, attempts: number) => void;
     onFailback?: (originalUrl: string, failbackUrl: string, attempt: number) => void;
     onSuccess?: (url: string, wasFailback: boolean, attempt: number) => void;
+    silentRetriesPerHost?: number;
     staticHosts?: string[];
     transformUrl?: (url: string, attempt: number) => string | null;
     verbose?: boolean;

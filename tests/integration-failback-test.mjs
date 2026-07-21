@@ -1984,6 +1984,383 @@ await test('Failback uses DNS-resolved hosts that arrive after load() started', 
 });
 
 // ----------------------------------------
+// Test 27: In-flight pending retry head does not block ready sibling host
+// Regression guard: pendingRetryUrls.shift() used 'break' when the head URL
+// was in-flight, which blocked subsequent ready retry candidates from launching.
+// ----------------------------------------
+await test('In-flight pending retry head does not block ready sibling host', async () => {
+  const HOST1 = 'failback1.example.com';
+  const HOST2 = 'failback2.example.com';
+  const requestedUrls = [];
+
+  class RetryQueueXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader() {}
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      requestedUrls.push(this._url);
+
+      if (this._url.includes('origin.example.com')) {
+        // Origin fails with network error
+        self.setTimeout(() => {
+          this.onerror?.();
+        }, 5);
+      } else if (this._url.includes(HOST1)) {
+        const count = requestedUrls.filter((u) => u.includes(HOST1)).length;
+        if (count === 1) {
+          // First attempt at host1 fails silently (timeout) -> triggers requeue
+        } else {
+          // Second attempt (retry) at host1 stays in flight (slow response)
+        }
+      } else if (this._url.includes(HOST2)) {
+        // Host 2 succeeds immediately
+        self.setTimeout(() => {
+          this.status = 200;
+          this.statusText = 'OK';
+          this.response = new ArrayBuffer(64);
+          this.readyState = 2;
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 5);
+      }
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = RetryQueueXHR;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: [HOST1, HOST2],
+      hedge: false,
+      firstByteTimeoutMs: 50,
+      silentRetriesPerHost: 1,
+      maxParallelAttempts: 2,
+    },
+  };
+
+  let succeededUrl = null;
+  const loader = new FailbackLoader(config);
+
+  try {
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/video.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            succeededUrl = response.url;
+            resolve();
+          },
+          onError: (error) =>
+            reject(new Error(error.text || String(error.code))),
+          onTimeout: () => reject(new Error('Timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(
+      succeededUrl && succeededUrl.includes(HOST2),
+      `Expected load to succeed on ${HOST2}, got: ${succeededUrl}`,
+    );
+    assert.ok(
+      requestedUrls.some((u) => u.includes(HOST2)),
+      `Expected ${HOST2} to have been requested`,
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 28: Sticky HTTP error is retained over subsequent hedge timeouts
+// Regression guard: recordExhaustionFailure keeps HTTP/integrity failure
+// sticky so a later silent/stall hedge timeout cannot overwrite it with onTimeout.
+// ----------------------------------------
+await test('Sticky HTTP error is retained over subsequent hedge timeouts', async () => {
+  const HOST1 = 'failback1.example.com';
+
+  class StickyErrorXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader() {}
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      if (this._url.includes('origin.example.com')) {
+        // Origin fails immediately with HTTP 404
+        self.setTimeout(() => {
+          this.status = 404;
+          this.statusText = 'Not Found';
+          this.response = null;
+          this.readyState = 2;
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 5);
+      } else if (this._url.includes(HOST1)) {
+        // Hedged attempt for HOST1 stays silent (times out)
+      }
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = StickyErrorXHR;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: [HOST1],
+      hedge: true,
+      hedgeDelayMs: 10,
+      firstByteTimeoutMs: 50,
+      silentRetriesPerHost: 0,
+    },
+  };
+
+  let errorReceived = null;
+  let timeoutFired = false;
+  const loader = new FailbackLoader(config);
+
+  try {
+    await new Promise((resolve) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/missing.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: () => resolve(),
+          onError: (error) => {
+            errorReceived = error;
+            resolve();
+          },
+          onTimeout: () => {
+            timeoutFired = true;
+            resolve();
+          },
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.equal(
+      timeoutFired,
+      false,
+      'Should not trigger onTimeout when HTTP error was recorded',
+    );
+    assert.ok(errorReceived, 'Should call onError for sticky HTTP 404 error');
+    assert.equal(errorReceived.code, 404, 'Error code should be 404');
+    assert.equal(
+      errorReceived.text,
+      'Not Found',
+      'Error text should be Not Found',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 29: Exhaustion error callback receives XHR of the retained failure
+// Regression guard: onError/onTimeout receive lastFailureXhr (the XHR of the retained error)
+// instead of this.loader (which points to the last launched hedge).
+// ----------------------------------------
+await test('Exhaustion error callback receives XHR of the retained failure', async () => {
+  const HOST1 = 'failback1.example.com';
+  let originXhrInstance = null;
+
+  class ErrorXHRMatching {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._url = '';
+    }
+
+    open(method, url) {
+      this._url = url;
+      this.responseURL = url;
+      this.readyState = 1;
+    }
+
+    setRequestHeader() {}
+    getResponseHeader() {
+      return null;
+    }
+
+    send() {
+      if (this._url.includes('origin.example.com')) {
+        originXhrInstance = this;
+        self.setTimeout(() => {
+          this.status = 503;
+          this.statusText = 'Service Unavailable';
+          this.response = null;
+          this.readyState = 2;
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 5);
+      } else if (this._url.includes(HOST1)) {
+        // Hedged attempt for HOST1 stays silent (status remains 0)
+      }
+    }
+
+    abort() {
+      this.readyState = 4;
+    }
+  }
+
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = ErrorXHRMatching;
+
+  const config = {
+    failbackConfig: {
+      staticHosts: [HOST1],
+      hedge: true,
+      hedgeDelayMs: 10,
+      firstByteTimeoutMs: 50,
+      silentRetriesPerHost: 0,
+    },
+  };
+
+  let passedXhr = null;
+  const loader = new FailbackLoader(config);
+
+  try {
+    await new Promise((resolve) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/service503.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: () => resolve(),
+          onError: (error, context, xhr) => {
+            passedXhr = xhr;
+            resolve();
+          },
+          onTimeout: () => resolve(),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(passedXhr, 'onError should pass an XHR instance');
+    assert.equal(
+      passedXhr,
+      originXhrInstance,
+      'onError should pass the XHR instance of the origin 503 error, not the hedged attempt',
+    );
+    assert.equal(passedXhr.status, 503, 'Passed XHR status should be 503');
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
 // Summary
 // ----------------------------------------
 

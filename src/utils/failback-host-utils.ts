@@ -65,6 +65,6 @@ export function applyHostToUrl(url: URL, host: string): void {
     return;
   }
 
-  url.hostname = normalized;
-  url.port = '';
+  // IPv6 address without brackets
+  url.host = `[${normalized}]`;
 }

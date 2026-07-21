@@ -126,6 +126,7 @@ export function fetchDnsTxt(domain: string): Promise<string[]> {
     })
     .catch(() => {
       logger.warn(`[DNS-TXT] Failed to resolve ${domain} from all providers`);
+      dnsCache.set(domain, []);
       return [];
     });
 }

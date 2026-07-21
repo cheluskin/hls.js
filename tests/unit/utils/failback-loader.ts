@@ -147,6 +147,9 @@ describe('FailbackLoader tests', function () {
     config = mergeConfig(hlsDefaultConfig, {}, logger);
     config.failbackConfig = {
       staticHosts: ['failback.example.com'],
+      hedge: false,
+      silentRetriesPerHost: 0,
+      maxParallelAttempts: 1,
     };
   });
 
@@ -619,6 +622,9 @@ describe('FailbackLoader tests', function () {
       config.failbackConfig = {
         staticHosts: ['failback-1.example.com', 'failback-2.example.com'],
         failbackHostCooldownMs: 30000,
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const context: FragmentLoaderContext = {
@@ -655,8 +661,14 @@ describe('FailbackLoader tests', function () {
 
       MockXMLHttpRequest.onRequest = (xhr) => {
         requestedUrls.push(xhr.url);
-        if (requestedUrls.length === 1 || requestedUrls.length === 2) {
+        if (requestedUrls.length === 1) {
           stall(xhr);
+          return;
+        }
+        if (requestedUrls.length === 2) {
+          self.setTimeout(() => {
+            xhr.simulateResponse(503, null);
+          }, 10);
           return;
         }
 
@@ -711,6 +723,9 @@ describe('FailbackLoader tests', function () {
       config.failbackConfig = {
         staticHosts: ['failback.example.com'],
         failbackHostCooldownMs: 30000,
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const context: FragmentLoaderContext = {
@@ -736,21 +751,26 @@ describe('FailbackLoader tests', function () {
       const requestedUrls: string[] = [];
       MockXMLHttpRequest.onRequest = (xhr) => {
         requestedUrls.push(xhr.url);
-        self.setTimeout(() => {
-          xhr.readyState = 2;
-          xhr.status = 200;
-          xhr.onreadystatechange?.();
-          xhr.onprogress?.(
-            new ProgressEvent('progress', { loaded: 1360, total: 1000000 }),
-          );
-        }, 10);
+        if (requestedUrls.length === 1) {
+          self.setTimeout(() => {
+            xhr.readyState = 2;
+            xhr.status = 200;
+            xhr.onreadystatechange?.();
+            xhr.onprogress?.(
+              new ProgressEvent('progress', { loaded: 1360, total: 1000000 }),
+            );
+          }, 10);
+        } else {
+          self.setTimeout(() => {
+            xhr.simulateResponse(503, null);
+          }, 10);
+        }
       };
 
       const loader1 = new FailbackLoader(config);
       loader1.load(context, loaderConfig, {
         onSuccess: () => done(new Error('Unexpected success')),
-        onError: () => done(new Error('Unexpected error')),
-        onTimeout: () => {
+        onError: () => {
           expect(requestedUrls).to.deep.equal([
             'https://cdn.example.com/video/segment.ts',
             'https://failback.example.com/video/segment.ts',
@@ -778,6 +798,7 @@ describe('FailbackLoader tests', function () {
             },
           );
         },
+        onTimeout: () => done(new Error('Unexpected timeout')),
         onAbort: () => {},
         onProgress: () => {},
       });
@@ -789,6 +810,9 @@ describe('FailbackLoader tests', function () {
       config.failbackConfig = {
         staticHosts: ['failback.example.com'],
         failbackHostCooldownMs: 30000,
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const context: FragmentLoaderContext = {
@@ -816,14 +840,20 @@ describe('FailbackLoader tests', function () {
       MockXMLHttpRequest.onRequest = (xhr) => {
         requestedUrls.push(xhr.url);
         if (firstLoad) {
-          self.setTimeout(() => {
-            xhr.readyState = 2;
-            xhr.status = 200;
-            xhr.onreadystatechange?.();
-            xhr.onprogress?.(
-              new ProgressEvent('progress', { loaded: 1360, total: 1000000 }),
-            );
-          }, 10);
+          if (requestedUrls.length === 1) {
+            self.setTimeout(() => {
+              xhr.readyState = 2;
+              xhr.status = 200;
+              xhr.onreadystatechange?.();
+              xhr.onprogress?.(
+                new ProgressEvent('progress', { loaded: 1360, total: 1000000 }),
+              );
+            }, 10);
+          } else {
+            self.setTimeout(() => {
+              xhr.simulateResponse(503, null);
+            }, 10);
+          }
           return;
         }
 
@@ -841,8 +871,7 @@ describe('FailbackLoader tests', function () {
       const loader1 = new FailbackLoader(config);
       loader1.load(context, loaderConfig, {
         onSuccess: () => done(new Error('Unexpected success')),
-        onError: () => done(new Error('Unexpected error')),
-        onTimeout: () => {
+        onError: () => {
           expect(requestedUrls).to.deep.equal([
             'https://cdn.example.com/video/segment.ts',
             'https://failback.example.com/video/segment.ts',
@@ -874,6 +903,7 @@ describe('FailbackLoader tests', function () {
             },
           );
         },
+        onTimeout: () => done(new Error('Unexpected timeout')),
         onAbort: () => {},
         onProgress: () => {},
       });
@@ -897,6 +927,9 @@ describe('FailbackLoader tests', function () {
 
           return null;
         },
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const loader = new FailbackLoader(config);
@@ -996,6 +1029,9 @@ describe('FailbackLoader tests', function () {
             successAttempts.push(attempt);
           }
         },
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const loader = new FailbackLoader(config);
@@ -1086,6 +1122,9 @@ describe('FailbackLoader tests', function () {
         onAllFailed: (_orig, attempts) => {
           allFailedAttempts = attempts;
         },
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const loader = new FailbackLoader(config);
@@ -1155,6 +1194,9 @@ describe('FailbackLoader tests', function () {
           return `https://failback${attempt}.example.com/video/segment.ts?sig=${callCount}`;
         },
         onFailback: (_orig, _fb, attempt) => failbackAttempts.push(attempt),
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
       };
 
       const loader = new FailbackLoader(config);

@@ -1105,6 +1105,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     attempt.lastProgressTime = attempt.startTime;
     attempt.lastSpeedCheckTime = attempt.startTime;
 
+    if (attempt.isOriginal && attempt.failbackNumber === 0) {
+      this.stats.loading.start = attempt.startTime;
+    }
+
     // Per-attempt overall load budget.
     const maxLoadTimeMs = this.loaderConfig?.loadPolicy.maxLoadTimeMs;
     if (maxLoadTimeMs && Number.isFinite(maxLoadTimeMs)) {
