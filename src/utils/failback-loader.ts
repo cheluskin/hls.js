@@ -399,8 +399,14 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private inFlightUrls: Set<string> = new Set();
   private hedgeTimer?: number;
 
-  // Last failure classification, used to pick onError vs onTimeout on exhaustion
+  // Last failure classification, used to pick onError vs onTimeout on exhaustion.
+  // Definitive HTTP/integrity failures are sticky: a later silent/stall/timeout
+  // must not overwrite them, otherwise completeExhausted() would report onTimeout
+  // instead of the real server error. lastFailureXhr is the XHR that produced the
+  // retained classification — kept separate from this.loader, which startAttempt()
+  // reassigns to each newly launched hedge.
   private lastFailureKind: AttemptFailureKind | null = null;
+  private lastFailureXhr: XMLHttpRequest | null = null;
   private lastErrorCode: number = 0;
   private lastErrorText: string = 'Network error';
 
@@ -612,6 +618,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.attempts.clear();
     this.inFlightUrls.clear();
     this.lastFailureKind = null;
+    this.lastFailureXhr = null;
     this.lastErrorCode = 0;
     this.lastErrorText = 'Network error';
 
@@ -889,12 +896,16 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
 
     // 3. Queued fresh-connection retries of hosts that went silent.
-    while (this.pendingRetryUrls.length > 0) {
+    // Walk the queue once: skip (and requeue) URLs still in flight so a busy
+    // head entry cannot block a ready sibling behind it. Bound the walk to
+    // the initial length to avoid spinning when every entry is still in flight.
+    let pendingRemaining = this.pendingRetryUrls.length;
+    while (pendingRemaining-- > 0) {
       const url = this.pendingRetryUrls.shift() as string;
       if (this.inFlightUrls.has(url)) {
-        // Still trying it; requeue for later so we don't spin.
+        // Still trying it; requeue for a later pump so we don't spin.
         this.pendingRetryUrls.push(url);
-        break;
+        continue;
       }
       const isOriginal = url === this.originalUrl;
       if (!isOriginal && !this.isFailbackHostAvailable(url)) {
@@ -1440,6 +1451,41 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
    * A single attempt failed. Record health, optionally requeue for a fresh
    * connection, then advance to the next candidate or finish the load.
    */
+  private isDefinitiveFailureKind(kind: AttemptFailureKind | null): boolean {
+    return kind === 'http' || kind === 'integrity';
+  }
+
+  /**
+   * Record the failure used when the load finally exhausts. Prefer an explicit
+   * HTTP/integrity error over a later soft failure (silent/stall/network), and
+   * keep `lastFailureXhr` pointed at the XHR that produced the retained error so
+   * onError/onTimeout receive the matching networkDetails — not the last hedge
+   * (this.loader is overwritten by each startAttempt).
+   */
+  private recordExhaustionFailure(
+    attempt: Attempt,
+    kind: AttemptFailureKind,
+    reason: string,
+    httpError?: { code: number; text: string },
+  ) {
+    if (
+      this.isDefinitiveFailureKind(this.lastFailureKind) &&
+      !this.isDefinitiveFailureKind(kind)
+    ) {
+      return;
+    }
+
+    this.lastFailureKind = kind;
+    this.lastFailureXhr = attempt.xhr;
+    if (httpError) {
+      this.lastErrorCode = httpError.code;
+      this.lastErrorText = httpError.text;
+    } else if (kind !== 'partial') {
+      this.lastErrorCode = 0;
+      this.lastErrorText = reason;
+    }
+  }
+
   private failAttempt(
     attempt: Attempt,
     kind: AttemptFailureKind,
@@ -1451,14 +1497,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
     attempt.settled = true;
 
-    this.lastFailureKind = kind;
-    if (httpError) {
-      this.lastErrorCode = httpError.code;
-      this.lastErrorText = httpError.text;
-    } else if (kind !== 'partial') {
-      this.lastErrorCode = 0;
-      this.lastErrorText = reason;
-    }
+    this.recordExhaustionFailure(attempt, kind, reason, httpError);
 
     const state = getSessionState(this.config);
     const elapsed = (self.performance.now() - attempt.startTime).toFixed(0);
@@ -1537,22 +1576,26 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     // A definitive server-side failure (HTTP error / incomplete body) is
     // reported as an error; a silent blackhole / stall / network outage is
     // reported as a timeout, matching transport semantics so hls.js applies
-    // its timeout retry policy.
-    const isHttpFailure =
-      this.lastFailureKind === 'http' || this.lastFailureKind === 'integrity';
+    // its timeout retry policy. lastFailureKind is sticky for http/integrity
+    // (see recordExhaustionFailure), so a later hedge timeout cannot mask them.
+    const isHttpFailure = this.isDefinitiveFailureKind(this.lastFailureKind);
+
+    // Prefer the XHR that produced the retained failure classification over
+    // this.loader (which may point at the last launched hedge attempt).
+    const networkDetails = this.lastFailureXhr || this.loader;
 
     if (isHttpFailure) {
       this.callbacks?.onError?.(
         { code: this.lastErrorCode, text: this.lastErrorText },
         this.context as FragmentLoaderContext,
-        this.loader,
+        networkDetails,
         this.stats,
       );
     } else {
       this.callbacks?.onTimeout?.(
         this.stats,
         this.context as FragmentLoaderContext,
-        this.loader,
+        networkDetails,
       );
     }
   }
