@@ -83,14 +83,10 @@ export default class FragmentLoader {
           frag.gap = false;
         }
       }
-      const LoaderCtor = FragmentILoader
-        ? FragmentILoader
-        : DefaultILoader === XhrLoader
-          ? FailbackLoader
-          : DefaultILoader;
-      const loader = (this.loader = new LoaderCtor(
-        config,
-      ) as Loader<FragmentLoaderContext>);
+      const loader = (this.loader = this.createLoader(
+        FragmentILoader,
+        DefaultILoader,
+      ));
       const loaderContext = createLoaderContext(frag, null, isIFrame);
       frag.loader = loader;
       const loadPolicy = getLoaderConfigWithoutReties(
@@ -232,9 +228,10 @@ export default class FragmentLoader {
         reject(createGapLoadError(frag, part));
         return;
       }
-      const loader = (this.loader = FragmentILoader
-        ? new FragmentILoader(config)
-        : (new DefaultILoader(config) as Loader<FragmentLoaderContext>));
+      const loader = (this.loader = this.createLoader(
+        FragmentILoader,
+        DefaultILoader,
+      ));
       const loaderContext = createLoaderContext(frag, part);
       frag.loader = loader;
       // Should we define another load policy for parts?
@@ -347,6 +344,21 @@ export default class FragmentLoader {
       fragLoading.first = partLoading.first;
     }
     fragLoading.end = partLoading.end;
+  }
+
+  private createLoader(
+    FragmentILoader: HlsConfig['fLoader'],
+    DefaultILoader: HlsConfig['loader'],
+  ): Loader<FragmentLoaderContext> {
+    // When using the default XhrLoader, route through FailbackLoader so both
+    // full segments and LL-HLS parts get CDN failover. Custom loaders are
+    // left untouched.
+    const LoaderCtor = FragmentILoader
+      ? FragmentILoader
+      : DefaultILoader === XhrLoader
+        ? FailbackLoader
+        : DefaultILoader;
+    return new LoaderCtor(this.config) as Loader<FragmentLoaderContext>;
   }
 
   private resetLoader(frag: Fragment, loader: Loader<FragmentLoaderContext>) {

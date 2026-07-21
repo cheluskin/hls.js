@@ -397,6 +397,14 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private attempts: Set<Attempt> = new Set();
   private inFlightUrls: Set<string> = new Set();
   private hedgeTimer?: number;
+  // Failback response held while the original is still allowed to win.
+  // Primary CDN keeps priority even when a hedged backup finishes first.
+  private parkedSuccess: {
+    attempt: Attempt;
+    data: any;
+    len: number;
+    status: number;
+  } | null = null;
 
   // Last failure classification, used to pick onError vs onTimeout on exhaustion.
   // Definitive HTTP/integrity failures are sticky: a later silent/stall/timeout
@@ -576,6 +584,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     });
     this.attempts.clear();
     this.inFlightUrls.clear();
+    this.parkedSuccess = null;
   }
 
   abort() {
@@ -616,6 +625,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.triedFailbackUrls.clear();
     this.attempts.clear();
     this.inFlightUrls.clear();
+    this.parkedSuccess = null;
     this.lastFailureKind = null;
     this.lastFailureXhr = null;
     this.lastErrorCode = 0;
@@ -842,7 +852,33 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         `\n  attempts: ${this.launchedCount}`,
     );
 
-    this.failbackConfig.onAllFailed?.(this.originalUrl, this.launchedCount);
+    this.invokeFailbackHook(
+      'onAllFailed',
+      this.failbackConfig.onAllFailed,
+      this.originalUrl,
+      this.launchedCount,
+    );
+  }
+
+  /**
+   * Invoke a user-supplied failbackConfig hook without letting exceptions
+   * interrupt the loader's success/error completion path.
+   */
+  private invokeFailbackHook(
+    name: string,
+    hook: ((...args: any[]) => void) | undefined,
+    ...args: any[]
+  ) {
+    if (!hook) {
+      return;
+    }
+    try {
+      hook(...args);
+    } catch (error: any) {
+      logger.warn(
+        `[FailbackLoader] ${name} callback threw: ${error?.message || error}`,
+      );
+    }
   }
 
   /**
@@ -940,7 +976,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.launchedCount++;
 
     if (!candidate.isOriginal) {
-      this.failbackConfig.onFailback?.(
+      this.invokeFailbackHook(
+        'onFailback',
+        this.failbackConfig.onFailback,
         this.originalUrl,
         candidate.url,
         candidate.failbackNumber,
@@ -999,6 +1037,77 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     );
   }
 
+  private findInFlightOriginal(): Attempt | null {
+    let found: Attempt | null = null;
+    Array.from(this.attempts).forEach((attempt) => {
+      if (attempt.isOriginal && !attempt.settled) {
+        found = attempt;
+      }
+    });
+    return found;
+  }
+
+  /**
+   * Cancel hedged failback requests without treating them as CDN failures.
+   * Used when the original source starts responding and must keep priority.
+   */
+  private abortNonOriginalAttempts() {
+    Array.from(this.attempts).forEach((attempt) => {
+      if (!attempt.isOriginal && !attempt.settled) {
+        attempt.settled = true;
+        this.teardownAttempt(attempt, true);
+      }
+    });
+  }
+
+  /**
+   * Hold a successful failback response while the original request is still
+   * viable. Prefer the highest-priority (lowest failbackNumber) parked body.
+   */
+  private parkFailbackSuccess(
+    attempt: Attempt,
+    data: any,
+    len: number,
+    status: number,
+  ) {
+    attempt.settled = true;
+    this.clearAttemptTimers(attempt);
+    this.attempts.delete(attempt);
+    this.inFlightUrls.delete(attempt.url);
+    attempt.xhr.onreadystatechange = null;
+    attempt.xhr.onprogress = null;
+    attempt.xhr.onerror = null;
+
+    if (
+      !this.parkedSuccess ||
+      attempt.failbackNumber < this.parkedSuccess.attempt.failbackNumber
+    ) {
+      this.parkedSuccess = { attempt, data, len, status };
+      this.logVerbose(
+        `[FailbackLoader] Parked failback #${attempt.failbackNumber} success; waiting on original: ${attempt.url}`,
+      );
+    }
+  }
+
+  /**
+   * Deliver a previously parked failback body after the original has failed.
+   * Returns true when a parked response was consumed.
+   */
+  private consumeParkedSuccess(): boolean {
+    if (!this.parkedSuccess || this.finished) {
+      return false;
+    }
+    const parked = this.parkedSuccess;
+    this.parkedSuccess = null;
+    this.completeWithSuccess(
+      parked.attempt,
+      parked.data,
+      parked.len,
+      parked.status,
+    );
+    return true;
+  }
+
   private startAttempt(
     url: string,
     isOriginal: boolean,
@@ -1039,15 +1148,17 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     const xhrSetup = this.config.xhrSetup;
     if (xhrSetup) {
       const xhrContext = url !== context.url ? { ...context, url } : context;
+      // Match XhrLoader: call xhrSetup with the loader instance as `this` so
+      // existing configs that rely on method-style hooks keep working.
       Promise.resolve()
         .then(() => {
           if (attempt.settled || this.finished) return;
-          return xhrSetup(xhr, url, xhrContext);
+          return xhrSetup.call(this, xhr, url, xhrContext);
         })
         .catch(() => {
           if (attempt.settled || this.finished) return;
           xhr.open('GET', url, true);
-          return xhrSetup(xhr, url, xhrContext);
+          return xhrSetup.call(this, xhr, url, xhrContext);
         })
         .then(() => {
           if (attempt.settled || this.finished) return;
@@ -1225,6 +1336,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         self.clearTimeout(this.hedgeTimer);
         this.hedgeTimer = undefined;
       }
+
+      // Original started responding: keep its priority even if a backup is
+      // already faster. Cancel competing hedges; a parked failback body is
+      // retained only as insurance if the original later stalls.
+      if (attempt.isOriginal) {
+        this.abortNonOriginalAttempts();
+      }
     }
 
     if (xhr.readyState !== 4) {
@@ -1254,6 +1372,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         );
         if (integrityError) {
           this.failAttempt(attempt, 'integrity', integrityError);
+          return;
+        }
+
+        // Primary keeps priority while it is still in flight: park failback
+        // successes and only promote them after the original fails.
+        if (!attempt.isOriginal && this.findInFlightOriginal()) {
+          this.parkFailbackSuccess(attempt, data, len, status);
           return;
         }
 
@@ -1287,6 +1412,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     attempt.settled = true;
     this.finished = true;
     this.loader = xhr;
+    this.parkedSuccess = null;
     // Detach the winner from the pool before aborting the losers so its own
     // teardown does not abort the (already complete) winning xhr.
     this.attempts.delete(attempt);
@@ -1295,6 +1421,26 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     xhr.onreadystatechange = null;
     xhr.onprogress = null;
     xhr.onerror = null;
+
+    // A hedged failback win leaves the original request still in-flight. If
+    // that original never produced a first byte (blackhole), abort alone would
+    // skip recordAttemptFailure — permanent failback never engages and every
+    // subsequent segment pays hedgeDelayMs again. Count those silent losers.
+    // (Usually the original already failed via monitor before consumeParkedSuccess;
+    // this covers the rare path where completeWithSuccess runs with original alive.)
+    if (!attempt.isOriginal) {
+      Array.from(this.attempts).forEach((loser) => {
+        if (
+          loser.isOriginal &&
+          !loser.settled &&
+          loser.firstByteAt === 0 &&
+          loser.loaded === 0
+        ) {
+          this.recordAttemptFailure(loser, 'silent');
+        }
+      });
+    }
+
     this.abortInternal();
 
     stats.loading.first = Math.max(attempt.firstByteAt, stats.loading.start);
@@ -1307,7 +1453,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     this.callbacks?.onProgress?.(stats, context, data, xhr);
 
-    this.failbackConfig.onSuccess?.(
+    this.invokeFailbackHook(
+      'onSuccess',
+      this.failbackConfig.onSuccess,
       xhr.responseURL,
       !attempt.isOriginal,
       attempt.failbackNumber,
@@ -1515,6 +1663,11 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     this.teardownAttempt(attempt, true);
     this.recordAttemptFailure(attempt, kind);
+
+    // Original lost: promote a parked failback body if one finished earlier.
+    if (attempt.isOriginal && this.consumeParkedSuccess()) {
+      return;
+    }
 
     // Retry silent/blackholed hosts on a fresh connection (probabilistic block).
     if (this.isRetryableSilence(kind)) {

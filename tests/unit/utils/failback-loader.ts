@@ -1452,4 +1452,380 @@ describe('FailbackLoader tests', function () {
       loader.destroy();
     });
   });
+
+  describe('Hedge win records original blackhole', function () {
+    it('should count a silent original toward permanent failback when hedge wins', function (done) {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 2,
+        firstByteTimeoutMs: 500,
+      };
+
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+
+      // First hedged win → consecutiveFailures = 1
+      // Backup finishes first and is parked; original then times out (silent).
+      const loader1 = new FailbackLoader(config);
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        if (xhr.url.includes('cdn.example.com')) {
+          // Blackhole: never respond
+          return;
+        }
+        self.setTimeout(() => {
+          const data = new ArrayBuffer(500);
+          xhr.simulateResponse(200, data, {
+            'Content-Length': '500',
+          });
+        }, 10);
+      };
+
+      loader1.load(context, loaderConfig, {
+        onSuccess: () => {
+          expect(getFailbackState(config)).to.deep.include({
+            consecutiveFailures: 1,
+            permanentMode: false,
+          });
+          loader1.destroy();
+
+          // Second hedged win → permanent mode
+          const loader2 = new FailbackLoader(config);
+          const context2: FragmentLoaderContext = {
+            ...context,
+            url: 'https://cdn.example.com/video/segment2.ts',
+          };
+          MockXMLHttpRequest.onRequest = (xhr) => {
+            if (xhr.url.includes('cdn.example.com')) {
+              return;
+            }
+            self.setTimeout(() => {
+              xhr.simulateResponse(200, new ArrayBuffer(500), {
+                'Content-Length': '500',
+              });
+            }, 10);
+          };
+
+          loader2.load(context2, loaderConfig, {
+            onSuccess: () => {
+              expect(getFailbackState(config)).to.deep.include({
+                consecutiveFailures: 2,
+                permanentMode: true,
+              });
+              loader2.destroy();
+
+              // Third load should skip original entirely (permanent mode)
+              const loader3 = new FailbackLoader(config);
+              const context3: FragmentLoaderContext = {
+                ...context,
+                url: 'https://cdn.example.com/video/segment3.ts',
+              };
+              const requestedUrls: string[] = [];
+              MockXMLHttpRequest.onRequest = (xhr) => {
+                requestedUrls.push(xhr.url);
+                self.setTimeout(() => {
+                  xhr.simulateResponse(200, new ArrayBuffer(500), {
+                    'Content-Length': '500',
+                  });
+                }, 0);
+              };
+
+              loader3.load(context3, loaderConfig, {
+                onSuccess: () => {
+                  expect(requestedUrls).to.deep.equal([
+                    'https://failback.example.com/video/segment3.ts',
+                  ]);
+                  loader3.destroy();
+                  done();
+                },
+                onError: () => done(new Error('Unexpected error')),
+                onTimeout: () => done(new Error('Unexpected timeout')),
+                onAbort: () => {},
+                onProgress: () => {},
+              });
+              clock.tick(50);
+            },
+            onError: () => done(new Error('Unexpected error on load 2')),
+            onTimeout: () => done(new Error('Unexpected timeout on load 2')),
+            onAbort: () => {},
+            onProgress: () => {},
+          });
+          // hedge + backup response + original first-byte timeout
+          clock.tick(700);
+        },
+        onError: () => done(new Error('Unexpected error on load 1')),
+        onTimeout: () => done(new Error('Unexpected timeout on load 1')),
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+      // hedge + backup response + original first-byte timeout
+      clock.tick(700);
+    });
+  });
+
+  describe('Original CDN priority over faster hedge', function () {
+    it('should prefer a slower original over a faster parked failback', function (done) {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 2,
+        firstByteTimeoutMs: 5000,
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        if (xhr.url.includes('cdn.example.com')) {
+          // Slow but working original: headers+body after the backup has finished.
+          self.setTimeout(() => {
+            xhr.simulateResponse(200, new ArrayBuffer(1000), {
+              'Content-Length': '1000',
+            });
+          }, 300);
+          return;
+        }
+        // Fast backup
+        self.setTimeout(() => {
+          xhr.simulateResponse(200, new ArrayBuffer(1000), {
+            'Content-Length': '1000',
+          });
+        }, 10);
+      };
+
+      loader.load(context, loaderConfig, {
+        onSuccess: (response) => {
+          expect(response.url).to.include('cdn.example.com');
+          expect(getFailbackState(config).consecutiveFailures).to.equal(0);
+          loader.destroy();
+          done();
+        },
+        onError: () => done(new Error('Unexpected error')),
+        onTimeout: () => done(new Error('Unexpected timeout')),
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+
+      // t=100 hedge launches backup; t=110 backup parks; t=300 original wins
+      clock.tick(350);
+    });
+  });
+
+  describe('xhrSetup this binding', function () {
+    it('should call xhrSetup with the FailbackLoader instance as this', function (done) {
+      const seenThis: unknown[] = [];
+      config.xhrSetup = function (this: unknown, xhr: XMLHttpRequest) {
+        seenThis.push(this);
+        xhr.open('GET', 'https://cdn.example.com/video/segment.ts', true);
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        self.setTimeout(() => {
+          xhr.simulateResponse(200, new ArrayBuffer(100), {
+            'Content-Length': '100',
+          });
+        }, 0);
+      };
+
+      loader.load(context, loaderConfig, {
+        onSuccess: () => {
+          expect(seenThis).to.have.lengthOf(1);
+          expect(seenThis[0]).to.equal(loader);
+          loader.destroy();
+          done();
+        },
+        onError: () => done(new Error('Unexpected error')),
+        onTimeout: () => done(new Error('Unexpected timeout')),
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+      // Flush microtasks from xhrSetup Promise chain, then timers
+      Promise.resolve()
+        .then(() => Promise.resolve())
+        .then(() => {
+          clock.tick(10);
+        })
+        .catch(done);
+    });
+  });
+
+  describe('failbackConfig callback isolation', function () {
+    it('should still complete successfully when onFailback/onSuccess throw', function (done) {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
+        onFailback: () => {
+          throw new Error('onFailback boom');
+        },
+        onSuccess: () => {
+          throw new Error('onSuccess boom');
+        },
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      let requestCount = 0;
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestCount++;
+        self.setTimeout(() => {
+          if (requestCount === 1) {
+            xhr.simulateNetworkError();
+          } else {
+            xhr.simulateResponse(200, new ArrayBuffer(200), {
+              'Content-Length': '200',
+            });
+          }
+        }, 0);
+      };
+
+      loader.load(context, loaderConfig, {
+        onSuccess: (response) => {
+          expect(response.url).to.include('failback.example.com');
+          loader.destroy();
+          done();
+        },
+        onError: () => done(new Error('Should not have called onError')),
+        onTimeout: () => done(new Error('Should not have timed out')),
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+      clock.tick(50);
+    });
+
+    it('should still report exhaustion when onAllFailed throws', function (done) {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
+        onAllFailed: () => {
+          throw new Error('onAllFailed boom');
+        },
+      };
+
+      const loader = new FailbackLoader(config);
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        self.setTimeout(() => {
+          xhr.simulateNetworkError();
+        }, 0);
+      };
+
+      loader.load(context, loaderConfig, {
+        onSuccess: () => done(new Error('Should not succeed')),
+        onError: () => {
+          loader.destroy();
+          done();
+        },
+        onTimeout: () => {
+          loader.destroy();
+          done();
+        },
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+      clock.tick(50);
+    });
+  });
 });

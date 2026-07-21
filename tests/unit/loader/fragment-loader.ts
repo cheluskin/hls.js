@@ -3,12 +3,15 @@ import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
 import { ErrorDetails, ErrorTypes } from '../../../src/errors';
-import { Fragment } from '../../../src/loader/fragment';
+import { Fragment, Part } from '../../../src/loader/fragment';
 import FragmentLoader, { LoadError } from '../../../src/loader/fragment-loader';
 import { LevelDetails } from '../../../src/loader/level-details';
 import { LoadStats } from '../../../src/loader/load-stats';
 import { PlaylistLevelType } from '../../../src/types/loader';
+import { AttrList } from '../../../src/utils/attr-list';
+import FailbackLoader from '../../../src/utils/failback-loader';
 import { logger } from '../../../src/utils/logger';
+import XhrLoader from '../../../src/utils/xhr-loader';
 import { MockXhr } from '../../mocks/loader.mock';
 import type { MediaFragment } from '../../../src/loader/fragment';
 
@@ -268,6 +271,40 @@ describe('FragmentLoader tests', function () {
       });
       expect(fragmentLoaderPrivates.loader).to.not.exist;
       expect(frag.loader).to.not.exist;
+    });
+  });
+
+  it('uses FailbackLoader for LL-HLS parts when loader is the default XhrLoader', function () {
+    const partLoader = new FragmentLoader(
+      mergeConfig(hlsDefaultConfig, { loader: XhrLoader }, logger),
+    );
+    const part = new Part(
+      new AttrList('DURATION=0.333,URI="part0.m4s"'),
+      frag,
+      'https://cdn.example.com/video/',
+      0,
+    );
+    const onProgress = sinon.spy();
+    // Kick off the load; FailbackLoader will create an XHR that we abort immediately.
+    const loadPromise = partLoader.loadPart(frag, part, onProgress);
+    const privates = partLoader as any;
+    expect(privates.loader).to.be.instanceOf(FailbackLoader);
+    partLoader.abort();
+    return loadPromise.catch(() => {
+      partLoader.destroy();
+    });
+  });
+
+  it('uses FailbackLoader for full fragments when loader is the default XhrLoader', function () {
+    const defaultLoader = new FragmentLoader(
+      mergeConfig(hlsDefaultConfig, { loader: XhrLoader }, logger),
+    );
+    const loadPromise = defaultLoader.load(frag);
+    const privates = defaultLoader as any;
+    expect(privates.loader).to.be.instanceOf(FailbackLoader);
+    defaultLoader.abort();
+    return loadPromise.catch(() => {
+      defaultLoader.destroy();
     });
   });
 });
