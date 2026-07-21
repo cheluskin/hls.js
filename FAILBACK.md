@@ -215,7 +215,6 @@ interface LoaderCallbacks<T> {
 │  │ • permanentFailbackMode: boolean                          │   │
 │  │ • dnsHostsCache: string[]                                │   │
 │  │ • fragmentsSinceLastProbe: number                         │   │
-│  │ • recoveryVideoElement: HTMLVideoElement | null          │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                   │
 │              permanentFailbackMode?                              │
