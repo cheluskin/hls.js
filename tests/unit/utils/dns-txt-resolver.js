@@ -141,12 +141,17 @@ describe('dns-txt-resolver', function () {
       expect(self.fetch.called).to.be.true;
     });
 
-    it('should return empty array when all providers fail', async function () {
+    it('should return empty array when all providers fail and cache empty result', async function () {
       self.fetch = sinon.stub().resolves({ ok: false });
 
-      const result = await fetchDnsTxt('test.example.com');
+      const result1 = await fetchDnsTxt('test.example.com');
+      const callCountAfterFirst = self.fetch.callCount;
 
-      expect(result).to.deep.equal([]);
+      const result2 = await fetchDnsTxt('test.example.com');
+
+      expect(result1).to.deep.equal([]);
+      expect(result2).to.deep.equal([]);
+      expect(self.fetch.callCount).to.equal(callCountAfterFirst);
     });
 
     it('should return empty array on network error', async function () {

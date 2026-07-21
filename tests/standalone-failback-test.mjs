@@ -378,6 +378,17 @@ test('URL transformation supports bracketed IPv6 failback host', () => {
   assert.equal(parsed.port, '9443');
 });
 
+test('URL transformation supports unbracketed IPv6 failback host', () => {
+  const hosts = ['2001:db8::1'];
+  const originalUrl = 'https://origin.example.com/video.ts';
+
+  const failbackUrl = getFailbackUrl(originalUrl, hosts, 0);
+  const parsed = new URL(failbackUrl);
+
+  assert.equal(parsed.hostname, '[2001:db8::1]');
+  assert.equal(parsed.port, '');
+});
+
 test('Invalid URL returns null', () => {
   const hosts = ['cdn.example.com'];
   const invalidUrl = 'not-a-valid-url';
