@@ -100,6 +100,8 @@ HLS.js использует многоуровневую систему загр
 
 - Инициализируется как `XhrLoader`. Наследуется плейлистами и ключами, а также используется в качестве fallback.
 
+**Известное ограничение:** failback применяется только к медиа-сегментам (`.ts` / `.m4s` / LL-HLS parts) через `FragmentLoader`. Плейлисты (`.m3u8`) и AES-ключи по-прежнему идут через обычный `XhrLoader` / `pLoader`. Если заблокирован сам манифест или ключ, сегментный failback не поможет.
+
 ### Интерфейс Loader
 
 Все загрузчики реализуют единый интерфейс:
@@ -210,10 +212,10 @@ interface LoaderCallbacks<T> {
 │                     FailbackLoader                               │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │ Состояние (глобальное, shared между всеми instances):    │   │
+│  │ Состояние (WeakMap на HlsConfig, изоляция плееров):      │   │
 │  │ • consecutiveOriginalFailures: number                     │   │
 │  │ • permanentFailbackMode: boolean                          │   │
-│  │ • dnsHostsCache: string[]                                │   │
+│  │ • unhealthyFailbackHosts: Map (карантин backup-хостов)    │   │
 │  │ • fragmentsSinceLastProbe: number                         │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                   │
@@ -295,7 +297,7 @@ interface LoaderCallbacks<T> {
 - Динамический reread списка хостов на каждом failback-кандидате, чтобы поздно завершившийся DNS preload влиял на следующие retry
 - **Быстрая детекция blackhole ТСПУ (first-byte timeout)** — если за `firstByteTimeoutMs` (по умолчанию 2500 мс) не пришло ни заголовков, ни байт, попытка считается заблокированной и бросается, не дожидаясь общего транспортного таймаута
 - **Детекция обрыва после первых байт (data-stall)** — если поток замолчал или трикл < 4KB/s дольше `dataStallTimeoutMs` (по умолчанию 3000 мс), попытка бросается (классический паттерн «несколько байт и тишина»)
-- **Staggered-хеджирование (параллельная гонка)** — если ведущий запрос молчит `hedgeDelayMs` (по умолчанию 1200 мс), параллельно открывается следующий кандидат; побеждает первый валидный ответ, остальные отменяются. Здоровый CDN отвечает быстрее задержки хеджа, поэтому лишних запросов не создаётся
+- **Staggered-хеджирование (параллельная гонка)** — если ведущий запрос молчит `hedgeDelayMs` (по умолчанию 1200 мс), параллельно открывается следующий кандидат; побеждает первый валидный ответ, остальные отменяются. Заголовки оригинала **не** убивают уже летящий backup: 503 или 200-then-stall на origin оставляют резерв как страховку. Здоровый CDN отвечает быстрее задержки хеджа, поэтому лишних запросов не создаётся
 - **Пере-попытки молчащих хостов по свежему соединению** — блокировка ТСПУ вероятностна, поэтому silent/stall/network-фейлы одного хоста повторяются на новом соединении до `silentRetriesPerHost` раз (по умолчанию 2). HTTP-ошибки на том же хосте не повторяются
 - **Режим постоянного failback** — после 2 обычных ошибок либо сразу после подтверждённой неполной передачи все последующие запросы идут напрямую на резервные хосты
 - Дедупликация уже попробованных URL + защитные лимиты `MAX_FAILBACK_ATTEMPTS = 32` и `MAX_TOTAL_ATTEMPTS_PER_LOAD = 24` против циклического `transformUrl` и бесконечных retry при полном блэкауте
@@ -308,18 +310,23 @@ interface LoaderCallbacks<T> {
 
 Получение списка резервных хостов из DNS TXT записи через DNS-over-HTTPS.
 
-**Провайдеры DoH:**
+**Провайдеры DoH (параллельно, первый успешный ответ побеждает):**
 
 1. Google (`dns.google/resolve`)
 2. Cloudflare (`cloudflare-dns.com/dns-query`)
+3. Quad9 (`dns.quad9.net:5053/dns-query`)
+4. AliDNS (`dns.alidns.com/resolve`)
+
+Список можно переопределить через `failbackConfig.dohProviders` или `setDohProviders()`. Google/Cloudflare часто блокируются там же, где нужен failback, поэтому в дефолте есть дополнительные JSON DoH-эндпойнты с CORS.
 
 **Особенности:**
 
 - Параллельные запросы ко всем провайдерам (первый успешный ответ побеждает)
 - Таймаут 3 секунды на каждый провайдер
-- `dns-txt-resolver` кеширует TXT-ответы на всю сессию
+- `dns-txt-resolver` кеширует успешные TXT-ответы на всю сессию; пустой/ошибочный lookup — на 60 секунд
 - `failback-host-resolver` дополнительно держит per-domain promise/cache для `preloadFailbackHosts()` и синхронного чтения
-- `clearDnsCache()` очищает обе прослойки кеша через listener
+- `clearDnsCache()` очищает обе прослойки кеша через listener (`all`)
+- `expireNegativeDnsCache()` сбрасывает только отрицательные DNS-записи и неудавшиеся preload-promise; успешный GeoDNS host-cache не трогает
 
 ---
 
@@ -503,6 +510,13 @@ export interface FailbackConfig {
    * HTTP-ошибки на том же хосте не повторяются. По умолчанию 2.
    */
   silentRetriesPerHost?: number;
+
+  /**
+   * Переопределить process-wide список DoH-провайдеров для резолва
+   * failback-хостов. Пустой/опущенный список оставляет дефолт
+   * (Google, Cloudflare, Quad9, AliDNS).
+   */
+  dohProviders?: string[];
 }
 ```
 
@@ -524,6 +538,10 @@ export async function fetchFailbackHosts(domain?: string): Promise<string[]>;
 
 // Очистка DNS кешей resolver/preload слоя
 export function clearDnsCache(): void;
+
+// Переопределить / прочитать process-wide список DoH-провайдеров
+export function setDohProviders(providers?: string[]): void;
+export function getDohProviders(): readonly string[];
 
 // Краткое состояние failback для конкретного HlsConfig
 export function getFailbackState(config: HlsConfig): {
@@ -601,7 +619,7 @@ backup3.example.com
 - Нет необходимости обновлять клиентский код
 - Изменения DNS подхватываются на новой сессии или после явного `clearDnsCache()`
 - Поддержка GeoDNS для региональных хостов
-- **Отрицательное кэширование (Negative Caching)**: при недоступности всех DoH-провайдеров факт сбоя кэшируется в сессии, предотвращая повторные сетевые таймауты DoH на каждом фрагменте.
+- **Отрицательное кэширование (Negative Caching)**: при недоступности всех DoH-провайдеров пустой результат кешируется на **60 секунд**, а не на всю сессию. Это гасит повторные таймауты DoH на каждом фрагменте, но позволяет позже подхватить GeoDNS-список, если плеер стартовал офлайн или DoH был временно заблокирован. Build-time fallback-хост при этом не записывается в постоянный host-cache.
 
 ---
 
@@ -626,7 +644,7 @@ FailbackLoader перехватывает следующие ситуации:
 4. **Browser-initiated `206 Partial Content`** при stale cache, когда мы сами не запрашивали `Range` (даже если `Content-Range` скрыт CORS)
 5. **Blackhole ТСПУ (`silent`)** — за `firstByteTimeoutMs` не пришло ни заголовков, ни байт
 6. **Обрыв после первых байт (`stall`)** — поток замолчал или трикл < 4KB/s дольше `dataStallTimeoutMs`
-7. **Усечённый `200/206` ответ** — фактический размер тела не совпадает с `Content-Length` или запрошенным byte range
+7. **Усечённый `200/206` ответ** — тело короче `Content-Length` (обрыв middlebox) или не совпадает с запрошенным byte range. Тело *длиннее* `Content-Length` не считается ошибкой: так выглядит hidden gzip, когда `Content-Encoding` скрыт CORS.
 
 Классификация ошибок определяет стратегию:
 
@@ -645,7 +663,15 @@ FailbackLoader перехватывает следующие ситуации:
 
 ### Режим постоянного failback
 
-После **2 обычных последовательных ошибок** на оригинальном источнике библиотека переключается в **режим постоянного failback**. Подтверждённая неполная передача (обрыв после headers/progress, stall или размер тела, не совпадающий с `Content-Length`/Range) переводит в этот режим сразу — следующий фрагмент не ждёт второго таймаута.
+После **2 обычных последовательных ошибок** на оригинальном источнике библиотека переключается в **режим постоянного failback**. Подтверждённая неполная передача переводит в этот режим сразу:
+
+- stall после headers/progress
+- несовпадение запрошенного Range
+- тело короче `Content-Length` при `identity` / без `Content-Encoding` (завершённый обрыв middlebox)
+
+Тело *длиннее* `Content-Length` не считается ошибкой: так выглядит hidden gzip, когда `Content-Encoding` скрыт CORS.
+
+Если в permanent mode все backup-хосты в карантине, loader не роняет фрагмент сразу: сначала пробует оригинал как last resort, и только если он тоже недоступен — один раз игнорирует карантин. Успешный полный сегмент с оригинала выводит из permanent mode.
 
 - Все новые запросы идут сразу на резервные хосты (минуя оригинальный)
 - Это ускоряет загрузку когда оригинальный источник полностью недоступен
@@ -763,12 +789,11 @@ Per-fragment логи (`LOAD START`, `LOADING`, `RESPONSE HEADERS RECEIVED`, `SU
 - если бюджет уже вышел, ставит timeout на `0ms`
 - вызывает его асинхронно, чтобы чисто выйти из текущего `onreadystatechange`
 
-### 7. Почему `abortInternal()` обнуляет `this.loader`, а `getResponseHeader()` завернут в `try/catch`
+### 7. Почему уже летящий backup не убивается по заголовкам оригинала
 
-Это защита от браузерных edge-cases:
+Приоритет origin обеспечивается парковкой (`parkFailbackSuccess` / `consumeParkedSuccess`) и `abortInternal()` только после **валидного тела**. Заголовки сами по себе ничего не доказывают: ТСПУ часто отдаёт 503 или 200 и затем обрывает поток. Если в этот момент abort-ить hedged backup, единственный рабочий кандидат оказывается в `triedFailbackUrls` и фрагмент падает впустую.
 
-- stale async callbacks от старого XHR должны сразу отфильтровываться по `this.loader !== xhr`
-- некоторые браузеры бросают `InvalidStateError`, если читать header слишком рано или после невалидного состояния XHR
+`getResponseHeader()` завернут в `try/catch`: некоторые браузеры бросают `InvalidStateError`, если читать header слишком рано или после невалидного состояния XHR.
 
 ---
 
@@ -995,9 +1020,9 @@ npm run release:check
 
 ### Покрытие тестами
 
-- **Upstream Karma Unit тесты (1143):** Полный тестовый сюит HLS.js (включая CMCD v2, transmuxer, ABR, buffer, audio, subtitle controllers)
-- **Standalone failback тесты (42):** DNS resolver, URL transformation, state management, exports, IPv6 formatting, negative DNS caching
-- **Integration тесты (33):** Полные интеграционные сценарии загрузчика:
+- **Upstream Karma Unit тесты (1155+):** Полный тестовый сюит HLS.js (включая CMCD v2, transmuxer, ABR, buffer, audio, subtitle controllers)
+- **Standalone failback тесты (44):** DNS resolver, URL transformation, state management, exports, IPv6 formatting, negative DNS caching с TTL
+- **Integration тесты (36):** Полные интеграционные сценарии загрузчика:
   - Базовый failback и обход отказа первого источника
   - Режим постоянного failback и автоматическое зондирование восстановления (probe 16KB Range)
   - Детекция скрытых browser-initiated 206 Partial Content
@@ -1007,6 +1032,8 @@ npm run release:check
   - **ТСПУ Data Stall**: микро-пропускная цензура (трикл < 4KB/s) и таймаут простая `dataStallTimeoutMs`
   - **Вероятностный Requeueing**: повторный запуск хоста по свежему TCP-сокету при молчаливом сетевом сбое (`silentRetriesPerHost`)
   - **Дифференциация карантина хостов**: отправка серверных ошибок (HTTP 503) в карантин (`failbackHostCooldownMs = 30s`) с сохранением доступности хостов при молчаливой цензуре
+  - **Last-resort original**: в permanent mode при карантине всех backup-хостов пробуется оригинал, а не мгновенный отказ фрагмента
+  - **Hedged backup survives origin headers**: 503 или 200-then-stall на оригинале не убивает уже летящий backup
 
 ---
 

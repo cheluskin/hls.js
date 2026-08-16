@@ -89,4 +89,6 @@ export {
   fetchDnsTxt,
   fetchFailbackHosts,
   clearDnsCache,
+  getDohProviders,
+  setDohProviders,
 } from './utils/dns-txt-resolver';

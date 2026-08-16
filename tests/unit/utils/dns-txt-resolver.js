@@ -4,7 +4,12 @@ import {
   fetchDnsTxt,
   fetchFailbackHosts,
   clearDnsCache,
+  expireNegativeDnsCache,
+  getDohProviders,
+  setDohProviders,
+  NEGATIVE_DNS_CACHE_TTL_MS,
 } from '../../../src/utils/dns-txt-resolver';
+import { preloadFailbackHosts } from '../../../src/utils/failback-host-resolver';
 
 describe('dns-txt-resolver', function () {
   let originalFetch;
@@ -19,6 +24,7 @@ describe('dns-txt-resolver', function () {
   afterEach(function () {
     // Restore original fetch
     self.fetch = originalFetch;
+    setDohProviders();
   });
 
   describe('fetchDnsTxt', function () {
@@ -126,19 +132,39 @@ describe('dns-txt-resolver', function () {
         Answer: [{ type: 16, data: '"success-host"' }],
       };
 
-      // First provider fails, second succeeds (parallel requests)
-      self.fetch = sinon.stub();
-      self.fetch.onFirstCall().resolves({ ok: false });
-      self.fetch.onSecondCall().resolves({
-        ok: true,
-        json: () => Promise.resolve(mockResponse),
+      self.fetch = sinon.stub().callsFake((url) => {
+        if (String(url).includes('dns.google')) {
+          return Promise.resolve({ ok: false });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve(mockResponse),
+        });
       });
 
       const result = await fetchDnsTxt('test.example.com');
 
       expect(result).to.deep.equal(['success-host']);
-      // Both providers are called in parallel
       expect(self.fetch.called).to.be.true;
+      expect(self.fetch.callCount).to.equal(getDohProviders().length);
+    });
+
+    it('should query overridden DoH providers', async function () {
+      setDohProviders(['https://doh.test.example/resolve']);
+      self.fetch = sinon.stub().resolves({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            Status: 0,
+            Answer: [{ type: 16, data: '"custom.example.com"' }],
+          }),
+      });
+
+      const result = await fetchDnsTxt('custom-doh.example.com');
+
+      expect(result).to.deep.equal(['custom.example.com']);
+      expect(self.fetch.callCount).to.equal(1);
+      expect(self.fetch.firstCall.args[0]).to.include('doh.test.example');
     });
 
     it('should return empty array when all providers fail and cache empty result', async function () {
@@ -152,6 +178,38 @@ describe('dns-txt-resolver', function () {
       expect(result1).to.deep.equal([]);
       expect(result2).to.deep.equal([]);
       expect(self.fetch.callCount).to.equal(callCountAfterFirst);
+    });
+
+    it('should retry a negative DNS lookup after the TTL expires', async function () {
+      const start = Date.now();
+      const nowStub = sinon.stub(Date, 'now').returns(start);
+      try {
+        self.fetch = sinon.stub().resolves({ ok: false });
+
+        const result1 = await fetchDnsTxt('neg-ttl.example.com');
+        expect(result1).to.deep.equal([]);
+        const callCountAfterFail = self.fetch.callCount;
+
+        nowStub.returns(start + NEGATIVE_DNS_CACHE_TTL_MS - 1);
+        const stillCached = await fetchDnsTxt('neg-ttl.example.com');
+        expect(stillCached).to.deep.equal([]);
+        expect(self.fetch.callCount).to.equal(callCountAfterFail);
+
+        nowStub.returns(start + NEGATIVE_DNS_CACHE_TTL_MS + 1);
+        self.fetch = sinon.stub().resolves({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              Status: 0,
+              Answer: [{ type: 16, data: '"recovered.example.com"' }],
+            }),
+        });
+
+        const recovered = await fetchDnsTxt('neg-ttl.example.com');
+        expect(recovered).to.deep.equal(['recovered.example.com']);
+      } finally {
+        nowStub.restore();
+      }
     });
 
     it('should return empty array on network error', async function () {
@@ -296,6 +354,58 @@ describe('dns-txt-resolver', function () {
       await fetchDnsTxt('test.example.com');
       // Call count should increase after cache clear
       expect(self.fetch.callCount).to.be.greaterThan(callCountAfterFirst);
+    });
+  });
+
+  describe('preloadFailbackHosts after negative DNS', function () {
+    it('should pick up DNS hosts after the negative cache expires', async function () {
+      self.fetch = sinon.stub().resolves({ ok: false });
+
+      const fallbackHosts = await preloadFailbackHosts(
+        'preload-neg-ttl.example.com',
+      );
+      expect(fallbackHosts).to.be.an('array');
+
+      expireNegativeDnsCache();
+      self.fetch = sinon.stub().resolves({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            Status: 0,
+            Answer: [{ type: 16, data: '"recovered-host.example.com"' }],
+          }),
+      });
+
+      const recovered = await preloadFailbackHosts(
+        'preload-neg-ttl.example.com',
+      );
+      expect(recovered).to.deep.equal(['recovered-host.example.com']);
+    });
+
+    it('should keep a positive host cache when only negative DNS entries expire', async function () {
+      self.fetch = sinon.stub().resolves({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            Status: 0,
+            Answer: [{ type: 16, data: '"keep-me.example.com"' }],
+          }),
+      });
+
+      const positive = await preloadFailbackHosts('positive-keep.example.com');
+      expect(positive).to.deep.equal(['keep-me.example.com']);
+
+      self.fetch = sinon.stub().resolves({ ok: false });
+      await preloadFailbackHosts('negative-drop.example.com');
+      const fetchCountAfterNegative = self.fetch.callCount;
+
+      expireNegativeDnsCache();
+
+      const stillPositive = await preloadFailbackHosts(
+        'positive-keep.example.com',
+      );
+      expect(stillPositive).to.deep.equal(['keep-me.example.com']);
+      expect(self.fetch.callCount).to.equal(fetchCountAfterNegative);
     });
   });
 });

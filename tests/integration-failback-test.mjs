@@ -1840,7 +1840,12 @@ await test('Failback uses DNS-resolved hosts that arrive after load() started', 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     const href = typeof url === 'string' ? url : url?.url || '';
-    if (href.includes('dns.google') || href.includes('cloudflare-dns')) {
+    if (
+      href.includes('/resolve') ||
+      href.includes('dns-query') ||
+      href.includes('dns.google') ||
+      href.includes('cloudflare-dns')
+    ) {
       await dnsGate;
       return {
         ok: true,
@@ -2847,6 +2852,370 @@ await test('Host Quarantine Rules: HTTP 503 quarantines host, silent blackhole d
     globalThis.XMLHttpRequest = originalXHR;
     destroyFailbackState(config);
     loader1.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 34: Last-resort original when every backup is quarantined
+// ----------------------------------------
+await test('Last resort: permanent mode with quarantined backups tries original', async () => {
+  const { FailbackLoader, getFailbackState, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+  const requested = [];
+  let loadIndex = 0;
+
+  class LastResortXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+      requested.push(url);
+    }
+    setRequestHeader() {}
+    send() {
+      const url = this.responseURL;
+      const isFirstLoad = loadIndex === 0;
+      setTimeout(() => {
+        if (isFirstLoad && url.includes('origin.example.com')) {
+          this.readyState = 2;
+          this.status = 200;
+          this.onreadystatechange?.();
+          this.onprogress?.({ loaded: 100, total: 1000000 });
+          return;
+        }
+        if (isFirstLoad) {
+          this.readyState = 4;
+          this.status = 503;
+          this.statusText = 'Service Unavailable';
+          this.onreadystatechange?.();
+          return;
+        }
+        this.readyState = 4;
+        this.status = 200;
+        this.response = new ArrayBuffer(1000);
+        this.onreadystatechange?.();
+      }, 5);
+    }
+    abort() {}
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = LastResortXHR;
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: false,
+      failbackHostCooldownMs: 60000,
+      silentRetriesPerHost: 0,
+      dataStallTimeoutMs: 50,
+    },
+  };
+  const loader1 = new FailbackLoader(config);
+
+  try {
+    await new Promise((resolve, reject) => {
+      loader1.load(
+        {
+          url: 'https://origin.example.com/seg1.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: () => reject(new Error('Load 1 should fail')),
+          onError: () => resolve(),
+          onTimeout: () => resolve(),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.equal(getFailbackState(config).permanentMode, true);
+    loadIndex = 1;
+    const loader2 = new FailbackLoader(config);
+    let successUrl = '';
+    await new Promise((resolve, reject) => {
+      loader2.load(
+        {
+          url: 'https://origin.example.com/seg2.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            successUrl = response.url;
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(
+      successUrl.includes('origin.example.com'),
+      'Last-resort original should win when backups are quarantined',
+    );
+    assert.equal(getFailbackState(config).permanentMode, false);
+    loader2.destroy();
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader1.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 35: Original HTTP error headers must not abort an in-flight backup
+// ----------------------------------------
+await test('Hedged backup survives original 503 headers', async () => {
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+
+  class HeaderThenErrorXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._aborted = false;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+    }
+    setRequestHeader() {}
+    send() {
+      const url = this.responseURL;
+      if (url.includes('origin.example.com')) {
+        setTimeout(() => {
+          if (this._aborted) return;
+          this.readyState = 2;
+          this.status = 503;
+          this.statusText = 'Service Unavailable';
+          this.onreadystatechange?.();
+          this.readyState = 4;
+          this.onreadystatechange?.();
+        }, 80);
+        return;
+      }
+      setTimeout(() => {
+        if (this._aborted) return;
+        this.readyState = 4;
+        this.status = 200;
+        this.response = new ArrayBuffer(1000);
+        this.onreadystatechange?.();
+      }, 120);
+    }
+    abort() {
+      this._aborted = true;
+    }
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = HeaderThenErrorXHR;
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: true,
+      hedgeDelayMs: 30,
+      silentRetriesPerHost: 0,
+      firstByteTimeoutMs: 2000,
+    },
+  };
+  const loader = new FailbackLoader(config);
+
+  try {
+    let successUrl = '';
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/seg.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            successUrl = response.url;
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(
+      successUrl.includes('backup.example.com'),
+      'In-flight backup should win after original 503 headers',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
+  }
+});
+
+// ----------------------------------------
+// Test 36: Original 200 headers then stall must not abort an in-flight backup
+// ----------------------------------------
+await test('Hedged backup survives original 200 headers then stall', async () => {
+  const { FailbackLoader, destroyFailbackState } =
+    await import('../dist/hls.mjs');
+  const originalXHR = globalThis.XMLHttpRequest;
+
+  class HeaderThenStallXHR {
+    constructor() {
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.response = null;
+      this.responseURL = '';
+      this.onreadystatechange = null;
+      this.onprogress = null;
+      this.onerror = null;
+      this._aborted = false;
+    }
+    open(method, url) {
+      this.readyState = 1;
+      this.responseURL = url;
+    }
+    setRequestHeader() {}
+    send() {
+      const url = this.responseURL;
+      if (url.includes('origin.example.com')) {
+        setTimeout(() => {
+          if (this._aborted) return;
+          this.readyState = 2;
+          this.status = 200;
+          this.statusText = 'OK';
+          this.onreadystatechange?.();
+          this.onprogress?.({ loaded: 80, total: 1000000 });
+        }, 80);
+        return;
+      }
+      setTimeout(() => {
+        if (this._aborted) return;
+        this.readyState = 4;
+        this.status = 200;
+        this.response = new ArrayBuffer(1000);
+        this.onreadystatechange?.();
+      }, 120);
+    }
+    abort() {
+      this._aborted = true;
+    }
+    getResponseHeader() {
+      return null;
+    }
+  }
+
+  globalThis.XMLHttpRequest = HeaderThenStallXHR;
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: true,
+      hedgeDelayMs: 30,
+      silentRetriesPerHost: 0,
+      firstByteTimeoutMs: 2000,
+      dataStallTimeoutMs: 80,
+    },
+  };
+  const loader = new FailbackLoader(config);
+
+  try {
+    let successUrl = '';
+    await new Promise((resolve, reject) => {
+      loader.load(
+        {
+          url: 'https://origin.example.com/seg.ts',
+          frag: null,
+          part: null,
+          responseType: 'arraybuffer',
+          headers: {},
+          rangeStart: 0,
+          rangeEnd: 0,
+        },
+        {
+          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          maxRetry: 0,
+          retryDelay: 0,
+          maxRetryDelay: 0,
+        },
+        {
+          onSuccess: (response) => {
+            successUrl = response.url;
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onAbort: () => {},
+          onProgress: () => {},
+        },
+      );
+    });
+
+    assert.ok(
+      successUrl.includes('backup.example.com'),
+      'In-flight backup should win after original headers-then-stall',
+    );
+  } finally {
+    globalThis.XMLHttpRequest = originalXHR;
+    destroyFailbackState(config);
+    loader.destroy();
   }
 });
 

@@ -1776,6 +1776,7 @@ export type ExtendedSourceBuffer = SourceBuffer & {
 export interface FailbackConfig {
     dataStallTimeoutMs?: number;
     dnsDomain?: string;
+    dohProviders?: string[];
     enableCacheControlHeader?: boolean;
     failbackHostCooldownMs?: number;
     firstByteTimeoutMs?: number;

@@ -1,3 +1,4 @@
+import { setDohProviders } from './dns-txt-resolver';
 import {
   DEFAULT_FAILBACK_DNS_DOMAIN,
   getFailbackHostsSync,
@@ -338,6 +339,12 @@ export interface FailbackConfig {
    * retried on the same host. Default: 2.
    */
   silentRetriesPerHost?: number;
+  /**
+   * Override the process-wide DNS-over-HTTPS provider list used to resolve
+   * failback hosts. Empty/omitted keeps the built-in defaults (Google,
+   * Cloudflare, Quad9, AliDNS).
+   */
+  dohProviders?: string[];
 }
 
 // Safety cap to prevent infinite loops if transformUrl never returns null
@@ -392,6 +399,9 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private launchedCount: number = 0;
   private failbackAttempt: number = 0;
   private triedFailbackUrls: Set<string> = new Set();
+  // After every healthy backup is quarantined, walk the list once more
+  // ignoring cooldown so a load is never left with zero candidates.
+  private quarantineBypassStarted: boolean = false;
 
   // In-flight attempts (parallel hedging)
   private attempts: Set<Attempt> = new Set();
@@ -440,7 +450,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       dataStallTimeoutMs: userConfig.dataStallTimeoutMs,
       maxParallelAttempts: userConfig.maxParallelAttempts,
       silentRetriesPerHost: userConfig.silentRetriesPerHost,
+      dohProviders: userConfig.dohProviders,
     };
+
+    if (userConfig.dohProviders && userConfig.dohProviders.length > 0) {
+      setDohProviders(userConfig.dohProviders);
+    }
 
     // Ensure state exists for this config
     getSessionState(config);
@@ -623,6 +638,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     this.launchedCount = 0;
     this.failbackAttempt = 0;
     this.triedFailbackUrls.clear();
+    this.quarantineBypassStarted = false;
     this.attempts.clear();
     this.inFlightUrls.clear();
     this.parkedSuccess = null;
@@ -796,14 +812,24 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
    * Only the original request feeds the permanent-mode threshold; failback
    * hosts are quarantined only on definitive (non-censorship) failures.
    */
-  private recordAttemptFailure(attempt: Attempt, kind: AttemptFailureKind) {
+  private recordAttemptFailure(
+    attempt: Attempt,
+    kind: AttemptFailureKind,
+    options?: { confirmedUnusable?: boolean },
+  ) {
     // A browser-synthesized 206 is not evidence about the CDN itself.
     if (kind === 'partial') {
       return;
     }
 
     if (attempt.isOriginal) {
-      const confirmedUnusable = kind === 'stall' || kind === 'integrity';
+      // Stall is a confirmed mid-transfer break. Integrity is immediately
+      // unusable for Range mismatches we issued and for an identity body
+      // shorter than Content-Length (finished truncated transfer). A body
+      // longer than Content-Length is hidden gzip and never reaches here.
+      const confirmedUnusable =
+        kind === 'stall' ||
+        (kind === 'integrity' && options?.confirmedUnusable === true);
       this.recordOriginalSourceFailure(
         `Original source ${this.describeFailure(kind)}`,
         confirmedUnusable,
@@ -813,7 +839,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     // Failback hosts: only a definitive server-side failure (HTTP error)
     // quarantines the host. Silent/stall/network failures are treated as
-    // likely-censorship and remain retryable (see reEnqueueOnSilence).
+    // likely-censorship and remain retryable (see maybeRequeueForRetry).
     if (kind === 'http') {
       this.quarantineFailbackHost(
         attempt.url,
@@ -882,24 +908,14 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   }
 
   /**
-   * Compute the next candidate URL to launch, or null if exhausted.
-   * Order: original (once, if allowed) → each failback host → queued
-   * fresh-connection retries of silent hosts.
+   * Walk remaining failback hosts. When `ignoreQuarantine` is set, hosts that
+   * were skipped for cooldown become eligible so a load is never left empty.
    */
-  private dequeueCandidateUrl(): {
+  private nextFailbackCandidate(ignoreQuarantine: boolean): {
     url: string;
     isOriginal: boolean;
     failbackNumber: number;
   } | null {
-    // 1. Original source (only the very first slot, and only when allowed).
-    if (this.allowOriginal && !this.attemptedOriginalRequest) {
-      this.attemptedOriginalRequest = true;
-      if (!this.inFlightUrls.has(this.originalUrl)) {
-        return { url: this.originalUrl, isOriginal: true, failbackNumber: 0 };
-      }
-    }
-
-    // 2. Fresh failback hosts in order.
     while (this.nextFailbackIndex < MAX_FAILBACK_ATTEMPTS) {
       const index = this.nextFailbackIndex;
       const candidate = this.getFailbackUrl(index);
@@ -918,7 +934,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       if (this.inFlightUrls.has(candidate)) {
         continue;
       }
-      if (!this.isFailbackHostAvailable(candidate)) {
+      if (!ignoreQuarantine && !this.isFailbackHostAvailable(candidate)) {
         continue;
       }
       this.triedFailbackUrls.add(candidate);
@@ -928,6 +944,33 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         isOriginal: false,
         failbackNumber: this.failbackAttempt,
       };
+    }
+    return null;
+  }
+
+  /**
+   * Compute the next candidate URL to launch, or null if exhausted.
+   * Order: original (once, if allowed) → each failback host → queued
+   * fresh-connection retries of silent hosts → last-resort original →
+   * one quarantine-bypass pass over unused backups.
+   */
+  private dequeueCandidateUrl(): {
+    url: string;
+    isOriginal: boolean;
+    failbackNumber: number;
+  } | null {
+    // 1. Original source (only the very first slot, and only when allowed).
+    if (this.allowOriginal && !this.attemptedOriginalRequest) {
+      this.attemptedOriginalRequest = true;
+      if (!this.inFlightUrls.has(this.originalUrl)) {
+        return { url: this.originalUrl, isOriginal: true, failbackNumber: 0 };
+      }
+    }
+
+    // 2. Fresh failback hosts in order.
+    const failback = this.nextFailbackCandidate(this.quarantineBypassStarted);
+    if (failback) {
+      return failback;
     }
 
     // 3. Queued fresh-connection retries of hosts that went silent.
@@ -943,11 +986,41 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
         continue;
       }
       const isOriginal = url === this.originalUrl;
-      if (!isOriginal && !this.isFailbackHostAvailable(url)) {
+      if (
+        !isOriginal &&
+        !this.quarantineBypassStarted &&
+        !this.isFailbackHostAvailable(url)
+      ) {
         continue;
       }
       const failbackNumber = isOriginal ? 0 : ++this.failbackAttempt;
       return { url, isOriginal, failbackNumber };
+    }
+
+    // 4. Permanent mode skipped the original, but every backup is dead or
+    // quarantined. A working origin is better than failing the fragment.
+    if (!this.attemptedOriginalRequest) {
+      this.attemptedOriginalRequest = true;
+      if (!this.inFlightUrls.has(this.originalUrl)) {
+        logger.log(
+          `[FailbackLoader] LAST RESORT: no healthy failback hosts, trying original: ${this.originalUrl}`,
+        );
+        return { url: this.originalUrl, isOriginal: true, failbackNumber: 0 };
+      }
+    }
+
+    // 5. Still nothing launchable: retry backups that were only skipped for
+    // cooldown. Hosts already tried this load stay in triedFailbackUrls.
+    if (!this.quarantineBypassStarted) {
+      this.quarantineBypassStarted = true;
+      this.nextFailbackIndex = 0;
+      const bypassed = this.nextFailbackCandidate(true);
+      if (bypassed) {
+        logger.log(
+          `[FailbackLoader] LAST RESORT: ignoring failback host quarantine for ${bypassed.url}`,
+        );
+        return bypassed;
+      }
     }
 
     return null;
@@ -1045,19 +1118,6 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       }
     });
     return found;
-  }
-
-  /**
-   * Cancel hedged failback requests without treating them as CDN failures.
-   * Used when the original source starts responding and must keep priority.
-   */
-  private abortNonOriginalAttempts() {
-    Array.from(this.attempts).forEach((attempt) => {
-      if (!attempt.isOriginal && !attempt.settled) {
-        attempt.settled = true;
-        this.teardownAttempt(attempt, true);
-      }
-    });
   }
 
   /**
@@ -1331,17 +1391,12 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
           (finalUrl !== attempt.url ? `\n  redirected: ${finalUrl}` : ''),
       );
 
-      // We have a promising connection — no need to keep hedging.
+      // Headers arrived — do not launch *new* hedges. Already-running
+      // backups stay up as insurance: original headers can still be a
+      // 503 or a 200 that later stalls (TSPU after handshake).
       if (this.hedgeTimer) {
         self.clearTimeout(this.hedgeTimer);
         this.hedgeTimer = undefined;
-      }
-
-      // Original started responding: keep its priority even if a backup is
-      // already faster. Cancel competing hedges; a parked failback body is
-      // retained only as insurance if the original later stalls.
-      if (attempt.isOriginal) {
-        this.abortNonOriginalAttempts();
       }
     }
 
@@ -1371,7 +1426,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
           len,
         );
         if (integrityError) {
-          this.failAttempt(attempt, 'integrity', integrityError);
+          this.failAttempt(
+            attempt,
+            'integrity',
+            integrityError.message,
+            undefined,
+            { confirmedUnusable: integrityError.immediateFailback },
+          );
           return;
         }
 
@@ -1461,13 +1522,24 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       attempt.failbackNumber,
     );
 
-    if (attempt.isOriginal && !state.permanentFailbackMode) {
-      if (state.consecutiveOriginalFailures > 0) {
+    if (attempt.isOriginal) {
+      if (state.permanentFailbackMode) {
+        // A full segment from origin is stronger evidence than a 16KiB probe.
+        logger.log(
+          '[FailbackLoader] Original source recovered via last-resort full segment',
+        );
+        state.permanentFailbackMode = false;
+        state.fragmentsSinceLastProbe = 0;
+        state.unhealthyFailbackHosts.clear();
+        state.consecutiveOriginalFailures = 0;
+      } else if (state.consecutiveOriginalFailures > 0) {
         logger.log(
           `[FailbackLoader] Original source recovered, resetting failure counter`,
         );
+        state.consecutiveOriginalFailures = 0;
+      } else {
+        state.consecutiveOriginalFailures = 0;
       }
-      state.consecutiveOriginalFailures = 0;
     }
 
     // Store the freshest original URL for future recovery probes.
@@ -1525,13 +1597,18 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
    * Validate that a terminal XHR contains the byte range it claims to contain.
    * A middlebox can close a 200 response after a small prefix while XHR still
    * exposes the resulting ArrayBuffer as a successful response.
+   *
+   * Content-Length is only treated as a truncation signal when the body is
+   * *shorter* than the header. A longer body is the normal CORS-hidden gzip
+   * case (Content-Encoding is not safelisted; XHR exposes the decompressed
+   * buffer against the compressed Content-Length) and must not fail the load.
    */
   private getResponseIntegrityError(
     xhr: XMLHttpRequest,
     context: FragmentLoaderContext,
     status: number,
     responseLength: number,
-  ): string | null {
+  ): { message: string; immediateFailback: boolean } | null {
     const contentEncoding = xhr.getResponseHeader('Content-Encoding');
     const contentLength = xhr.getResponseHeader('Content-Length');
 
@@ -1543,9 +1620,14 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       if (
         Number.isSafeInteger(expectedLength) &&
         expectedLength >= 0 &&
-        responseLength !== expectedLength
+        responseLength < expectedLength
       ) {
-        return `response body is ${responseLength} bytes but Content-Length is ${expectedLength}`;
+        return {
+          message: `response body is ${responseLength} bytes but Content-Length is ${expectedLength}`,
+          // Hidden gzip produces a *longer* body and is ignored above.
+          // A shorter identity body is a finished truncated transfer.
+          immediateFailback: true,
+        };
       }
     }
 
@@ -1555,7 +1637,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     const expectedLength = context.rangeEnd! - context.rangeStart!;
     if (expectedLength >= 0 && responseLength !== expectedLength) {
-      return `range body is ${responseLength} bytes but requested range requires ${expectedLength}`;
+      return {
+        message: `range body is ${responseLength} bytes but requested range requires ${expectedLength}`,
+        immediateFailback: true,
+      };
     }
 
     if (status !== 206) {
@@ -1569,7 +1654,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
 
     const match = contentRange.match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
     if (!match) {
-      return '206 response has an invalid Content-Range header';
+      return {
+        message: '206 response has an invalid Content-Range header',
+        immediateFailback: true,
+      };
     }
 
     const responseStart = Number(match[1]);
@@ -1578,7 +1666,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       responseStart !== context.rangeStart ||
       responseEnd !== context.rangeEnd! - 1
     ) {
-      return `response range ${responseStart}-${responseEnd} does not match requested range ${context.rangeStart}-${context.rangeEnd! - 1}`;
+      return {
+        message: `response range ${responseStart}-${responseEnd} does not match requested range ${context.rangeStart}-${context.rangeEnd! - 1}`,
+        immediateFailback: true,
+      };
     }
 
     return null;
@@ -1642,6 +1733,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     kind: AttemptFailureKind,
     reason: string,
     httpError?: { code: number; text: string },
+    options?: { confirmedUnusable?: boolean },
   ) {
     if (attempt.settled || this.finished) {
       return;
@@ -1662,7 +1754,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     );
 
     this.teardownAttempt(attempt, true);
-    this.recordAttemptFailure(attempt, kind);
+    this.recordAttemptFailure(attempt, kind, options);
 
     // Original lost: promote a parked failback body if one finished earlier.
     if (attempt.isOriginal && this.consumeParkedSuccess()) {

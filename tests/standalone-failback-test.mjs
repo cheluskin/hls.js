@@ -207,7 +207,10 @@ await testAsync(
 
     const result = await fetchDnsTxt('provider-fallback.example.com');
     assert.deepEqual(result, ['fallback-provider']);
-    assert.equal(callCount, 2);
+    assert.ok(
+      callCount >= 2,
+      `all DoH providers are queried in parallel, got ${callCount}`,
+    );
   },
 );
 
@@ -279,6 +282,80 @@ await testAsync(
     assert.deepEqual(hostsA1, ['a.example.com-host']);
     assert.deepEqual(hostsB1, ['b.example.com-host']);
     assert.equal(hostsA1, hostsA2);
+  },
+);
+
+await testAsync(
+  'fetchDnsTxt negative cache expires and can recover',
+  async () => {
+    clearDnsCache();
+    const start = Date.now();
+    const originalNow = Date.now;
+    let now = start;
+    Date.now = () => now;
+
+    try {
+      let callCount = 0;
+      fetchMock = async () => {
+        callCount++;
+        return { ok: false };
+      };
+
+      const first = await fetchDnsTxt('neg-ttl.example.com');
+      assert.deepEqual(first, []);
+      const afterFail = callCount;
+      assert.ok(afterFail > 0, 'first lookup should hit DoH');
+
+      const cached = await fetchDnsTxt('neg-ttl.example.com');
+      assert.deepEqual(cached, []);
+      assert.equal(
+        callCount,
+        afterFail,
+        'negative result should be cached within the TTL',
+      );
+
+      now = start + 60_000 + 1;
+      fetchMock = async () => ({
+        ok: true,
+        json: async () => ({
+          Status: 0,
+          Answer: [{ type: 16, data: '"recovered.example.com"' }],
+        }),
+      });
+
+      const recovered = await fetchDnsTxt('neg-ttl.example.com');
+      assert.deepEqual(recovered, ['recovered.example.com']);
+    } finally {
+      Date.now = originalNow;
+    }
+  },
+);
+
+await testAsync(
+  'preloadFailbackHosts retries DNS after negative cache is cleared',
+  async () => {
+    clearDnsCache();
+    fetchMock = async () => ({ ok: false });
+
+    const fallbackHosts = await preloadFailbackHosts(
+      'preload-neg-ttl.example.com',
+    );
+    assert.ok(Array.isArray(fallbackHosts), 'should return fallback hosts');
+
+    // clearDnsCache also drops the host-resolver promise so the next
+    // preload can pick up a recovered DoH answer (TTL expiry is covered
+    // by the unit suite; standalone runs against dist).
+    clearDnsCache();
+    fetchMock = async () => ({
+      ok: true,
+      json: async () => ({
+        Status: 0,
+        Answer: [{ type: 16, data: '"recovered-host.example.com"' }],
+      }),
+    });
+
+    const recovered = await preloadFailbackHosts('preload-neg-ttl.example.com');
+    assert.deepEqual(recovered, ['recovered-host.example.com']);
   },
 );
 
