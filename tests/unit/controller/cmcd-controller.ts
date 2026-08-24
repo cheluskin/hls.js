@@ -145,6 +145,17 @@ describe('CMCDController', function () {
         expect(config.fLoader).to.equal(Hls.DefaultConfig.fLoader);
       });
 
+      it('wraps FailbackLoader when CMCD is enabled with the default loader', function () {
+        const hls = new Hls({ cmcd: {} });
+        const Ctor = hls.config.fLoader;
+        expect(Ctor).to.be.a('function');
+        const instance = new Ctor!(hls.config) as any;
+        expect(instance.loader).to.be.instanceOf(Hls.FailbackLoader);
+        expect(typeof instance.getCacheAge).to.equal('function');
+        expect(typeof instance.getResponseHeader).to.equal('function');
+        hls.destroy();
+      });
+
       it('uses the session id if provided', function () {
         const sessionId = 'SESSION_ID';
         setupEach({ sessionId });

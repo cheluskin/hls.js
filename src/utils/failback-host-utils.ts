@@ -1,21 +1,38 @@
+/**
+ * Drop DNS TXT junk that is not a usable HTTP host (SPF, site-verification,
+ * multi-token records). Applied after extracting `host` from a URL so a
+ * failback entry like `https://cdn.example.com:8443/path` still works.
+ */
+function isPlausibleHttpHost(host: string): boolean {
+  if (!host || /[\s=,/?#@~]/.test(host)) {
+    return false;
+  }
+  return /^[A-Za-z0-9._:%:[\]-]+$/.test(host);
+}
+
 export function normalizeHost(host: string): string | null {
   const trimmed = host.trim();
   if (!trimmed) {
     return null;
   }
 
+  let candidate = trimmed;
   if (trimmed.indexOf('://') !== -1 || trimmed.startsWith('//')) {
     try {
       const parsed = new URL(
         trimmed.startsWith('//') ? `https:${trimmed}` : trimmed,
       );
-      return parsed.host || null;
+      candidate = parsed.host || '';
     } catch {
       return null;
     }
   }
 
-  return trimmed;
+  if (!isPlausibleHttpHost(candidate)) {
+    return null;
+  }
+
+  return candidate;
 }
 
 export function normalizeHosts(hosts: string[] | undefined): string[] {
