@@ -76,6 +76,10 @@ const STALL_CHECK_INTERVAL_MS = 500;
 const MIN_SPEED_BYTES_PER_SEC = 4096;
 const DEFAULT_FAILBACK_HOST_COOLDOWN_MS = 30000;
 
+function isHttpClientError(status: number | undefined): boolean {
+  return typeof status === 'number' && status >= 400 && status < 500;
+}
+
 /**
  * Get or initialize state for a specific config instance
  */
@@ -239,6 +243,12 @@ function tryRecoverToOriginalCDN(
     probeEnd,
   )
     .then((isAlive) => {
+      // loadSource()/destroyFailbackState() may have replaced this session
+      // while the probe was in flight. Ignore the stale callback.
+      if (failbackStates.get(config) !== state) {
+        return;
+      }
+
       state.isProbeInProgress = false;
       // Re-check conditions after async probe - state may have changed
       if (!state.permanentFailbackMode) {
@@ -258,6 +268,9 @@ function tryRecoverToOriginalCDN(
       }
     })
     .catch(() => {
+      if (failbackStates.get(config) !== state) {
+        return;
+      }
       state.isProbeInProgress = false;
       logger.log('[FailbackLoader] ✗ Original CDN probe failed');
     });
@@ -815,7 +828,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   private recordAttemptFailure(
     attempt: Attempt,
     kind: AttemptFailureKind,
-    options?: { confirmedUnusable?: boolean },
+    options?: { confirmedUnusable?: boolean; httpStatus?: number },
   ) {
     // A browser-synthesized 206 is not evidence about the CDN itself.
     if (kind === 'partial') {
@@ -823,6 +836,13 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     }
 
     if (attempt.isOriginal) {
+      // A 4xx is about this object (missing segment, expired token), not the
+      // CDN. Still failback the current request, but do not send the rest of
+      // the session to backup.
+      if (isHttpClientError(options?.httpStatus)) {
+        return;
+      }
+
       // Stall is a confirmed mid-transfer break. Integrity is immediately
       // unusable for Range mismatches we issued and for an identity body
       // shorter than Content-Length (finished truncated transfer). A body
@@ -918,7 +938,16 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
   } | null {
     while (this.nextFailbackIndex < MAX_FAILBACK_ATTEMPTS) {
       const index = this.nextFailbackIndex;
-      const candidate = this.getFailbackUrl(index);
+      let candidate: string | null;
+      try {
+        candidate = this.getFailbackUrl(index);
+      } catch (error: any) {
+        logger.warn(
+          `[FailbackLoader] getFailbackUrl/transformUrl threw at index ${index}: ${error?.message || error}`,
+        );
+        this.nextFailbackIndex = index + 1;
+        continue;
+      }
       if (!candidate) {
         this.nextFailbackIndex = MAX_FAILBACK_ATTEMPTS;
         break;
@@ -1448,6 +1477,18 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
       }
     }
 
+    // CORS / mixed-content / aborted-without-status: browsers report this as
+    // readyState 4 + status 0. Treat as a transport failure, not an HTTP
+    // error, so backup hosts are not quarantined.
+    if (!status) {
+      this.failAttempt(
+        attempt,
+        'network',
+        'HTTP status 0 (CORS or transport failure)',
+      );
+      return;
+    }
+
     // Non-2xx / empty body.
     this.failAttempt(attempt, 'http', `HTTP ${status} ${xhr.statusText}`, {
       code: status,
@@ -1733,7 +1774,7 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     kind: AttemptFailureKind,
     reason: string,
     httpError?: { code: number; text: string },
-    options?: { confirmedUnusable?: boolean },
+    options?: { confirmedUnusable?: boolean; httpStatus?: number },
   ) {
     if (attempt.settled || this.finished) {
       return;
@@ -1754,7 +1795,10 @@ class FailbackLoader implements Loader<FragmentLoaderContext> {
     );
 
     this.teardownAttempt(attempt, true);
-    this.recordAttemptFailure(attempt, kind, options);
+    this.recordAttemptFailure(attempt, kind, {
+      ...options,
+      httpStatus: httpError?.code ?? options?.httpStatus,
+    });
 
     // Original lost: promote a parked failback body if one finished earlier.
     if (attempt.isOriginal && this.consumeParkedSuccess()) {

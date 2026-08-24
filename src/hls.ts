@@ -573,6 +573,9 @@ export default class Hls implements HlsEventEmitter {
     this._autoLevelCapping = -1;
     this._maxHdcpLevel = null;
     this.logger.log(`loadSource:${loadingSource}`);
+    // A new asset must not inherit permanent-failback / quarantine from the
+    // previous source on this Hls instance (channel switch, next episode).
+    destroyFailbackState(this.config);
     if (
       media &&
       loadedSource &&

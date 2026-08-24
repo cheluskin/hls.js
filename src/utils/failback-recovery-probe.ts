@@ -244,13 +244,18 @@ export function probeOriginalCDN(
     };
 
     Promise.resolve()
-      .then(() => xhrSetup(xhr, url, probeContext))
+      .then(() => {
+        if (settled) {
+          return;
+        }
+        return xhrSetup.call({ config }, xhr, url, probeContext);
+      })
       .catch(() => {
         if (settled) {
           return;
         }
         xhr.open('GET', url, true);
-        return xhrSetup(xhr, url, probeContext);
+        return xhrSetup.call({ config }, xhr, url, probeContext);
       })
       .then(() => {
         if (!settled) {

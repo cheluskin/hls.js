@@ -15,6 +15,7 @@ import {
   toCmcdValue,
 } from '@svta/cml-cmcd';
 import { Events } from '../events';
+import { resolveFragmentLoaderConstructor } from '../loader/resolve-fragment-loader';
 import {
   addEventListener,
   removeEventListener,
@@ -712,6 +713,14 @@ export default class CMCDController implements ComponentAPI {
         return this.loader.context;
       }
 
+      getCacheAge() {
+        return this.loader.getCacheAge?.() ?? null;
+      }
+
+      getResponseHeader(name: string) {
+        return this.loader.getResponseHeader?.(name) ?? null;
+      }
+
       destroy() {
         this.loader.destroy();
       }
@@ -735,10 +744,9 @@ export default class CMCDController implements ComponentAPI {
    * Create a fragment loader
    */
   private createFragmentLoader(): FragmentLoaderConstructor | undefined {
-    const { fLoader } = this.config;
     const apply = this.applyFragmentData;
     const recordResponse = this.recordFragmentResponse;
-    const Ctor = fLoader || (this.config.loader as FragmentLoaderConstructor);
+    const Ctor = resolveFragmentLoaderConstructor(this.config);
 
     return class CmcdFragmentLoader {
       private loader: Loader<FragmentLoaderContext>;
@@ -753,6 +761,14 @@ export default class CMCDController implements ComponentAPI {
 
       get context() {
         return this.loader.context;
+      }
+
+      getCacheAge() {
+        return this.loader.getCacheAge?.() ?? null;
+      }
+
+      getResponseHeader(name: string) {
+        return this.loader.getResponseHeader?.(name) ?? null;
       }
 
       destroy() {

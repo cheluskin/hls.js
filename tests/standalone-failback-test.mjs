@@ -22,6 +22,7 @@ let clearDnsCache,
   fetchFailbackHosts,
   preloadFailbackHosts,
   applyHostToUrl,
+  normalizeHosts,
   getFailbackState,
   resetFailbackState,
   destroyFailbackState;
@@ -39,6 +40,7 @@ try {
 
   const hostUtilsModule = await import('../src/utils/failback-host-utils.ts');
   applyHostToUrl = hostUtilsModule.applyHostToUrl;
+  normalizeHosts = hostUtilsModule.normalizeHosts;
 } catch {
   // If direct TS import fails, the project needs to be built first
   console.log(
@@ -53,7 +55,8 @@ try {
   resetFailbackState = module.resetFailbackState;
   destroyFailbackState = module.destroyFailbackState;
 
-  ({ applyHostToUrl } = await import('../src/utils/failback-host-utils.ts'));
+  ({ applyHostToUrl, normalizeHosts } =
+    await import('../src/utils/failback-host-utils.ts'));
 }
 
 let passed = 0;
@@ -472,6 +475,22 @@ test('Invalid URL returns null', () => {
 
   const result = getFailbackUrl(invalidUrl, hosts, 0);
   assert.equal(result, null);
+});
+
+test('normalizeHosts drops SPF and site-verification TXT junk', () => {
+  const hosts = normalizeHosts([
+    'failback.example.com',
+    'v=spf1 include:_spf.google.com ~all',
+    'google-site-verification=abc',
+    'cdn-a.example.com,cdn-b.example.com',
+    'https://cdn.example.com:8443/ignored/path',
+  ]);
+  assert.deepEqual(hosts, ['failback.example.com', 'cdn.example.com:8443']);
+});
+
+test('normalizeHosts keeps IPv6 failback hosts', () => {
+  const hosts = normalizeHosts(['[2001:db8::1]:9443', '2001:db8::1']);
+  assert.deepEqual(hosts, ['[2001:db8::1]:9443', '2001:db8::1']);
 });
 
 test('Empty hosts array returns null for any attempt', () => {

@@ -204,6 +204,7 @@ describe('failback-recovery-probe', function () {
     expect(xhr.requestHeaders.get('range')).to.equal('bytes=0-16383');
     expect(xhr.requestHeaders.get('x-test')).to.equal('1');
     expect(xhr.responseType).to.equal('arraybuffer');
+    expect(xhrSetup.getCall(0).thisValue).to.have.property('config', config);
   });
 
   it('should reject an XHR probe with a truncated body', async function () {
