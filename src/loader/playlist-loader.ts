@@ -7,6 +7,7 @@
  */
 
 import M3U8Parser from './m3u8-parser';
+import { resolvePlaylistLoaderConstructor } from './resolve-fragment-loader';
 import { ErrorDetails, ErrorTypes } from '../errors';
 import { Events } from '../events';
 import { LoaderContextType, PlaylistLevelType } from '../types/loader';
@@ -114,9 +115,7 @@ class PlaylistLoader implements NetworkComponentAPI {
     context: PlaylistLoaderContext,
   ): Loader<LoaderContext> {
     const config = this.hls.config;
-    const PLoader = config.pLoader;
-    const Loader = config.loader;
-    const InternalLoader = PLoader || Loader;
+    const InternalLoader = resolvePlaylistLoaderConstructor(config);
     const loader = new InternalLoader(config) as Loader<PlaylistLoaderContext>;
 
     this.loaders[context.type] = loader;

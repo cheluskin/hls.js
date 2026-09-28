@@ -15,7 +15,10 @@ import {
   toCmcdValue,
 } from '@svta/cml-cmcd';
 import { Events } from '../events';
-import { resolveFragmentLoaderConstructor } from '../loader/resolve-fragment-loader';
+import {
+  resolveFragmentLoaderConstructor,
+  resolvePlaylistLoaderConstructor,
+} from '../loader/resolve-fragment-loader';
 import {
   addEventListener,
   removeEventListener,
@@ -694,9 +697,8 @@ export default class CMCDController implements ComponentAPI {
    * Create a playlist loader
    */
   private createPlaylistLoader(): PlaylistLoaderConstructor | undefined {
-    const { pLoader } = this.config;
     const apply = this.applyPlaylistData;
-    const Ctor = pLoader || (this.config.loader as PlaylistLoaderConstructor);
+    const Ctor = resolvePlaylistLoaderConstructor(this.config);
 
     return class CmcdPlaylistLoader {
       private loader: Loader<PlaylistLoaderContext>;

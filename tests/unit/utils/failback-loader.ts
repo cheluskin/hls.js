@@ -3,7 +3,12 @@ import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
 import Hls from '../../../src/hls';
-import { LoaderContextType } from '../../../src/types/loader';
+import { Fragment } from '../../../src/loader/fragment';
+import FragmentLoader from '../../../src/loader/fragment-loader';
+import {
+  LoaderContextType,
+  PlaylistLevelType,
+} from '../../../src/types/loader';
 import FailbackLoader, {
   destroyFailbackState,
   getExtendedFailbackState,
@@ -12,6 +17,7 @@ import FailbackLoader, {
 } from '../../../src/utils/failback-loader';
 import { logger } from '../../../src/utils/logger';
 import type { HlsConfig } from '../../../src/config';
+import type { MediaFragment } from '../../../src/loader/fragment';
 import type {
   FragmentLoaderContext,
   LoaderCallbacks,
@@ -60,6 +66,14 @@ class MockXMLHttpRequest {
 
   getResponseHeader(name: string): string | null {
     return this._responseHeaders.get(name.toLowerCase()) || null;
+  }
+
+  getAllResponseHeaders(): string {
+    let all = '';
+    this._responseHeaders.forEach((value, name) => {
+      all += `${name}: ${value}\r\n`;
+    });
+    return all;
   }
 
   send() {
@@ -875,6 +889,111 @@ describe('FailbackLoader tests', function () {
       let firstLoad = true;
       MockXMLHttpRequest.onRequest = (xhr) => {
         requestedUrls.push(xhr.url);
+        const isOrigin = xhr.url.includes('cdn.example.com');
+        if (firstLoad && isOrigin) {
+          // Origin: headers + a few KB, then silence (TSPU pattern).
+          self.setTimeout(() => {
+            xhr.readyState = 2;
+            xhr.status = 200;
+            xhr.onreadystatechange?.();
+            xhr.onprogress?.(
+              new ProgressEvent('progress', { loaded: 1360, total: 1000000 }),
+            );
+          }, 10);
+          return;
+        }
+        if (!firstLoad && !isOrigin) {
+          // The backup that rescued the first fragment now fails hard.
+          self.setTimeout(() => {
+            xhr.simulateResponse(503, null);
+          }, 10);
+          return;
+        }
+        self.setTimeout(() => {
+          xhr.simulateResponse(200, new ArrayBuffer(1000), {
+            'Content-Length': '1000',
+          });
+        }, 10);
+      };
+
+      const loader1 = new FailbackLoader(config);
+      loader1.load(context, loaderConfig, {
+        onSuccess: (response) => {
+          // Origin stalled and the backup delivered: permanent failback.
+          expect(response.url).to.include('failback.example.com');
+          expect(getFailbackState(config).permanentMode).to.be.true;
+          loader1.destroy();
+          firstLoad = false;
+
+          const loader2 = new FailbackLoader(config);
+          loader2.load(
+            { ...context, url: 'https://cdn.example.com/video/segment2.ts' },
+            loaderConfig,
+            {
+              onSuccess: (nextResponse) => {
+                expect(nextResponse.url).to.include('cdn.example.com');
+                expect(requestedUrls).to.deep.equal([
+                  'https://cdn.example.com/video/segment.ts',
+                  'https://failback.example.com/video/segment.ts',
+                  'https://failback.example.com/video/segment2.ts',
+                  'https://cdn.example.com/video/segment2.ts',
+                ]);
+                expect(getFailbackState(config)).to.deep.include({
+                  consecutiveFailures: 0,
+                  permanentMode: false,
+                });
+                loader2.destroy();
+                done();
+              },
+              onError: (error) => done(new Error(error.text)),
+              onTimeout: () => done(new Error('Unexpected timeout')),
+              onAbort: () => {},
+              onProgress: () => {},
+            },
+          );
+        },
+        onError: (error) => done(new Error(error.text)),
+        onTimeout: () => done(new Error('Unexpected timeout')),
+        onAbort: () => {},
+        onProgress: () => {},
+      });
+
+      clock.tick(12000);
+    });
+
+    it('should not enter permanent failback when the backup fails too', function (done) {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        failbackHostCooldownMs: 30000,
+        hedge: false,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 1,
+      };
+
+      const context: FragmentLoaderContext = {
+        url: 'https://cdn.example.com/video/segment.ts',
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+      const loaderConfig = {
+        loadPolicy: {
+          maxTimeToFirstByteMs: 10000,
+          maxLoadTimeMs: 60000,
+        },
+        maxRetry: 0,
+        retryDelay: 0,
+        maxRetryDelay: 0,
+      } as unknown as LoaderConfiguration;
+
+      const requestedUrls: string[] = [];
+      let firstLoad = true;
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requestedUrls.push(xhr.url);
         if (firstLoad) {
           if (xhr.url.includes('cdn.example.com')) {
             self.setTimeout(() => {
@@ -904,7 +1023,8 @@ describe('FailbackLoader tests', function () {
       loader1.load(context, loaderConfig, {
         onSuccess: () => done(new Error('Unexpected success')),
         onError: () => {
-          expect(getFailbackState(config).permanentMode).to.be.true;
+          // Nothing proved that the backup is any better than the origin.
+          expect(getFailbackState(config).permanentMode).to.be.false;
           loader1.destroy();
           firstLoad = false;
 
@@ -2482,6 +2602,660 @@ describe('FailbackLoader tests', function () {
             done();
           });
         });
+      });
+    });
+  });
+  describe('TSPU resilience (Android net-export scenarios)', function () {
+    // Pattern from Chrome 149 / Android 15 net-export logs: TCP + TLS complete,
+    // the server gets ~2-4KB through (sometimes headers and ~1.3KB of body),
+    // then every further packet is dropped without a RST. Chrome keeps the
+    // frozen HTTP/2 or QUIC session and sends retries into it.
+    const ORIGIN = 'https://cdn.example.com/video';
+    const defaultLoaderConfig = {
+      loadPolicy: {
+        maxTimeToFirstByteMs: 10000,
+        maxLoadTimeMs: 120000,
+      },
+      maxRetry: 0,
+      retryDelay: 0,
+      maxRetryDelay: 0,
+    } as unknown as LoaderConfiguration;
+
+    type LoadResult = {
+      kind: 'success' | 'error' | 'timeout';
+      response?: any;
+      error?: { code: number; text: string };
+      stats: any;
+    };
+
+    function mediaContext(url: string): FragmentLoaderContext {
+      return {
+        url,
+        type: LoaderContextType.MEDIA_FRAGMENT,
+        frag: null as any,
+        part: null,
+        responseType: 'arraybuffer',
+        headers: {},
+        rangeStart: 0,
+        rangeEnd: 0,
+      };
+    }
+
+    function playlistContext(url: string, extra: Record<string, any> = {}) {
+      return {
+        url,
+        type: LoaderContextType.LEVEL,
+        responseType: 'text',
+        level: 0,
+        id: 0,
+        groupId: null,
+        deliveryDirectives: null,
+        ...extra,
+      } as any;
+    }
+
+    function load(
+      loader: FailbackLoader,
+      context: any,
+      loaderConfig: LoaderConfiguration = defaultLoaderConfig,
+    ): Promise<LoadResult> {
+      return new Promise((resolve) => {
+        loader.load(context, loaderConfig, {
+          onSuccess: (response, stats) =>
+            resolve({ kind: 'success', response, stats }),
+          onError: (error, _context, _details, stats) =>
+            resolve({ kind: 'error', error, stats }),
+          onTimeout: (stats) => resolve({ kind: 'timeout', stats }),
+          onAbort: () => {},
+          onProgress: () => {},
+        });
+      });
+    }
+
+    function respondOk(
+      xhr: MockXMLHttpRequest,
+      delay: number = 10,
+      size: number = 1000,
+    ) {
+      self.setTimeout(() => {
+        xhr.simulateResponse(200, new ArrayBuffer(size), {
+          'Content-Length': String(size),
+        });
+      }, delay);
+    }
+
+    function respondText(
+      xhr: MockXMLHttpRequest,
+      text: string,
+      delay: number = 10,
+      headers: Record<string, string> = {},
+    ) {
+      self.setTimeout(() => {
+        xhr.simulateResponse(200, text as any, headers);
+      }, delay);
+    }
+
+    it('starts the next fragment on the backup that answered, not on the one that froze', async function () {
+      config.failbackConfig = {
+        staticHosts: ['fb1.example.com', 'fb2.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        firstByteTimeoutMs: 300,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 3,
+      };
+      const requested: string[] = [];
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requested.push(xhr.url);
+        if (xhr.url.includes('fb2.example.com')) {
+          respondOk(xhr);
+        }
+        // origin and fb1: handshake passes, response never arrives
+      };
+
+      const loader1 = new FailbackLoader(config);
+      const first = load(loader1, mediaContext(`${ORIGIN}/seg1.ts`));
+      clock.tick(1000);
+      const result1 = await first;
+      expect(result1.kind).to.equal('success');
+      expect(result1.response.url).to.include('fb2.example.com');
+      expect(requested).to.deep.equal([
+        `${ORIGIN}/seg1.ts`,
+        'https://fb1.example.com/video/seg1.ts',
+        'https://fb2.example.com/video/seg1.ts',
+      ]);
+      loader1.destroy();
+
+      requested.length = 0;
+      const loader2 = new FailbackLoader(config);
+      const second = load(loader2, mediaContext(`${ORIGIN}/seg2.ts`));
+      clock.tick(1000);
+      const result2 = await second;
+      expect(result2.kind).to.equal('success');
+      // The origin still gets its head start (one failure is not enough), but
+      // the hedge goes straight to the host that answered.
+      expect(requested).to.deep.equal([
+        `${ORIGIN}/seg2.ts`,
+        'https://fb2.example.com/video/seg2.ts',
+      ]);
+      expect(getFailbackState(config).permanentMode).to.be.true;
+      loader2.destroy();
+
+      requested.length = 0;
+      const loader3 = new FailbackLoader(config);
+      const third = load(loader3, mediaContext(`${ORIGIN}/seg3.ts`));
+      clock.tick(1000);
+      expect((await third).kind).to.equal('success');
+      expect(requested).to.deep.equal([
+        'https://fb2.example.com/video/seg3.ts',
+      ]);
+      loader3.destroy();
+    });
+
+    it('does not resend a silent host into its frozen connection within the same load', async function () {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        firstByteTimeoutMs: 300,
+        silentRetriesPerHost: 2,
+        maxParallelAttempts: 3,
+      };
+      const requested: string[] = [];
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requested.push(xhr.url);
+      };
+
+      const loader = new FailbackLoader(config);
+      const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`), {
+        ...defaultLoaderConfig,
+        loadPolicy: { maxTimeToFirstByteMs: 2000, maxLoadTimeMs: 120000 },
+      } as unknown as LoaderConfiguration);
+      clock.tick(5000);
+      expect((await result).kind).to.equal('timeout');
+      expect(requested).to.deep.equal([
+        `${ORIGIN}/seg.ts`,
+        'https://failback.example.com/video/seg.ts',
+      ]);
+      // Nothing delivered: no evidence that the backup beats the origin.
+      expect(getFailbackState(config).permanentMode).to.be.false;
+      loader.destroy();
+    });
+
+    it('still retries the same URL on a fresh connection after a reset', async function () {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: false,
+        silentRetriesPerHost: 1,
+        maxParallelAttempts: 1,
+      };
+      const requested: string[] = [];
+      let originCalls = 0;
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requested.push(xhr.url);
+        if (xhr.url.includes('cdn.example.com')) {
+          originCalls++;
+          if (originCalls === 1) {
+            self.setTimeout(() => xhr.simulateNetworkError(), 10);
+          } else {
+            respondOk(xhr);
+          }
+          return;
+        }
+        self.setTimeout(() => xhr.simulateResponse(503, null), 10);
+      };
+
+      const loader = new FailbackLoader(config);
+      const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`));
+      clock.tick(500);
+      const outcome = await result;
+      expect(outcome.kind).to.equal('success');
+      expect(outcome.response.url).to.include('cdn.example.com');
+      expect(requested).to.deep.equal([
+        `${ORIGIN}/seg.ts`,
+        'https://failback.example.com/video/seg.ts',
+        `${ORIGIN}/seg.ts`,
+      ]);
+      expect(getFailbackState(config).consecutiveFailures).to.equal(0);
+      loader.destroy();
+    });
+
+    it('keeps a slow but healthy origin alive past the soft silence budget', async function () {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        firstByteTimeoutMs: 300,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 3,
+      };
+      const requested: string[] = [];
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requested.push(xhr.url);
+        if (xhr.url.includes('cdn.example.com')) {
+          // Slow mobile link: first byte after 800ms (> soft 300ms budget).
+          respondOk(xhr, 800);
+        }
+        // backup: blackholed (e.g. a throttled CDN)
+      };
+
+      const loader = new FailbackLoader(config);
+      const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`));
+      clock.tick(2000);
+      const outcome = await result;
+      expect(outcome.kind).to.equal('success');
+      expect(outcome.response.url).to.include('cdn.example.com');
+      expect(
+        requested.filter((url) => url.includes('cdn.example.com')),
+      ).to.have.length(1);
+      expect(getFailbackState(config)).to.deep.include({
+        consecutiveFailures: 0,
+        permanentMode: false,
+      });
+      loader.destroy();
+    });
+
+    it('stretches hedge and silence budgets on a link that is slow to answer', async function () {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        firstByteTimeoutMs: 300,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 3,
+      };
+      const requested: string[] = [];
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requested.push(xhr.url);
+        if (xhr.url.includes('cdn.example.com')) {
+          respondOk(xhr, 800);
+        }
+      };
+
+      for (let i = 0; i < 3; i++) {
+        const loader = new FailbackLoader(config);
+        const result = load(loader, mediaContext(`${ORIGIN}/seg${i}.ts`));
+        clock.tick(2000);
+        expect((await result).kind).to.equal('success');
+        loader.destroy();
+      }
+      // After the first slow answer the hedge waits for ~2x the observed
+      // time-to-headers, so later fragments no longer open a backup request.
+      expect(
+        requested.filter((url) => url.includes('failback.example.com')),
+      ).to.have.length(1);
+    });
+
+    it('cancels hedged backups once the original streamed past the TSPU window', async function () {
+      config.failbackConfig = {
+        staticHosts: ['failback.example.com'],
+        hedge: true,
+        hedgeDelayMs: 100,
+        firstByteTimeoutMs: 300,
+        silentRetriesPerHost: 0,
+        maxParallelAttempts: 3,
+      };
+      let backup: MockXMLHttpRequest | null = null;
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        if (!xhr.url.includes('cdn.example.com')) {
+          backup = xhr;
+          return;
+        }
+        self.setTimeout(() => {
+          xhr.status = 200;
+          xhr.readyState = 2;
+          xhr.onreadystatechange?.();
+        }, 150);
+        self.setTimeout(() => {
+          xhr.readyState = 3;
+          xhr.onprogress?.(
+            new ProgressEvent('progress', {
+              loaded: 70000,
+              total: 200000,
+              lengthComputable: true,
+            }),
+          );
+        }, 200);
+        self.setTimeout(() => {
+          xhr.response = new ArrayBuffer(200000);
+          xhr.readyState = 4;
+          xhr.onreadystatechange?.();
+        }, 400);
+      };
+
+      const loader = new FailbackLoader(config);
+      const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`));
+      clock.tick(250);
+      expect(backup).to.not.equal(null);
+      expect((backup as any)._aborted).to.equal(true);
+      clock.tick(300);
+      const outcome = await result;
+      expect(outcome.kind).to.equal('success');
+      expect(outcome.response.url).to.include('cdn.example.com');
+      loader.destroy();
+    });
+
+    it('reports an offline outage as a status-0 error and does not blame the origin', async function () {
+      const onLine = sinon.stub(navigator, 'onLine').get(() => false);
+      try {
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          self.setTimeout(() => xhr.simulateNetworkError(), 10);
+        };
+        const loader = new FailbackLoader(config);
+        const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`));
+        clock.tick(200);
+        const outcome = await result;
+        expect(outcome.kind).to.equal('error');
+        expect(outcome.error!.code).to.equal(0);
+        expect(getFailbackState(config)).to.deep.include({
+          consecutiveFailures: 0,
+          permanentMode: false,
+        });
+        loader.destroy();
+      } finally {
+        onLine.restore();
+      }
+    });
+
+    it('exposes loading.first and progress to ABR while the body streams', async function () {
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        self.setTimeout(() => {
+          xhr.status = 200;
+          xhr.readyState = 2;
+          xhr.onreadystatechange?.();
+        }, 50);
+        self.setTimeout(() => {
+          xhr.readyState = 3;
+          xhr.onprogress?.(
+            new ProgressEvent('progress', {
+              loaded: 5000,
+              total: 100000,
+              lengthComputable: true,
+            }),
+          );
+        }, 100);
+        self.setTimeout(() => {
+          xhr.response = new ArrayBuffer(100000);
+          xhr.readyState = 4;
+          xhr.onreadystatechange?.();
+        }, 600);
+      };
+
+      const loader = new FailbackLoader(config);
+      const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`));
+      clock.tick(150);
+      expect(loader.stats.loading.first).to.be.greaterThan(0);
+      expect(loader.stats.loading.first).to.be.at.least(
+        loader.stats.loading.start,
+      );
+      expect(loader.stats.loaded).to.equal(5000);
+      expect(loader.stats.total).to.equal(100000);
+      clock.tick(600);
+      expect((await result).kind).to.equal('success');
+      loader.destroy();
+    });
+
+    it('does not mistake suspended timers (Android background) for a stall', async function () {
+      const requested: string[] = [];
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        requested.push(xhr.url);
+        self.setTimeout(() => {
+          xhr.status = 200;
+          xhr.readyState = 2;
+          xhr.onreadystatechange?.();
+          xhr.onprogress?.(
+            new ProgressEvent('progress', { loaded: 1000, total: 100000 }),
+          );
+        }, 10);
+        self.setTimeout(() => {
+          xhr.response = new ArrayBuffer(100000);
+          xhr.readyState = 4;
+          xhr.onreadystatechange?.();
+        }, 30600);
+      };
+
+      const loader = new FailbackLoader(config);
+      const result = load(loader, mediaContext(`${ORIGIN}/seg.ts`));
+      clock.tick(500);
+      // The renderer is frozen for 30s: timers fire at most once on resume.
+      clock.jump(30000);
+      clock.tick(200);
+      const outcome = await result;
+      expect(outcome.kind).to.equal('success');
+      expect(requested).to.deep.equal([`${ORIGIN}/seg.ts`]);
+      expect(getFailbackState(config).consecutiveFailures).to.equal(0);
+      loader.destroy();
+    });
+
+    it('keeps frag.stats (read by ABR) as the object the loader updates', async function () {
+      MockXMLHttpRequest.onRequest = (xhr) => {
+        respondOk(xhr, 50, 1000);
+      };
+      clock.tick(1000); // performance.now() > 0
+      const fragmentLoader = new FragmentLoader(config);
+      const frag = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
+      frag.url = `${ORIGIN}/seg.ts`;
+      frag.stats.retry = 2;
+      const result = fragmentLoader.load(frag);
+      clock.tick(100);
+      await result;
+      // FragmentLoader binds frag.stats to loader.stats *before* load(); a
+      // loader that swaps its stats object in load() leaves ABR reading zeros
+      // (bandwidth samples of 0 bytes collapse the estimate to the lowest
+      // level).
+      expect(frag.stats.loaded).to.equal(1000);
+      expect(frag.stats.total).to.equal(1000);
+      expect(frag.stats.retry).to.equal(2);
+      expect(frag.stats.loading.start).to.be.greaterThan(0);
+      expect(frag.stats.loading.first).to.be.at.least(frag.stats.loading.start);
+      expect(frag.stats.loading.end).to.be.at.least(frag.stats.loading.first);
+      fragmentLoader.destroy();
+    });
+
+    describe('playlists', function () {
+      const playlist =
+        '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nseg0.ts\n';
+
+      it('serves a playlist from a backup and keeps the origin as base URL', async function () {
+        config.failbackConfig = {
+          staticHosts: ['failback.example.com'],
+          hedge: true,
+          hedgeDelayMs: 100,
+          firstByteTimeoutMs: 300,
+          silentRetriesPerHost: 0,
+          maxParallelAttempts: 3,
+        };
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          if (xhr.url.includes('failback.example.com')) {
+            respondText(xhr, playlist);
+          }
+        };
+
+        const loader = new FailbackLoader(config);
+        const result = load(loader, playlistContext(`${ORIGIN}/index.m3u8`), {
+          ...defaultLoaderConfig,
+          loadPolicy: { maxTimeToFirstByteMs: 10000, maxLoadTimeMs: 20000 },
+        } as unknown as LoaderConfiguration);
+        clock.tick(1000);
+        const outcome = await result;
+        expect(outcome.kind).to.equal('success');
+        expect(outcome.response.data).to.equal(playlist);
+        expect(outcome.response.url).to.equal(`${ORIGIN}/index.m3u8`);
+        // Playlist results never move fragments into permanent failback.
+        expect(getFailbackState(config)).to.deep.include({
+          consecutiveFailures: 0,
+          permanentMode: false,
+        });
+        loader.destroy();
+      });
+
+      it('keeps the origin error and does not quarantine a backup that lacks the playlist', async function () {
+        config.failbackConfig = {
+          staticHosts: ['failback.example.com'],
+          hedge: false,
+          silentRetriesPerHost: 0,
+          maxParallelAttempts: 1,
+          failbackHostCooldownMs: 30000,
+        };
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          if (xhr.url.includes('cdn.example.com')) {
+            self.setTimeout(() => xhr.simulateResponse(503, null), 10);
+          } else if (xhr.url.includes('.m3u8')) {
+            self.setTimeout(() => xhr.simulateResponse(404, null), 10);
+          } else {
+            respondOk(xhr);
+          }
+        };
+
+        const playlistLoader = new FailbackLoader(config);
+        const playlistResult = load(
+          playlistLoader,
+          playlistContext(`${ORIGIN}/index.m3u8`),
+        );
+        clock.tick(200);
+        const failed = await playlistResult;
+        expect(failed.kind).to.equal('error');
+        expect(failed.error!.code).to.equal(503);
+        playlistLoader.destroy();
+
+        const fragmentLoader = new FailbackLoader(config);
+        const fragmentResult = load(
+          fragmentLoader,
+          mediaContext(`${ORIGIN}/seg.ts`),
+        );
+        clock.tick(200);
+        const outcome = await fragmentResult;
+        expect(outcome.kind).to.equal('success');
+        expect(outcome.response.url).to.include('failback.example.com');
+        fragmentLoader.destroy();
+      });
+
+      it('honours the manifest timeout retry policy', async function () {
+        config.failbackConfig = {
+          staticHosts: ['failback.example.com'],
+          hedge: false,
+          silentRetriesPerHost: 0,
+          maxParallelAttempts: 1,
+        };
+        const requested: string[] = [];
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          requested.push(xhr.url);
+        };
+        const loader = new FailbackLoader(config);
+        const result = load(
+          loader,
+          playlistContext(`${ORIGIN}/master.m3u8`, {
+            type: LoaderContextType.MANIFEST,
+          }),
+          {
+            ...defaultLoaderConfig,
+            loadPolicy: {
+              maxTimeToFirstByteMs: Infinity,
+              maxLoadTimeMs: 4000,
+              timeoutRetry: {
+                maxNumRetry: 1,
+                retryDelayMs: 0,
+                maxRetryDelayMs: 0,
+              },
+              errorRetry: null,
+            },
+          } as unknown as LoaderConfiguration,
+        );
+        clock.tick(30000);
+        const outcome = await result;
+        expect(outcome.kind).to.equal('timeout');
+        expect(outcome.stats.retry).to.equal(1);
+        expect(requested).to.deep.equal([
+          `${ORIGIN}/master.m3u8`,
+          'https://failback.example.com/video/master.m3u8',
+          `${ORIGIN}/master.m3u8`,
+          'https://failback.example.com/video/master.m3u8',
+        ]);
+        loader.destroy();
+      });
+
+      it('does not hedge LL-HLS blocking playlist reloads', async function () {
+        config.failbackConfig = {
+          staticHosts: ['failback.example.com'],
+          hedge: true,
+          hedgeDelayMs: 100,
+          firstByteTimeoutMs: 300,
+          silentRetriesPerHost: 0,
+          maxParallelAttempts: 3,
+        };
+        const requested: string[] = [];
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          requested.push(xhr.url);
+          respondText(xhr, playlist, 2000);
+        };
+        const loader = new FailbackLoader(config);
+        const result = load(
+          loader,
+          playlistContext(`${ORIGIN}/index.m3u8?_HLS_msn=10&_HLS_part=2`, {
+            deliveryDirectives: { msn: 10, part: 2, skip: '' },
+          }),
+          {
+            ...defaultLoaderConfig,
+            loadPolicy: { maxTimeToFirstByteMs: 6000, maxLoadTimeMs: 6000 },
+          } as unknown as LoaderConfiguration,
+        );
+        clock.tick(3000);
+        const outcome = await result;
+        expect(outcome.kind).to.equal('success');
+        expect(requested).to.deep.equal([
+          `${ORIGIN}/index.m3u8?_HLS_msn=10&_HLS_part=2`,
+        ]);
+        loader.destroy();
+      });
+
+      it('accepts a playlist whose UTF-8 BOM was stripped by the decoder', async function () {
+        const bytes = new TextEncoder().encode(playlist).length;
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          respondText(xhr, playlist, 10, {
+            'Content-Length': String(bytes + 3),
+          });
+        };
+        const loader = new FailbackLoader(config);
+        const result = load(loader, playlistContext(`${ORIGIN}/index.m3u8`));
+        clock.tick(100);
+        const outcome = await result;
+        expect(outcome.kind).to.equal('success');
+        expect(outcome.response.url).to.equal(`${ORIGIN}/index.m3u8`);
+        loader.destroy();
+      });
+
+      it('fails over when a playlist body is shorter than Content-Length', async function () {
+        const bytes = new TextEncoder().encode(playlist).length;
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          if (xhr.url.includes('cdn.example.com')) {
+            respondText(xhr, playlist.slice(0, 10), 10, {
+              'Content-Length': String(bytes),
+            });
+          } else {
+            respondText(xhr, playlist, 10, {
+              'Content-Length': String(bytes),
+            });
+          }
+        };
+        const loader = new FailbackLoader(config);
+        const result = load(loader, playlistContext(`${ORIGIN}/index.m3u8`));
+        clock.tick(200);
+        const outcome = await result;
+        expect(outcome.kind).to.equal('success');
+        expect(outcome.response.data).to.equal(playlist);
+        loader.destroy();
+      });
+
+      it('reports the Age header of the winning playlist response', async function () {
+        MockXMLHttpRequest.onRequest = (xhr) => {
+          respondText(xhr, playlist, 10, { Age: '12' });
+        };
+        const loader = new FailbackLoader(config);
+        const result = load(loader, playlistContext(`${ORIGIN}/index.m3u8`));
+        clock.tick(100);
+        expect((await result).kind).to.equal('success');
+        expect(loader.getCacheAge()).to.equal(12);
+        loader.destroy();
       });
     });
   });

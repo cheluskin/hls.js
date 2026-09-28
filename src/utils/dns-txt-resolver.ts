@@ -81,7 +81,7 @@ export function hasDnsCacheEntry(domain: string): boolean {
  */
 export function peekNegativeDnsExpiry(domain: string): number | null {
   const entry = dnsCache.get(domain);
-  if (!entry || entry.expiresAt == null) {
+  if (entry?.expiresAt == null) {
     return null;
   }
   if (Date.now() >= entry.expiresAt) {

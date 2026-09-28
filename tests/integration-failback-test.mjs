@@ -1477,9 +1477,15 @@ await test('Recovery probe uses xhrSetup when probing original CDN', async () =>
 
           if (originalRequestCount === 3) {
             probeAuthSeen = this._requestHeaders['X-Test-Auth'] === 'token';
+            // Answer exactly the requested byte range, like a real CDN.
+            const range = /bytes=(\d+)-(\d+)/.exec(
+              this._requestHeaders.Range || '',
+            );
             this.status = 206;
             this.statusText = 'OK';
-            this.response = new ArrayBuffer(16 * 1024);
+            this.response = new ArrayBuffer(
+              range ? Number(range[2]) - Number(range[1]) + 1 : 0,
+            );
           } else {
             this.status = 500;
             this.statusText = 'Server Error';
@@ -2594,14 +2600,15 @@ await test('TSPU Data Stall: trickle after headers triggers stall failover', asy
 });
 
 // ----------------------------------------
-// Test 32: Probabilistic Blackhole Fresh-Connection Retry
+// Test 32: Fresh-connection retry after a reset, never after silence
 // ----------------------------------------
-await test('Probabilistic Blackhole: requeues silent host for fresh-connection retry', async () => {
+await test('Connection reset requeues the host; a silent host is not resent into its frozen connection', async () => {
   const { FailbackLoader, destroyFailbackState } =
     await import('../dist/hls.mjs');
   const originalXHR = globalThis.XMLHttpRequest;
 
   let backupAttempts = 0;
+  let backupMode = 'reset';
 
   class RetryXHR {
     constructor() {
@@ -2630,10 +2637,14 @@ await test('Probabilistic Blackhole: requeues silent host for fresh-connection r
           this.status = 500;
           this.onreadystatechange?.();
         }, 5);
+      } else if (backupAttempts === 1 && backupMode === 'reset') {
+        // Backup 1st attempt: connection reset (RST) -> connection is gone
+        setTimeout(() => this.onerror?.(), 5);
       } else if (backupAttempts === 1) {
-        // Backup 1st attempt: silent (blackholed)
+        // Backup 1st attempt: silent (handshake ok, response blackholed).
+        // Chrome would send any retry into the same frozen HTTP/2/QUIC
+        // session, so it must not be retried within this load.
       } else {
-        // Backup 2nd attempt: succeeds!
         setTimeout(() => {
           this.readyState = 4;
           this.status = 200;
@@ -2650,20 +2661,9 @@ await test('Probabilistic Blackhole: requeues silent host for fresh-connection r
 
   globalThis.XMLHttpRequest = RetryXHR;
 
-  const config = {
-    failbackConfig: {
-      staticHosts: ['backup.example.com'],
-      hedge: false,
-      firstByteTimeoutMs: 50,
-      silentRetriesPerHost: 1,
-    },
-  };
-
-  const loader = new FailbackLoader(config);
-  let successUrl = '';
-
-  try {
-    await new Promise((resolve, reject) => {
+  const loadOnce = (config) => {
+    const loader = new FailbackLoader(config);
+    return new Promise((resolve) => {
       loader.load(
         {
           url: 'https://origin.example.com/segment.ts',
@@ -2675,37 +2675,54 @@ await test('Probabilistic Blackhole: requeues silent host for fresh-connection r
           rangeEnd: 0,
         },
         {
-          loadPolicy: { maxTimeToFirstByteMs: 5000, maxLoadTimeMs: 30000 },
+          loadPolicy: { maxTimeToFirstByteMs: 300, maxLoadTimeMs: 30000 },
           maxRetry: 0,
           retryDelay: 0,
           maxRetryDelay: 0,
         },
         {
-          onSuccess: (response) => {
-            successUrl = response.url;
-            resolve();
-          },
-          onError: (err) => reject(new Error(err.text)),
-          onTimeout: () => reject(new Error('Unexpected timeout')),
+          onSuccess: (response) => resolve({ ok: true, url: response.url }),
+          onError: () => resolve({ ok: false }),
+          onTimeout: () => resolve({ ok: false }),
           onAbort: () => {},
           onProgress: () => {},
         },
       );
-    });
+    }).finally(() => loader.destroy());
+  };
 
+  const config = {
+    failbackConfig: {
+      staticHosts: ['backup.example.com'],
+      hedge: false,
+      firstByteTimeoutMs: 50,
+      silentRetriesPerHost: 1,
+    },
+  };
+
+  try {
+    const reset = await loadOnce(config);
+    assert.equal(reset.ok, true, 'reset host should succeed on retry');
+    assert.ok(reset.url.includes('backup.example.com'));
     assert.equal(
       backupAttempts,
       2,
-      'Backup host should be retried on fresh connection after silent failure',
+      'Backup host should be retried on a fresh connection after a reset',
     );
-    assert.ok(
-      successUrl.includes('backup.example.com'),
-      'Should succeed on second backup attempt',
+
+    destroyFailbackState(config);
+    backupAttempts = 0;
+    backupMode = 'silent';
+    const silent = await loadOnce(config);
+    assert.equal(silent.ok, false, 'silent host exhausts the load');
+    assert.equal(
+      backupAttempts,
+      1,
+      'A silent host must not be resent into its frozen connection',
     );
   } finally {
     globalThis.XMLHttpRequest = originalXHR;
     destroyFailbackState(config);
-    loader.destroy();
   }
 });
 
@@ -2887,13 +2904,15 @@ await test('Last resort: permanent mode with quarantined backups tries original'
       const isFirstLoad = loadIndex === 0;
       setTimeout(() => {
         if (isFirstLoad && url.includes('origin.example.com')) {
+          // Origin: headers + a few bytes, then silence (TSPU freeze).
           this.readyState = 2;
           this.status = 200;
           this.onreadystatechange?.();
           this.onprogress?.({ loaded: 100, total: 1000000 });
           return;
         }
-        if (isFirstLoad) {
+        if (!isFirstLoad && url.includes('backup.example.com')) {
+          // The backup that rescued load 1 now fails hard (quarantined).
           this.readyState = 4;
           this.status = 503;
           this.statusText = 'Service Unavailable';
@@ -2943,15 +2962,19 @@ await test('Last resort: permanent mode with quarantined backups tries original'
           maxRetryDelay: 0,
         },
         {
-          onSuccess: () => reject(new Error('Load 1 should fail')),
-          onError: () => resolve(),
-          onTimeout: () => resolve(),
+          onSuccess: (response) => {
+            assert.ok(response.url.includes('backup.example.com'));
+            resolve();
+          },
+          onError: (err) => reject(new Error(err.text)),
+          onTimeout: () => reject(new Error('Unexpected timeout')),
           onAbort: () => {},
           onProgress: () => {},
         },
       );
     });
 
+    // Origin stalled mid-transfer and the backup delivered: permanent mode.
     assert.equal(getFailbackState(config).permanentMode, true);
     loadIndex = 1;
     const loader2 = new FailbackLoader(config);

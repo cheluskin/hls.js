@@ -1786,6 +1786,7 @@ export interface FailbackConfig {
     onAllFailed?: (originalUrl: string, attempts: number) => void;
     onFailback?: (originalUrl: string, failbackUrl: string, attempt: number) => void;
     onSuccess?: (url: string, wasFailback: boolean, attempt: number) => void;
+    playlistFailback?: boolean;
     silentRetriesPerHost?: number;
     staticHosts?: string[];
     transformUrl?: (url: string, attempt: number) => string | null;
