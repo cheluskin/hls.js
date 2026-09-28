@@ -3,7 +3,11 @@ import { LoaderContextType } from '../types/loader';
 import type { HlsConfig } from '../config';
 import type { LoaderContext } from '../types/loader';
 
-export const RECOVERY_PROBE_MAX_BYTES = 16 * 1024;
+// Larger than any prefix a TSPU has been seen to leak before blackholing a
+// connection (2-4KB in current Android net-export logs, 16-20KB in earlier
+// reports), so a probe cannot "succeed" on a connection that would freeze on a
+// real segment.
+export const RECOVERY_PROBE_MAX_BYTES = 64 * 1024;
 
 function getProbeHeaders(
   headers: Record<string, string> | undefined,

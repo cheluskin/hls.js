@@ -1,7 +1,10 @@
 import { expect } from 'chai';
 import sinon from 'sinon';
 import { hlsDefaultConfig, mergeConfig } from '../../../src/config';
-import { probeOriginalCDN } from '../../../src/utils/failback-recovery-probe';
+import {
+  probeOriginalCDN,
+  RECOVERY_PROBE_MAX_BYTES,
+} from '../../../src/utils/failback-recovery-probe';
 import { logger } from '../../../src/utils/logger';
 import type { HlsConfig } from '../../../src/config';
 
@@ -74,7 +77,8 @@ describe('failback-recovery-probe', function () {
   it('should validate the full fetch probe range and preserve non-Range headers', async function () {
     const fetchResponse = {
       status: 206,
-      arrayBuffer: () => Promise.resolve(new ArrayBuffer(16 * 1024)),
+      arrayBuffer: () =>
+        Promise.resolve(new ArrayBuffer(RECOVERY_PROBE_MAX_BYTES)),
     };
     const config = createConfig();
     const fetchStub = sinon.stub().resolves(fetchResponse as Response);
@@ -95,7 +99,9 @@ describe('failback-recovery-probe', function () {
 
     const options = fetchStub.firstCall.args[1];
     expect(options.method).to.equal('GET');
-    expect(options.headers.Range).to.equal('bytes=0-16383');
+    expect(options.headers.Range).to.equal(
+      `bytes=0-${RECOVERY_PROBE_MAX_BYTES - 1}`,
+    );
     expect(options.headers.range).to.equal(undefined);
     expect(options.headers.Authorization).to.equal('Bearer token');
   });
@@ -123,6 +129,25 @@ describe('failback-recovery-probe', function () {
     clock.tick(3000);
 
     expect(await resultPromise).to.equal(false);
+  });
+
+  it('should not recover on a body the size of a TSPU leak window', async function () {
+    // A DPI box that freezes connections after ~16-20KB would let a 16KB probe
+    // through; the default probe must be larger than that window.
+    expect(RECOVERY_PROBE_MAX_BYTES).to.be.greaterThan(32 * 1024);
+    const config = createConfig();
+    self.fetch = sinon.stub().resolves({
+      status: 206,
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(16 * 1024)),
+    } as unknown as Response) as unknown as typeof fetch;
+
+    expect(
+      await probeOriginalCDN(
+        config,
+        'https://origin.example.com/segment.ts',
+        3000,
+      ),
+    ).to.equal(false);
   });
 
   it('should reject an exposed Content-Range for other bytes', async function () {
@@ -179,7 +204,7 @@ describe('failback-recovery-probe', function () {
 
     ProbeMockXMLHttpRequest.onSend = (xhr) => {
       xhr.status = 206;
-      xhr.response = new ArrayBuffer(16 * 1024);
+      xhr.response = new ArrayBuffer(RECOVERY_PROBE_MAX_BYTES);
       xhr.readyState = 4;
       xhr.onreadystatechange?.();
     };
@@ -201,7 +226,9 @@ describe('failback-recovery-probe', function () {
 
     const xhr = ProbeMockXMLHttpRequest.instances[0];
     expect(xhr.url).to.equal('https://origin.example.com/segment.ts');
-    expect(xhr.requestHeaders.get('range')).to.equal('bytes=0-16383');
+    expect(xhr.requestHeaders.get('range')).to.equal(
+      `bytes=0-${RECOVERY_PROBE_MAX_BYTES - 1}`,
+    );
     expect(xhr.requestHeaders.get('x-test')).to.equal('1');
     expect(xhr.responseType).to.equal('arraybuffer');
     expect(xhrSetup.getCall(0).thisValue).to.have.property('config', config);
